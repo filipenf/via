@@ -2,6 +2,7 @@ mod config;
 mod event;
 mod logging;
 mod mediator;
+mod pty;
 mod ui;
 
 use anyhow::Result;
@@ -18,14 +19,14 @@ async fn main() -> Result<()> {
     let config = Config::from_env();
     info!(?config, "starting spectre");
 
-    let ui = GhosttyUi::new();
+    let ui = GhosttyUi::new(config.clone());
     ui.describe_backend();
 
     let mediator = Mediator::new(config);
     let handle = mediator.spawn();
 
-    tokio::signal::ctrl_c().await?;
-    info!("shutdown requested");
+    ui.run()?;
+    info!("window closed; shutdown requested");
 
     handle.shutdown().await;
     Ok(())
