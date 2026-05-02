@@ -1,0 +1,3 @@
+[env]
+PKG_CONFIG_PATH = { value = "/home/filipenf/.local/ghostty-dev/share/pkgconfig", force = true }
+LD_LIBRARY_PATH = { value = "/home/filipenf/.local/ghostty-dev/lib", force = true }
