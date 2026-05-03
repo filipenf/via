@@ -12,7 +12,7 @@ use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::event::{Event, UiCommand, UiEvent};
@@ -118,6 +118,10 @@ impl GhosttyUi {
 
                 for (index, pane) in panes.iter_mut().enumerate() {
                     let rect = layout.pane(index);
+                    if rect.width == 0 || rect.height == 0 {
+                        continue;
+                    }
+
                     if let Some(size) = pane.resize(rect.width, rect.height) {
                         debug!(pane = pane.title, ?size, "resized terminal pane");
                     }
@@ -354,8 +358,18 @@ impl TerminalPane {
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        if let Some(pty) = &mut self.pty {
-            pty.write_all(bytes)?;
+        let result = match &mut self.pty {
+            Some(pty) => pty.write_all(bytes),
+            None => Ok(()),
+        };
+
+        if let Err(error) = result {
+            warn!(
+                pane = self.title,
+                %error,
+                "terminal pane rejected input; dropping PTY session"
+            );
+            self.pty = None;
         }
 
         Ok(())
@@ -1804,6 +1818,17 @@ mod tests {
             }
         );
         assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(1));
+    }
+
+    #[test]
+    fn maximized_layouts_keep_hidden_panes_zero_sized() {
+        let nvim_layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::NvimMaximized);
+        let agent_layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::AgentMaximized);
+
+        assert_eq!(nvim_layout.pane(1).width, 0);
+        assert_eq!(nvim_layout.pane(1).height, 0);
+        assert_eq!(agent_layout.pane(0).width, 0);
+        assert_eq!(agent_layout.pane(0).height, 0);
     }
 
     #[test]
