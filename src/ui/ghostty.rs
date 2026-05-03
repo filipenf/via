@@ -104,8 +104,13 @@ impl GhosttyUi {
             ensure_buffer_size(&mut buffer, width, height);
             let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes);
             let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
-            let layout_shortcut_consumed =
-                handle_layout_shortcuts(&pressed_keys, alt, panes.len(), &mut pane_layout_mode);
+            let layout_shortcut_consumed = handle_layout_shortcuts(
+                &pressed_keys,
+                alt,
+                panes.len(),
+                &mut pane_layout_mode,
+                &mut active_pane,
+            );
 
             let new_layout = SplitLayout::for_window(width, height, panes.len(), pane_layout_mode);
             if new_layout != layout {
@@ -661,7 +666,9 @@ fn forward_special_keys(
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
 
     for key in pressed_keys.iter().copied() {
-        if skip_layout_shortcut && pane_layout_shortcut(key).is_some() {
+        if skip_layout_shortcut
+            && (pane_layout_shortcut(key).is_some() || pane_navigation_shortcut(key).is_some())
+        {
             continue;
         }
 
@@ -685,12 +692,20 @@ fn handle_layout_shortcuts(
     alt: bool,
     pane_count: usize,
     mode: &mut PaneLayoutMode,
+    active_pane: &mut usize,
 ) -> bool {
     if !alt {
         return false;
     }
 
     for key in pressed_keys {
+        if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
+            if next_active_pane < pane_count {
+                *active_pane = next_active_pane;
+            }
+            return true;
+        }
+
         let Some(next_mode) = pane_layout_shortcut(*key) else {
             continue;
         };
@@ -700,10 +715,29 @@ fn handle_layout_shortcuts(
         }
 
         *mode = next_mode;
+        if let Some(next_active_pane) = focused_pane_for_layout(next_mode) {
+            *active_pane = next_active_pane;
+        }
         return true;
     }
 
     false
+}
+
+fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
+    match mode {
+        PaneLayoutMode::NvimMaximized => Some(0),
+        PaneLayoutMode::AgentMaximized => Some(1),
+        PaneLayoutMode::Split => None,
+    }
+}
+
+fn pane_navigation_shortcut(key: Key) -> Option<usize> {
+    match key {
+        Key::Left => Some(0),
+        Key::Right => Some(1),
+        _ => None,
+    }
 }
 
 fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
@@ -1775,13 +1809,60 @@ mod tests {
     #[test]
     fn maps_alt_number_shortcuts_to_layout_modes() {
         let mut mode = PaneLayoutMode::Split;
+        let mut active_pane = 1;
 
-        assert!(handle_layout_shortcuts(&[Key::Key1], true, 2, &mut mode));
+        assert!(handle_layout_shortcuts(
+            &[Key::Key1],
+            true,
+            2,
+            &mut mode,
+            &mut active_pane
+        ));
         assert_eq!(mode, PaneLayoutMode::NvimMaximized);
-        assert!(handle_layout_shortcuts(&[Key::Key2], true, 2, &mut mode));
+        assert_eq!(active_pane, 0);
+        assert!(handle_layout_shortcuts(
+            &[Key::Key2],
+            true,
+            2,
+            &mut mode,
+            &mut active_pane
+        ));
         assert_eq!(mode, PaneLayoutMode::Split);
-        assert!(handle_layout_shortcuts(&[Key::Key3], true, 2, &mut mode));
+        assert_eq!(active_pane, 0);
+        assert!(handle_layout_shortcuts(
+            &[Key::Key3],
+            true,
+            2,
+            &mut mode,
+            &mut active_pane
+        ));
         assert_eq!(mode, PaneLayoutMode::AgentMaximized);
+        assert_eq!(active_pane, 1);
+    }
+
+    #[test]
+    fn maps_alt_arrow_shortcuts_to_active_panes() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active_pane = 1;
+
+        assert!(handle_layout_shortcuts(
+            &[Key::Left],
+            true,
+            2,
+            &mut mode,
+            &mut active_pane
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 0);
+        assert!(handle_layout_shortcuts(
+            &[Key::Right],
+            true,
+            2,
+            &mut mode,
+            &mut active_pane
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 1);
     }
 
     #[test]
