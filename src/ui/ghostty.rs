@@ -85,7 +85,9 @@ impl GhosttyUi {
         let mut buffer = vec![BLACK; INITIAL_WIDTH * INITIAL_HEIGHT];
         let mut panes = self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT)?;
         let mut active_pane = 0;
-        let mut layout = SplitLayout::for_window(INITIAL_WIDTH, INITIAL_HEIGHT, panes.len());
+        let mut pane_layout_mode = PaneLayoutMode::Split;
+        let mut layout =
+            SplitLayout::for_window(INITIAL_WIDTH, INITIAL_HEIGHT, panes.len(), pane_layout_mode);
         let nvim_args = nvim_args(&self.config);
 
         panes[0].spawn(
@@ -100,8 +102,12 @@ impl GhosttyUi {
         while window.is_open() {
             let (width, height) = window.get_size();
             ensure_buffer_size(&mut buffer, width, height);
+            let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes);
+            let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
+            let layout_shortcut_consumed =
+                handle_layout_shortcuts(&pressed_keys, alt, panes.len(), &mut pane_layout_mode);
 
-            let new_layout = SplitLayout::for_window(width, height, panes.len());
+            let new_layout = SplitLayout::for_window(width, height, panes.len(), pane_layout_mode);
             if new_layout != layout {
                 layout = new_layout;
 
@@ -118,8 +124,13 @@ impl GhosttyUi {
             }
             self.forward_ui_commands(&mut panes)?;
             self.flush_pending_agent_write(&mut panes)?;
-            forward_text_input(&input_rx, &mut panes[active_pane])?;
-            forward_special_keys(&window, &mut panes[active_pane])?;
+            forward_text_input(&input_rx, &mut panes[active_pane], layout_shortcut_consumed)?;
+            forward_special_keys(
+                &pressed_keys,
+                &window,
+                &mut panes[active_pane],
+                layout_shortcut_consumed,
+            )?;
 
             buffer.fill(BLACK);
             for (index, pane) in panes.iter_mut().enumerate() {
@@ -150,7 +161,8 @@ impl GhosttyUi {
     }
 
     fn create_panes(&self, width: usize, height: usize) -> Result<Vec<TerminalPane>> {
-        let layout = SplitLayout::for_window(width, height, self.pane_count());
+        let layout =
+            SplitLayout::for_window(width, height, self.pane_count(), PaneLayoutMode::Split);
         let mut panes = vec![TerminalPane::new(
             "nvim",
             layout.pane(0).width,
@@ -353,6 +365,10 @@ impl TerminalPane {
         rect: PaneRect,
         active: bool,
     ) {
+        if rect.width == 0 || rect.height == 0 {
+            return;
+        }
+
         self.view.draw(
             font_renderer,
             buffer,
@@ -382,13 +398,20 @@ struct PaneRect {
     height: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneLayoutMode {
+    NvimMaximized,
+    Split,
+    AgentMaximized,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SplitLayout {
     panes: Vec<PaneRect>,
 }
 
 impl SplitLayout {
-    fn for_window(width: usize, height: usize, pane_count: usize) -> Self {
+    fn for_window(width: usize, height: usize, pane_count: usize, mode: PaneLayoutMode) -> Self {
         if pane_count <= 1 {
             return Self {
                 panes: vec![PaneRect {
@@ -397,6 +420,44 @@ impl SplitLayout {
                     width,
                     height,
                 }],
+            };
+        }
+
+        if mode == PaneLayoutMode::NvimMaximized {
+            return Self {
+                panes: vec![
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                    PaneRect {
+                        x: width,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                ],
+            };
+        }
+
+        if mode == PaneLayoutMode::AgentMaximized {
+            return Self {
+                panes: vec![
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0,
+                    },
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        width,
+                        height,
+                    },
+                ],
             };
         }
 
@@ -574,8 +635,16 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) {
     }
 }
 
-fn forward_text_input(input: &Receiver<char>, pane: &mut TerminalPane) -> Result<()> {
+fn forward_text_input(
+    input: &Receiver<char>,
+    pane: &mut TerminalPane,
+    suppress_input: bool,
+) -> Result<()> {
     for ch in input.try_iter() {
+        if suppress_input {
+            continue;
+        }
+
         let mut bytes = [0; 4];
         pane.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
     }
@@ -583,10 +652,19 @@ fn forward_text_input(input: &Receiver<char>, pane: &mut TerminalPane) -> Result
     Ok(())
 }
 
-fn forward_special_keys(window: &Window, pane: &mut TerminalPane) -> Result<()> {
+fn forward_special_keys(
+    pressed_keys: &[Key],
+    window: &Window,
+    pane: &mut TerminalPane,
+    skip_layout_shortcut: bool,
+) -> Result<()> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
 
-    for key in window.get_keys_pressed(KeyRepeat::Yes) {
+    for key in pressed_keys.iter().copied() {
+        if skip_layout_shortcut && pane_layout_shortcut(key).is_some() {
+            continue;
+        }
+
         if ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
                 pane.write_all(&bytes)?;
@@ -600,6 +678,41 @@ fn forward_special_keys(window: &Window, pane: &mut TerminalPane) -> Result<()> 
     }
 
     Ok(())
+}
+
+fn handle_layout_shortcuts(
+    pressed_keys: &[Key],
+    alt: bool,
+    pane_count: usize,
+    mode: &mut PaneLayoutMode,
+) -> bool {
+    if !alt {
+        return false;
+    }
+
+    for key in pressed_keys {
+        let Some(next_mode) = pane_layout_shortcut(*key) else {
+            continue;
+        };
+
+        if next_mode == PaneLayoutMode::AgentMaximized && pane_count < 2 {
+            continue;
+        }
+
+        *mode = next_mode;
+        return true;
+    }
+
+    false
+}
+
+fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
+    match key {
+        Key::Key1 => Some(PaneLayoutMode::NvimMaximized),
+        Key::Key2 => Some(PaneLayoutMode::Split),
+        Key::Key3 => Some(PaneLayoutMode::AgentMaximized),
+        _ => None,
+    }
 }
 
 fn ctrl_sequence(key: Key) -> Option<[u8; 1]> {
@@ -1569,7 +1682,7 @@ mod tests {
 
     #[test]
     fn creates_single_pane_layout_without_agent() {
-        let layout = SplitLayout::for_window(100, 50, 1);
+        let layout = SplitLayout::for_window(100, 50, 1, PaneLayoutMode::Split);
 
         assert_eq!(
             layout.pane(0),
@@ -1584,7 +1697,7 @@ mod tests {
 
     #[test]
     fn creates_vertical_split_layout_for_agent() {
-        let layout = SplitLayout::for_window(100, 50, 2);
+        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::Split);
 
         assert_eq!(
             layout.pane(0),
@@ -1607,6 +1720,68 @@ mod tests {
         assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
         assert_eq!(layout.pane_at(60, 10).map(|(index, _)| index), Some(1));
         assert_eq!(layout.pane_at(50, 10), None);
+    }
+
+    #[test]
+    fn creates_nvim_maximized_layout() {
+        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::NvimMaximized);
+
+        assert_eq!(
+            layout.pane(0),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }
+        );
+        assert_eq!(
+            layout.pane(1),
+            PaneRect {
+                x: 100,
+                y: 0,
+                width: 0,
+                height: 0,
+            }
+        );
+        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
+    }
+
+    #[test]
+    fn creates_agent_maximized_layout() {
+        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::AgentMaximized);
+
+        assert_eq!(
+            layout.pane(0),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            }
+        );
+        assert_eq!(
+            layout.pane(1),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }
+        );
+        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(1));
+    }
+
+    #[test]
+    fn maps_alt_number_shortcuts_to_layout_modes() {
+        let mut mode = PaneLayoutMode::Split;
+
+        assert!(handle_layout_shortcuts(&[Key::Key1], true, 2, &mut mode));
+        assert_eq!(mode, PaneLayoutMode::NvimMaximized);
+        assert!(handle_layout_shortcuts(&[Key::Key2], true, 2, &mut mode));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert!(handle_layout_shortcuts(&[Key::Key3], true, 2, &mut mode));
+        assert_eq!(mode, PaneLayoutMode::AgentMaximized);
     }
 
     #[test]
