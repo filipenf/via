@@ -1,6 +1,7 @@
 local socket = vim.g.spectre_editor_socket
 local uv = vim.uv or vim.loop
 local pending_active_update = false
+local pending_selection_update = false
 
 local function encode(payload)
   if vim.json and vim.json.encode then
@@ -100,6 +101,49 @@ local function send_diagnostics()
   })
 end
 
+local function visual_mode()
+  local mode = vim.api.nvim_get_mode().mode
+
+  return mode == "v" or mode == "V" or mode == "\022"
+end
+
+local function send_visual_selection()
+  if not visual_mode() then
+    return
+  end
+
+  local path = current_file_path()
+  if not path then
+    return
+  end
+
+  local start_line = vim.fn.getpos("v")[2]
+  local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+
+  if start_line > cursor_line then
+    start_line, cursor_line = cursor_line, start_line
+  end
+
+  notify({
+    type = "visual_selection_changed",
+    path = path,
+    start_line = start_line,
+    end_line = cursor_line,
+  })
+end
+
+local function schedule_visual_selection()
+  if pending_selection_update then
+    return
+  end
+
+  pending_selection_update = true
+  vim.defer_fn(function()
+    pending_selection_update = false
+    send_visual_selection()
+  end, 25)
+end
+
 local group = vim.api.nvim_create_augroup("SpectreContextSync", { clear = true })
 
 vim.api.nvim_create_autocmd({ "BufEnter", "BufFilePost", "CursorMoved", "CursorMovedI" }, {
@@ -112,7 +156,13 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
   callback = send_diagnostics,
 })
 
+vim.api.nvim_create_autocmd({ "CursorMoved", "ModeChanged" }, {
+  group = group,
+  callback = schedule_visual_selection,
+})
+
 vim.schedule(function()
   send_active_buffer()
   send_diagnostics()
+  send_visual_selection()
 end)

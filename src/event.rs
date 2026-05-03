@@ -23,6 +23,11 @@ pub enum UiCommand {
         line: u32,
         column: u32,
     },
+    VisualSelectionChanged {
+        path: PathBuf,
+        start_line: u32,
+        end_line: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +41,11 @@ pub enum EditorEvent {
         path: PathBuf,
         error_count: usize,
         warning_count: usize,
+    },
+    VisualSelectionChanged {
+        path: PathBuf,
+        start_line: u32,
+        end_line: u32,
     },
 }
 
