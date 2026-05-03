@@ -27,11 +27,10 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let ui = GhosttyUi::new(config.clone());
-    ui.describe_backend();
-
-    let mediator = Mediator::new(config);
+    let mediator = Mediator::new(config.clone());
     let handle = mediator.spawn();
+    let ui = GhosttyUi::new(config.clone(), handle.events());
+    ui.describe_backend();
 
     ui.run()?;
     info!("window closed; shutdown requested");
