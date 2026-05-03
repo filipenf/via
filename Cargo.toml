@@ -6,10 +6,10 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.100"
 crossbeam-channel = "0.5.15"
-font8x8 = "0.3.1"
+fontdue = "0.9.3"
+libghostty-vt = "0.1.1"
 minifb = "0.28.0"
 portable-pty = "0.9.0"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "sync"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-vt100 = "0.16.2"
