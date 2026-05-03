@@ -2,6 +2,7 @@ mod config;
 mod event;
 mod logging;
 mod mediator;
+mod nvim;
 mod pty;
 mod ui;
 
@@ -10,6 +11,7 @@ use tracing::info;
 
 use crate::config::Config;
 use crate::mediator::Mediator;
+use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
 #[tokio::main]
@@ -18,6 +20,12 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env();
     info!(?config, "starting spectre");
+
+    if let Some(target) = cli_open_target(&config) {
+        nvim::log_socket_warning(&config.nvim_socket_path);
+        nvim::open_file(&config.nvim_socket_path, target).await?;
+        return Ok(());
+    }
 
     let ui = GhosttyUi::new(config.clone());
     ui.describe_backend();
@@ -30,4 +38,15 @@ async fn main() -> Result<()> {
 
     handle.shutdown().await;
     Ok(())
+}
+
+fn cli_open_target(config: &Config) -> Option<FileTarget> {
+    let mut args = std::env::args().skip(1);
+
+    match args.next().as_deref() {
+        Some("--open") => args
+            .next()
+            .map(|target| FileTarget::parse(&target, &config.working_directory)),
+        _ => None,
+    }
 }
