@@ -16,7 +16,7 @@ pub enum UiEvent {
     Resize { columns: u16, rows: u16 },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     ActiveBufferChanged {
         path: PathBuf,

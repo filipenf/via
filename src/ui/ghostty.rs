@@ -73,10 +73,7 @@ impl GhosttyUi {
         let mut panes = self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT)?;
         let mut active_pane = 0;
         let mut layout = SplitLayout::for_window(INITIAL_WIDTH, INITIAL_HEIGHT, panes.len());
-        let nvim_args = [
-            OsString::from("--listen"),
-            self.config.nvim_socket_path.clone().into_os_string(),
-        ];
+        let nvim_args = nvim_args(&self.config);
 
         panes[0].spawn(
             &self.config.nvim_command,
@@ -579,6 +576,43 @@ fn key_sequence(key: Key) -> Option<&'static [u8]> {
         Key::Delete => Some(b"\x1b[3~"),
         _ => None,
     }
+}
+
+fn nvim_args(config: &Config) -> Vec<OsString> {
+    vec![
+        OsString::from("--listen"),
+        config.nvim_socket_path.clone().into_os_string(),
+        OsString::from("-c"),
+        OsString::from(format!(
+            "lua {}",
+            nvim_context_bridge_lua(&config.editor_socket_path)
+        )),
+    ]
+}
+
+fn nvim_context_bridge_lua(editor_socket_path: &Path) -> String {
+    format!(
+        r#"do local socket={}; local uv=vim.uv or vim.loop; local pending=false; local function encode(payload) if vim.json and vim.json.encode then return vim.json.encode(payload) else return vim.fn.json_encode(payload) end end; local function notify(payload) if not socket or socket=="" or not uv then return end local pipe=uv.new_pipe(false); if not pipe then return end pipe:connect(socket,function(err) if err then pipe:close(); return end pipe:write(encode(payload).."\n",function() pipe:close() end) end) end; local function path() return vim.api.nvim_buf_get_name(0) end; local function active() local p=path(); if p=="" then return end local pos=vim.api.nvim_win_get_cursor(0); notify({{type="active_buffer_changed",path=p,line=pos[1],column=pos[2]+1}}) end; local function schedule_active() if pending then return end pending=true; vim.defer_fn(function() pending=false; active() end,75) end; local function diagnostics() local p=path(); if p=="" then return end local errors=0; local warnings=0; for _,d in ipairs(vim.diagnostic.get(0)) do if d.severity==vim.diagnostic.severity.ERROR then errors=errors+1 elseif d.severity==vim.diagnostic.severity.WARN then warnings=warnings+1 end end; notify({{type="diagnostics_changed",path=p,error_count=errors,warning_count=warnings}}) end; local group=vim.api.nvim_create_augroup("SpectreContextSync",{{clear=true}}); vim.api.nvim_create_autocmd({{"BufEnter","BufFilePost","CursorMoved","CursorMovedI"}},{{group=group,callback=schedule_active}}); vim.api.nvim_create_autocmd("DiagnosticChanged",{{group=group,callback=diagnostics}}); vim.schedule(function() active(); diagnostics() end); end"#,
+        lua_string_literal(editor_socket_path)
+    )
+}
+
+fn lua_string_literal(path: &Path) -> String {
+    let mut quoted = String::from("\"");
+
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(ch),
+        }
+    }
+
+    quoted.push('"');
+    quoted
 }
 
 fn terminal_size_for_window(width: usize, height: usize) -> TerminalSize {
@@ -1458,6 +1492,27 @@ mod tests {
         assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
         assert_eq!(layout.pane_at(60, 10).map(|(index, _)| index), Some(1));
         assert_eq!(layout.pane_at(50, 10), None);
+    }
+
+    #[test]
+    fn nvim_args_install_context_bridge() {
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: None,
+            nvim_socket_path: PathBuf::from("/tmp/spectre-nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/spectre-editor.sock"),
+            working_directory: PathBuf::from("/repo"),
+        };
+        let args = nvim_args(&config);
+        let command = args[3].to_string_lossy();
+
+        assert_eq!(args[0], OsString::from("--listen"));
+        assert_eq!(args[1], OsString::from("/tmp/spectre-nvim.sock"));
+        assert_eq!(args[2], OsString::from("-c"));
+        assert!(command.contains("SpectreContextSync"));
+        assert!(command.contains("/tmp/spectre-editor.sock"));
+        assert!(command.contains("active_buffer_changed"));
+        assert!(command.contains("diagnostics_changed"));
     }
 
     #[test]

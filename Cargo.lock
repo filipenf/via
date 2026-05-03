@@ -970,6 +970,8 @@ dependencies = [
  "minifb",
  "nvim-rs",
  "portable-pty",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
