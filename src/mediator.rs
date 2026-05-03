@@ -104,23 +104,51 @@ impl Mediator {
             .active_buffer
             .as_ref()
             .map(|buffer| buffer.path.clone());
+        let previous_selection = self.editor_state.visual_selection.clone();
 
         debug!(?event, "editor context updated");
-        if let EditorEvent::ActiveBufferChanged { path, line, column } = &event {
-            if previous_path.as_ref() != Some(path) {
-                let command = UiCommand::EditorContextChanged {
-                    path: path.clone(),
-                    line: *line,
-                    column: *column,
-                };
-
-                if self.ui_commands.try_send(command).is_err() {
-                    debug!("ui is not accepting commands");
+        match &event {
+            EditorEvent::ActiveBufferChanged { path, line, column } => {
+                if previous_path.as_ref() != Some(path) {
+                    self.send_ui_command(UiCommand::EditorContextChanged {
+                        path: path.clone(),
+                        line: *line,
+                        column: *column,
+                    });
                 }
             }
+            EditorEvent::VisualSelectionChanged {
+                path,
+                start_line,
+                end_line,
+            } => {
+                let changed = previous_selection
+                    .as_ref()
+                    .map(|selection| {
+                        selection.path != *path
+                            || selection.start_line != *start_line
+                            || selection.end_line != *end_line
+                    })
+                    .unwrap_or(true);
+
+                if changed {
+                    self.send_ui_command(UiCommand::VisualSelectionChanged {
+                        path: path.clone(),
+                        start_line: *start_line,
+                        end_line: *end_line,
+                    });
+                }
+            }
+            EditorEvent::DiagnosticsChanged { .. } => {}
         }
 
         self.editor_state.apply(event);
+    }
+
+    fn send_ui_command(&self, command: UiCommand) {
+        if self.ui_commands.try_send(command).is_err() {
+            debug!("ui is not accepting commands");
+        }
     }
 }
 

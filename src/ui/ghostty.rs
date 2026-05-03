@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -41,6 +41,12 @@ pub struct GhosttyUi {
     config: Config,
     events: EventSender,
     ui_commands: TokioReceiver<UiCommand>,
+    pending_agent_write: Option<PendingAgentWrite>,
+}
+
+struct PendingAgentWrite {
+    ready_at: Instant,
+    bytes: Vec<u8>,
 }
 
 impl GhosttyUi {
@@ -49,6 +55,7 @@ impl GhosttyUi {
             config,
             events,
             ui_commands,
+            pending_agent_write: None,
         }
     }
 
@@ -110,6 +117,7 @@ impl GhosttyUi {
                 pane.drain_output();
             }
             self.forward_ui_commands(&mut panes)?;
+            self.flush_pending_agent_write(&mut panes)?;
             forward_text_input(&input_rx, &mut panes[active_pane])?;
             forward_special_keys(&window, &mut panes[active_pane])?;
 
@@ -224,11 +232,55 @@ impl GhosttyUi {
 
                     info!(path = %path.display(), line, column, "forwarding editor context to agent");
                     agent_pane.write_all(update.as_bytes())?;
+                    self.pending_agent_write = None;
+                }
+                UiCommand::VisualSelectionChanged {
+                    path,
+                    start_line,
+                    end_line,
+                } => {
+                    let Some(agent_pane) = panes.get_mut(1) else {
+                        continue;
+                    };
+                    let update = format_selection_update(
+                        &path,
+                        start_line,
+                        end_line,
+                        &self.config.working_directory,
+                    );
+
+                    info!(path = %path.display(), start_line, end_line, "forwarding visual selection to agent");
+                    agent_pane.write_all(b"\x15")?;
+                    self.pending_agent_write = Some(PendingAgentWrite {
+                        ready_at: Instant::now() + Duration::from_millis(30),
+                        bytes: update.into_bytes(),
+                    });
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn flush_pending_agent_write(&mut self, panes: &mut [TerminalPane]) -> Result<()> {
+        let Some(pending) = &self.pending_agent_write else {
+            return Ok(());
+        };
+
+        if Instant::now() < pending.ready_at {
+            return Ok(());
+        }
+
+        let Some(agent_pane) = panes.get_mut(1) else {
+            self.pending_agent_write = None;
+            return Ok(());
+        };
+        let pending = self
+            .pending_agent_write
+            .take()
+            .expect("pending write exists");
+
+        agent_pane.write_all(&pending.bytes)
     }
 }
 
@@ -621,13 +673,26 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
     ]
 }
 
-fn format_context_update(path: &Path, line: u32, column: u32, working_directory: &Path) -> String {
+fn format_context_update(
+    path: &Path,
+    _line: u32,
+    _column: u32,
+    working_directory: &Path,
+) -> String {
     let display_path = path.strip_prefix(working_directory).unwrap_or(path);
 
-    format!(
-        "Context update: current file is {}:{line}:{column}\n",
-        display_path.display()
-    )
+    format!("@{}\n", display_path.display())
+}
+
+fn format_selection_update(
+    path: &Path,
+    start_line: u32,
+    end_line: u32,
+    working_directory: &Path,
+) -> String {
+    let display_path = path.strip_prefix(working_directory).unwrap_or(path);
+
+    format!("@{}:{start_line}-{end_line}", display_path.display())
 }
 
 fn lua_string_literal(path: &Path) -> String {
@@ -1574,7 +1639,15 @@ mod tests {
     fn context_update_uses_relative_file_path() {
         assert_eq!(
             format_context_update(Path::new("/repo/src/main.rs"), 42, 7, Path::new("/repo")),
-            "Context update: current file is src/main.rs:42:7\n"
+            "@src/main.rs\n"
+        );
+    }
+
+    #[test]
+    fn selection_update_uses_relative_file_path_and_line_range() {
+        assert_eq!(
+            format_selection_update(Path::new("/repo/src/main.rs"), 3, 8, Path::new("/repo")),
+            "@src/main.rs:3-8"
         );
     }
 

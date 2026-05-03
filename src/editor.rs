@@ -14,6 +14,7 @@ use crate::mediator::EventSender;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditorState {
     pub active_buffer: Option<ActiveBuffer>,
+    pub visual_selection: Option<VisualSelection>,
     pub diagnostics: HashMap<PathBuf, DiagnosticSummary>,
 }
 
@@ -28,6 +29,13 @@ pub struct ActiveBuffer {
 pub struct DiagnosticSummary {
     pub error_count: usize,
     pub warning_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VisualSelection {
+    pub path: PathBuf,
+    pub start_line: u32,
+    pub end_line: u32,
 }
 
 impl EditorState {
@@ -49,6 +57,17 @@ impl EditorState {
                     },
                 );
             }
+            EditorEvent::VisualSelectionChanged {
+                path,
+                start_line,
+                end_line,
+            } => {
+                self.visual_selection = Some(VisualSelection {
+                    path,
+                    start_line,
+                    end_line,
+                });
+            }
         }
     }
 }
@@ -65,6 +84,11 @@ enum WireEditorEvent {
         path: String,
         error_count: usize,
         warning_count: usize,
+    },
+    VisualSelectionChanged {
+        path: String,
+        start_line: u32,
+        end_line: u32,
     },
 }
 
@@ -164,6 +188,15 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             error_count,
             warning_count,
         },
+        WireEditorEvent::VisualSelectionChanged {
+            path,
+            start_line,
+            end_line,
+        } => EditorEvent::VisualSelectionChanged {
+            path: resolve_path(&path, working_directory),
+            start_line,
+            end_line,
+        },
     })
 }
 
@@ -224,6 +257,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_visual_selection_changed_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"visual_selection_changed","path":"src/main.rs","start_line":3,"end_line":8}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::VisualSelectionChanged {
+                path: PathBuf::from("/repo/src/main.rs"),
+                start_line: 3,
+                end_line: 8,
+            }
+        );
+    }
+
+    #[test]
     fn applies_editor_events_to_state() {
         let mut state = EditorState::default();
 
@@ -236,6 +285,11 @@ mod tests {
             path: PathBuf::from("/repo/src/main.rs"),
             error_count: 1,
             warning_count: 2,
+        });
+        state.apply(EditorEvent::VisualSelectionChanged {
+            path: PathBuf::from("/repo/src/main.rs"),
+            start_line: 3,
+            end_line: 8,
         });
 
         assert_eq!(
@@ -251,6 +305,14 @@ mod tests {
             Some(&DiagnosticSummary {
                 error_count: 1,
                 warning_count: 2,
+            })
+        );
+        assert_eq!(
+            state.visual_selection,
+            Some(VisualSelection {
+                path: PathBuf::from("/repo/src/main.rs"),
+                start_line: 3,
+                end_line: 8,
             })
         );
     }
