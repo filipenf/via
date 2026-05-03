@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -63,7 +64,16 @@ impl GhosttyUi {
         let mut font_renderer = FontRenderer::new()?;
         let mut buffer = vec![BLACK; INITIAL_WIDTH * INITIAL_HEIGHT];
         let mut view = TerminalView::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
-        let mut pty = PtySession::spawn(&self.config.nvim_command, view.size)?;
+        let nvim_args = [
+            OsString::from("--listen"),
+            self.config.nvim_socket_path.clone().into_os_string(),
+        ];
+        let mut pty = PtySession::spawn_with_args(
+            &self.config.nvim_command,
+            nvim_args,
+            &self.config.working_directory,
+            view.size,
+        )?;
 
         info!(size = ?view.size, "native terminal window ready");
 

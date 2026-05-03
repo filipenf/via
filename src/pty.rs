@@ -1,4 +1,6 @@
+use std::ffi::OsStr;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
@@ -23,13 +25,26 @@ pub struct TerminalSize {
 }
 
 impl PtySession {
-    pub fn spawn(command: &str, size: TerminalSize) -> Result<Self> {
+    pub fn spawn_with_args<I, S>(
+        command: &str,
+        args: I,
+        cwd: &Path,
+        size: TerminalSize,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let pty_system = native_pty_system();
         let pair = pty_system
             .openpty(size.into())
             .context("failed to open PTY")?;
 
         let mut command = CommandBuilder::new(command);
+        for arg in args {
+            command.arg(arg);
+        }
+        command.cwd(cwd);
         command.env("TERM", "xterm-256color");
 
         let child = pair

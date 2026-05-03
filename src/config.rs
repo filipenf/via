@@ -6,6 +6,7 @@ pub struct Config {
     pub nvim_command: String,
     pub agent_command: Option<String>,
     pub nvim_socket_path: PathBuf,
+    pub working_directory: PathBuf,
 }
 
 impl Config {
@@ -15,11 +16,13 @@ impl Config {
         let nvim_socket_path = env::var_os("SPECTRE_NVIM_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_socket_path);
+        let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         Self {
             nvim_command,
             agent_command,
             nvim_socket_path,
+            working_directory,
         }
     }
 }
