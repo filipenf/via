@@ -29,8 +29,8 @@ async fn main() -> Result<()> {
     }
 
     let mediator = Mediator::new(config.clone());
-    let handle = mediator.spawn();
-    let ui = GhosttyUi::new(config.clone(), handle.events());
+    let mut handle = mediator.spawn();
+    let ui = GhosttyUi::new(config.clone(), handle.events(), handle.take_ui_commands());
     ui.describe_backend();
 
     ui.run()?;

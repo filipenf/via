@@ -4,7 +4,7 @@ use tracing::{debug, error, info};
 
 use crate::config::Config;
 use crate::editor::{self, EditorState};
-use crate::event::{EditorEvent, Event, UiEvent};
+use crate::event::{EditorEvent, Event, UiCommand, UiEvent};
 use crate::nvim::{self, FileTarget};
 
 const EVENT_BUFFER_SIZE: usize = 128;
@@ -12,6 +12,7 @@ const EVENT_BUFFER_SIZE: usize = 128;
 pub struct Mediator {
     config: Config,
     events: mpsc::Receiver<Event>,
+    ui_commands: mpsc::Sender<UiCommand>,
     editor_state: EditorState,
 }
 
@@ -22,6 +23,7 @@ pub struct EventSender {
 
 pub struct MediatorHandle {
     events: EventSender,
+    ui_commands: Option<mpsc::Receiver<UiCommand>>,
     stopped: oneshot::Receiver<()>,
     editor_listener: JoinHandle<()>,
 }
@@ -29,17 +31,21 @@ pub struct MediatorHandle {
 impl Mediator {
     pub fn new(config: Config) -> Self {
         let (_events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
+        let (ui_commands_tx, _ui_commands_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
         Self {
             config,
             events: events_rx,
+            ui_commands: ui_commands_tx,
             editor_state: EditorState::default(),
         }
     }
 
     pub fn spawn(mut self) -> MediatorHandle {
         let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
+        let (ui_commands_tx, ui_commands_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
         self.events = events_rx;
+        self.ui_commands = ui_commands_tx;
         let events = EventSender {
             events: events_tx.clone(),
         };
@@ -57,6 +63,7 @@ impl Mediator {
 
         MediatorHandle {
             events,
+            ui_commands: Some(ui_commands_rx),
             stopped: stopped_rx,
             editor_listener,
         }
@@ -92,7 +99,27 @@ impl Mediator {
     }
 
     fn apply_editor_event(&mut self, event: EditorEvent) {
+        let previous_path = self
+            .editor_state
+            .active_buffer
+            .as_ref()
+            .map(|buffer| buffer.path.clone());
+
         debug!(?event, "editor context updated");
+        if let EditorEvent::ActiveBufferChanged { path, line, column } = &event {
+            if previous_path.as_ref() != Some(path) {
+                let command = UiCommand::EditorContextChanged {
+                    path: path.clone(),
+                    line: *line,
+                    column: *column,
+                };
+
+                if self.ui_commands.try_send(command).is_err() {
+                    debug!("ui is not accepting commands");
+                }
+            }
+        }
+
         self.editor_state.apply(event);
     }
 }
@@ -114,6 +141,12 @@ impl EventSender {
 impl MediatorHandle {
     pub fn events(&self) -> EventSender {
         self.events.clone()
+    }
+
+    pub fn take_ui_commands(&mut self) -> mpsc::Receiver<UiCommand> {
+        self.ui_commands
+            .take()
+            .expect("UI commands receiver was already taken")
     }
 
     pub async fn shutdown(self) {

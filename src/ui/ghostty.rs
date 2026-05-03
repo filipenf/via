@@ -11,10 +11,11 @@ use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
 use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info};
 
 use crate::config::Config;
-use crate::event::{Event, UiEvent};
+use crate::event::{Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::nvim::FileTarget;
 use crate::pty::{PtySession, TerminalSize};
@@ -39,11 +40,16 @@ const SPLIT_GAP: usize = 2;
 pub struct GhosttyUi {
     config: Config,
     events: EventSender,
+    ui_commands: TokioReceiver<UiCommand>,
 }
 
 impl GhosttyUi {
-    pub fn new(config: Config, events: EventSender) -> Self {
-        Self { config, events }
+    pub fn new(config: Config, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
+        Self {
+            config,
+            events,
+            ui_commands,
+        }
     }
 
     pub fn describe_backend(&self) {
@@ -52,7 +58,7 @@ impl GhosttyUi {
         );
     }
 
-    pub fn run(self) -> Result<()> {
+    pub fn run(mut self) -> Result<()> {
         let mut window = Window::new(
             "Spectre",
             INITIAL_WIDTH,
@@ -103,6 +109,7 @@ impl GhosttyUi {
             for pane in &mut panes {
                 pane.drain_output();
             }
+            self.forward_ui_commands(&mut panes)?;
             forward_text_input(&input_rx, &mut panes[active_pane])?;
             forward_special_keys(&window, &mut panes[active_pane])?;
 
@@ -203,6 +210,25 @@ impl GhosttyUi {
             path: target.path,
             line: target.line,
         }));
+    }
+
+    fn forward_ui_commands(&mut self, panes: &mut [TerminalPane]) -> Result<()> {
+        while let Ok(command) = self.ui_commands.try_recv() {
+            match command {
+                UiCommand::EditorContextChanged { path, line, column } => {
+                    let Some(agent_pane) = panes.get_mut(1) else {
+                        continue;
+                    };
+                    let update =
+                        format_context_update(&path, line, column, &self.config.working_directory);
+
+                    info!(path = %path.display(), line, column, "forwarding editor context to agent");
+                    agent_pane.write_all(update.as_bytes())?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -592,8 +618,17 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
 
 fn nvim_context_bridge_lua(editor_socket_path: &Path) -> String {
     format!(
-        r#"do local socket={}; local uv=vim.uv or vim.loop; local pending=false; local function encode(payload) if vim.json and vim.json.encode then return vim.json.encode(payload) else return vim.fn.json_encode(payload) end end; local function notify(payload) if not socket or socket=="" or not uv then return end local pipe=uv.new_pipe(false); if not pipe then return end pipe:connect(socket,function(err) if err then pipe:close(); return end pipe:write(encode(payload).."\n",function() pipe:close() end) end) end; local function path() return vim.api.nvim_buf_get_name(0) end; local function active() local p=path(); if p=="" then return end local pos=vim.api.nvim_win_get_cursor(0); notify({{type="active_buffer_changed",path=p,line=pos[1],column=pos[2]+1}}) end; local function schedule_active() if pending then return end pending=true; vim.defer_fn(function() pending=false; active() end,75) end; local function diagnostics() local p=path(); if p=="" then return end local errors=0; local warnings=0; for _,d in ipairs(vim.diagnostic.get(0)) do if d.severity==vim.diagnostic.severity.ERROR then errors=errors+1 elseif d.severity==vim.diagnostic.severity.WARN then warnings=warnings+1 end end; notify({{type="diagnostics_changed",path=p,error_count=errors,warning_count=warnings}}) end; local group=vim.api.nvim_create_augroup("SpectreContextSync",{{clear=true}}); vim.api.nvim_create_autocmd({{"BufEnter","BufFilePost","CursorMoved","CursorMovedI"}},{{group=group,callback=schedule_active}}); vim.api.nvim_create_autocmd("DiagnosticChanged",{{group=group,callback=diagnostics}}); vim.schedule(function() active(); diagnostics() end); end"#,
+        r#"do local socket={}; local uv=vim.uv or vim.loop; local pending=false; local function encode(payload) if vim.json and vim.json.encode then return vim.json.encode(payload) else return vim.fn.json_encode(payload) end end; local function notify(payload) if not socket or socket=="" or not uv then return end local pipe=uv.new_pipe(false); if not pipe then return end pipe:connect(socket,function(err) if err then pipe:close(); return end pipe:write(encode(payload).."\n",function() pipe:close() end) end) end; local function path() local buf=vim.api.nvim_get_current_buf(); local p=vim.api.nvim_buf_get_name(buf); if p=="" or vim.bo[buf].buftype~="" then return nil end; local stat=uv.fs_stat(p); if not stat or stat.type~="file" then return nil end; return p end; local function active() local p=path(); if not p then return end local pos=vim.api.nvim_win_get_cursor(0); notify({{type="active_buffer_changed",path=p,line=pos[1],column=pos[2]+1}}) end; local function schedule_active() if pending then return end pending=true; vim.defer_fn(function() pending=false; active() end,75) end; local function diagnostics() local p=path(); if not p then return end local errors=0; local warnings=0; for _,d in ipairs(vim.diagnostic.get(0)) do if d.severity==vim.diagnostic.severity.ERROR then errors=errors+1 elseif d.severity==vim.diagnostic.severity.WARN then warnings=warnings+1 end end; notify({{type="diagnostics_changed",path=p,error_count=errors,warning_count=warnings}}) end; local group=vim.api.nvim_create_augroup("SpectreContextSync",{{clear=true}}); vim.api.nvim_create_autocmd({{"BufEnter","BufFilePost","CursorMoved","CursorMovedI"}},{{group=group,callback=schedule_active}}); vim.api.nvim_create_autocmd("DiagnosticChanged",{{group=group,callback=diagnostics}}); vim.schedule(function() active(); diagnostics() end); end"#,
         lua_string_literal(editor_socket_path)
+    )
+}
+
+fn format_context_update(path: &Path, line: u32, column: u32, working_directory: &Path) -> String {
+    let display_path = path.strip_prefix(working_directory).unwrap_or(path);
+
+    format!(
+        "Context update: current file is {}:{line}:{column}\n",
+        display_path.display()
     )
 }
 
@@ -1513,6 +1548,16 @@ mod tests {
         assert!(command.contains("/tmp/spectre-editor.sock"));
         assert!(command.contains("active_buffer_changed"));
         assert!(command.contains("diagnostics_changed"));
+        assert!(command.contains("buftype"));
+        assert!(command.contains("fs_stat"));
+    }
+
+    #[test]
+    fn context_update_uses_relative_file_path() {
+        assert_eq!(
+            format_context_update(Path::new("/repo/src/main.rs"), 42, 7, Path::new("/repo")),
+            "Context update: current file is src/main.rs:42:7\n"
+        );
     }
 
     #[test]

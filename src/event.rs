@@ -17,6 +17,15 @@ pub enum UiEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UiCommand {
+    EditorContextChanged {
+        path: PathBuf,
+        line: u32,
+        column: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
     ActiveBufferChanged {
         path: PathBuf,
