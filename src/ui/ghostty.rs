@@ -10,10 +10,13 @@ use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterato
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::{Terminal, TerminalOptions};
-use minifb::{InputCallback, Key, KeyRepeat, Window, WindowOptions};
+use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use tracing::{debug, info};
 
 use crate::config::Config;
+use crate::event::{Event, UiEvent};
+use crate::mediator::EventSender;
+use crate::nvim::FileTarget;
 use crate::pty::{PtySession, TerminalSize};
 
 // This module owns the native terminal surface boundary. On Linux, Ghostty's
@@ -32,11 +35,12 @@ const CURSOR: u32 = 0xb8bb26;
 
 pub struct GhosttyUi {
     config: Config,
+    events: EventSender,
 }
 
 impl GhosttyUi {
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, events: EventSender) -> Self {
+        Self { config, events }
     }
 
     pub fn describe_backend(&self) {
@@ -76,6 +80,7 @@ impl GhosttyUi {
         )?;
 
         info!(size = ?view.size, "native terminal window ready");
+        let mut left_mouse_down = false;
 
         while window.is_open() {
             let (width, height) = window.get_size();
@@ -92,6 +97,7 @@ impl GhosttyUi {
             forward_special_keys(&window, &mut pty)?;
 
             view.draw(&mut font_renderer, &mut buffer, width, height);
+            self.forward_file_reference_click(&window, &view, &mut left_mouse_down);
             window
                 .update_with_buffer(&buffer, width, height)
                 .context("failed to update native window")?;
@@ -101,6 +107,42 @@ impl GhosttyUi {
 
         Ok(())
     }
+
+    fn forward_file_reference_click(
+        &self,
+        window: &Window,
+        view: &TerminalView,
+        left_mouse_down: &mut bool,
+    ) {
+        let is_down = window.get_mouse_down(MouseButton::Left);
+        let just_pressed = is_down && !*left_mouse_down;
+        *left_mouse_down = is_down;
+
+        if !just_pressed {
+            return;
+        }
+
+        let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
+            return;
+        };
+
+        let row = (y as usize) / CELL_HEIGHT;
+        let column = (x as usize) / CELL_WIDTH;
+        let Some(target) = view.file_reference_at(row, column, &self.config.working_directory)
+        else {
+            return;
+        };
+
+        info!(
+            path = %target.path.display(),
+            line = ?target.line,
+            "file reference clicked"
+        );
+        self.events.try_send(Event::Ui(UiEvent::OpenRequested {
+            path: target.path,
+            line: target.line,
+        }));
+    }
 }
 
 struct TerminalView {
@@ -108,6 +150,7 @@ struct TerminalView {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
+    visible_rows: Vec<String>,
     size: TerminalSize,
 }
 
@@ -129,6 +172,7 @@ impl TerminalView {
             render_state,
             rows,
             cells,
+            visible_rows: Vec::new(),
             size,
         })
     }
@@ -165,16 +209,28 @@ impl TerminalView {
         height: usize,
     ) {
         buffer.fill(BLACK);
+        self.visible_rows.clear();
         draw_screen(
             &self.terminal,
             &mut self.render_state,
             &mut self.rows,
             &mut self.cells,
+            &mut self.visible_rows,
             font_renderer,
             buffer,
             width,
             height,
         );
+    }
+
+    fn file_reference_at(
+        &self,
+        row: usize,
+        column: usize,
+        working_directory: &Path,
+    ) -> Option<FileTarget> {
+        let row = self.visible_rows.get(row)?;
+        file_reference_at(row, column, working_directory)
     }
 }
 
@@ -309,6 +365,7 @@ fn draw_screen(
     render_state: &mut RenderState<'static>,
     rows: &mut RowIterator<'static>,
     cells: &mut CellIterator<'static>,
+    visible_rows: &mut Vec<String>,
     font_renderer: &mut FontRenderer,
     buffer: &mut [u32],
     width: usize,
@@ -330,11 +387,13 @@ fn draw_screen(
             Err(_) => return,
         };
         let y = row as usize * CELL_HEIGHT;
+        let mut row_text = String::new();
         let mut col = 0;
 
         while let Some(cell_ref) = cell_iter.next() {
             let x = col as usize * CELL_WIDTH;
-            draw_cell(cell_ref, font_renderer, buffer, width, height, x, y);
+            let ch = draw_cell(cell_ref, font_renderer, buffer, width, height, x, y);
+            row_text.push(ch.unwrap_or(' '));
             col += 1;
 
             if col >= cols {
@@ -342,6 +401,7 @@ fn draw_screen(
             }
         }
 
+        visible_rows.push(row_text);
         row += 1;
     }
 
@@ -376,9 +436,9 @@ fn draw_cell(
     height: usize,
     x: usize,
     y: usize,
-) {
+) -> Option<char> {
     let Ok(raw_cell) = cell.raw_cell() else {
-        return;
+        return None;
     };
     let is_wide_continuation = raw_cell
         .wide()
@@ -386,7 +446,7 @@ fn draw_cell(
         .unwrap_or(false);
 
     if is_wide_continuation {
-        return;
+        return None;
     }
 
     let (fg, bg) = cell_colors(cell);
@@ -403,7 +463,7 @@ fn draw_cell(
     draw_rect(buffer, width, height, x, y, cell_width, CELL_HEIGHT, bg);
 
     if !raw_cell.has_text().unwrap_or(false) {
-        return;
+        return None;
     }
 
     let ch = cell
@@ -412,6 +472,7 @@ fn draw_cell(
         .and_then(|mut graphemes| graphemes.drain(..).next())
         .unwrap_or(' ');
     font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
+    Some(ch)
 }
 
 struct FontRenderer {
@@ -500,6 +561,124 @@ fn font_path() -> Option<PathBuf> {
     .map(Path::new)
     .find(|path| path.exists())
     .map(Path::to_path_buf)
+}
+
+fn file_reference_at(row: &str, column: usize, working_directory: &Path) -> Option<FileTarget> {
+    let spans = file_reference_spans(row, working_directory);
+
+    spans
+        .into_iter()
+        .find(|span| column >= span.start && column < span.end)
+        .map(|span| span.target)
+}
+
+fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        while index < chars.len() && !is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        let start = index;
+
+        while index < chars.len() && is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        if start == index {
+            continue;
+        }
+
+        let Some((token_start, token_end, token)) = trim_file_reference(&chars[start..index])
+        else {
+            continue;
+        };
+
+        if !looks_like_file_reference(&token) {
+            continue;
+        }
+
+        let target = FileTarget::parse(&token, working_directory);
+
+        spans.push(FileReferenceSpan {
+            start: start + token_start,
+            end: start + token_end,
+            target,
+        });
+    }
+
+    spans
+}
+
+#[derive(Debug)]
+struct FileReferenceSpan {
+    start: usize,
+    end: usize,
+    target: FileTarget,
+}
+
+fn trim_file_reference(chars: &[char]) -> Option<(usize, usize, String)> {
+    let mut start = 0;
+    let mut end = chars.len();
+
+    while start < end && matches!(chars[start], '"' | '\'' | '`' | '(' | '[' | '{' | '<') {
+        start += 1;
+    }
+
+    while end > start
+        && matches!(
+            chars[end - 1],
+            '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '.'
+        )
+    {
+        end -= 1;
+    }
+
+    if start == end {
+        return None;
+    }
+
+    Some((start, end, chars[start..end].iter().collect()))
+}
+
+fn looks_like_file_reference(token: &str) -> bool {
+    token.contains('/')
+        || token.contains('\\')
+        || token.contains('.')
+        || token
+            .rsplit_once(':')
+            .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+}
+
+fn is_file_reference_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '/' | '\\'
+                | '.'
+                | '_'
+                | '-'
+                | ':'
+                | '~'
+                | '@'
+                | '+'
+                | '"'
+                | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+        )
 }
 
 fn draw_rect(
@@ -608,4 +787,30 @@ fn dim(color: u32) -> u32 {
     let b = (color & 0xff) / 2;
 
     (r << 16) | (g << 8) | b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finds_reference_under_column() {
+        let target = file_reference_at("open project.md:12 please", 7, Path::new("/repo")).unwrap();
+
+        assert_eq!(target.path, PathBuf::from("/repo/project.md"));
+        assert_eq!(target.line, Some(12));
+    }
+
+    #[test]
+    fn trims_common_surrounding_punctuation() {
+        let target = file_reference_at("see `src/main.rs:8`, ok", 6, Path::new("/repo")).unwrap();
+
+        assert_eq!(target.path, PathBuf::from("/repo/src/main.rs"));
+        assert_eq!(target.line, Some(8));
+    }
+
+    #[test]
+    fn ignores_plain_words() {
+        assert!(file_reference_at("no file here", 1, Path::new("/repo")).is_none());
+    }
 }

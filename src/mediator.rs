@@ -1,8 +1,9 @@
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 use crate::config::Config;
-use crate::event::Event;
+use crate::event::{Event, UiEvent};
+use crate::nvim::{self, FileTarget};
 
 const EVENT_BUFFER_SIZE: usize = 128;
 
@@ -56,17 +57,32 @@ impl Mediator {
         );
 
         while let Some(event) = self.events.recv().await {
-            if matches!(event, Event::Shutdown) {
-                info!("mediator received shutdown");
-                break;
-            }
+            match event {
+                Event::Shutdown => {
+                    info!("mediator received shutdown");
+                    break;
+                }
+                Event::Ui(UiEvent::OpenRequested { path, line }) => {
+                    let target = FileTarget { path, line };
 
-            debug!(?event, "mediator event received");
+                    if let Err(error) = nvim::open_file(&self.config.nvim_socket_path, target).await
+                    {
+                        error!(%error, "failed to open file in Neovim");
+                    }
+                }
+                event => debug!(?event, "mediator event received"),
+            }
         }
     }
 }
 
 impl EventSender {
+    pub fn try_send(&self, event: Event) {
+        if self.events.try_send(event).is_err() {
+            debug!("mediator is not accepting events");
+        }
+    }
+
     pub async fn send(&self, event: Event) {
         if self.events.send(event).await.is_err() {
             debug!("mediator is no longer accepting events");
@@ -75,7 +91,6 @@ impl EventSender {
 }
 
 impl MediatorHandle {
-    #[allow(dead_code)]
     pub fn events(&self) -> EventSender {
         self.events.clone()
     }
