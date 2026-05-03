@@ -27,7 +27,9 @@ const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
 const DEFAULT_CELL_WIDTH: usize = 10;
 const DEFAULT_CELL_HEIGHT: usize = 22;
-const DEFAULT_FONT_SIZE: f32 = 17.0;
+const DEFAULT_FONT_SIZE_POINTS: f32 = 12.0;
+const DEFAULT_FONT_DPI: f32 = 96.0;
+const DEFAULT_FONT_PIXEL_SIZE: f32 = DEFAULT_FONT_SIZE_POINTS * DEFAULT_FONT_DPI / 72.0;
 const SCROLLBACK_ROWS: usize = 10_000;
 
 const BLACK: u32 = 0x0c0c0c;
@@ -57,6 +59,7 @@ struct TerminalConfig {
     font_family: Option<String>,
     font_path: Option<PathBuf>,
     font_size: f32,
+    font_pixels: f32,
     metrics: TerminalMetrics,
     theme: TerminalTheme,
 }
@@ -157,7 +160,8 @@ impl TerminalConfig {
     }
 
     fn finalize_metrics(&mut self) {
-        let scale = (self.font_size / DEFAULT_FONT_SIZE).max(0.5);
+        self.font_pixels = points_to_pixels(self.font_size);
+        let scale = (self.font_pixels / DEFAULT_FONT_PIXEL_SIZE).max(0.5);
         self.metrics.cell_width =
             ((DEFAULT_CELL_WIDTH as f32 * scale).round() as usize).max(MIN_CELL_WIDTH);
         self.metrics.cell_height =
@@ -171,7 +175,8 @@ impl Default for TerminalConfig {
         Self {
             font_family: None,
             font_path: std::env::var_os("SPECTRE_FONT_PATH").map(PathBuf::from),
-            font_size: DEFAULT_FONT_SIZE,
+            font_size: DEFAULT_FONT_SIZE_POINTS,
+            font_pixels: DEFAULT_FONT_PIXEL_SIZE,
             metrics: TerminalMetrics::default(),
             theme: TerminalTheme::default(),
         }
@@ -1077,6 +1082,10 @@ fn vim_fnameescape(path: &Path) -> String {
     escaped
 }
 
+fn points_to_pixels(points: f32) -> f32 {
+    points * DEFAULT_FONT_DPI / 72.0
+}
+
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {
     let cols = (width / metrics.cell_width).max(1).min(u16::MAX as usize) as u16;
     let rows = (height / metrics.cell_height).max(1).min(u16::MAX as usize) as u16;
@@ -1295,7 +1304,7 @@ impl FontRenderer {
 
         Ok(Self {
             font,
-            font_size: config.font_size,
+            font_size: config.font_pixels,
             baseline: config.metrics.baseline,
             theme: config.theme.clone(),
             cache: HashMap::new(),
@@ -2064,8 +2073,9 @@ mod tests {
 
         config.finalize_metrics();
 
-        assert_eq!(config.metrics.cell_width, 5);
-        assert_eq!(config.metrics.cell_height, 12);
+        assert_eq!(config.font_pixels, 12.0);
+        assert_eq!(config.metrics.cell_width, 8);
+        assert_eq!(config.metrics.cell_height, 17);
     }
 
     #[test]
