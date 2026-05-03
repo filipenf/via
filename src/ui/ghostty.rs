@@ -1,23 +1,28 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use font8x8::{BASIC_FONTS, UnicodeFonts};
+use fontdue::{Font, FontSettings, Metrics};
+use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
+use libghostty_vt::screen::CellWide;
+use libghostty_vt::style::RgbColor;
+use libghostty_vt::{Terminal, TerminalOptions};
 use minifb::{InputCallback, Key, KeyRepeat, Window, WindowOptions};
 use tracing::{debug, info};
-use vt100::{Cell, Color, Parser, Screen};
 
 use crate::config::Config;
 use crate::pty::{PtySession, TerminalSize};
 
-// This module owns the native terminal surface boundary. The current renderer is
-// intentionally small so the PTY/window path works before full libghostty surface
-// bindings are wired in.
+// This module owns the native terminal surface boundary. On Linux, Ghostty's
+// exported C surface API does not currently expose a platform handle, so we use
+// libghostty-vt for terminal state and keep drawing intentionally small.
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
-const CELL_WIDTH: usize = 8;
-const CELL_HEIGHT: usize = 16;
-const FONT_SCALE_Y: usize = 2;
+const CELL_WIDTH: usize = 10;
+const CELL_HEIGHT: usize = 22;
+const FONT_SIZE: f32 = 17.0;
 const SCROLLBACK_ROWS: usize = 10_000;
 
 const BLACK: u32 = 0x0c0c0c;
@@ -55,8 +60,9 @@ impl GhosttyUi {
         let (input_tx, input_rx) = unbounded();
         window.set_input_callback(Box::new(TextInput::new(input_tx)));
 
+        let mut font_renderer = FontRenderer::new()?;
         let mut buffer = vec![BLACK; INITIAL_WIDTH * INITIAL_HEIGHT];
-        let mut view = TerminalView::new(INITIAL_WIDTH, INITIAL_HEIGHT);
+        let mut view = TerminalView::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
         let mut pty = PtySession::spawn(&self.config.nvim_command, view.size)?;
 
         info!(size = ?view.size, "native terminal window ready");
@@ -70,11 +76,12 @@ impl GhosttyUi {
                 debug!(?size, "resized terminal");
             }
 
-            drain_pty_output(pty.output(), &mut view.parser);
+            let output = pty.output().clone();
+            drain_pty_output(&output, &mut view);
             forward_text_input(&input_rx, &mut pty)?;
             forward_special_keys(&window, &mut pty)?;
 
-            view.draw(&mut buffer, width, height);
+            view.draw(&mut font_renderer, &mut buffer, width, height);
             window
                 .update_with_buffer(&buffer, width, height)
                 .context("failed to update native window")?;
@@ -87,16 +94,33 @@ impl GhosttyUi {
 }
 
 struct TerminalView {
-    parser: Parser,
+    terminal: Terminal<'static, 'static>,
+    render_state: RenderState<'static>,
+    rows: RowIterator<'static>,
+    cells: CellIterator<'static>,
     size: TerminalSize,
 }
 
 impl TerminalView {
-    fn new(width: usize, height: usize) -> Self {
+    fn new(width: usize, height: usize) -> Result<Self> {
         let size = terminal_size_for_window(width, height);
-        let parser = Parser::new(size.rows, size.cols, SCROLLBACK_ROWS);
+        let terminal = Terminal::new(TerminalOptions {
+            cols: size.cols,
+            rows: size.rows,
+            max_scrollback: SCROLLBACK_ROWS,
+        })
+        .context("failed to create Ghostty terminal")?;
+        let render_state = RenderState::new().context("failed to create Ghostty render state")?;
+        let rows = RowIterator::new().context("failed to create Ghostty row iterator")?;
+        let cells = CellIterator::new().context("failed to create Ghostty cell iterator")?;
 
-        Self { parser, size }
+        Ok(Self {
+            terminal,
+            render_state,
+            rows,
+            cells,
+            size,
+        })
     }
 
     fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
@@ -106,14 +130,41 @@ impl TerminalView {
             return None;
         }
 
-        self.parser.screen_mut().set_size(size.rows, size.cols);
+        if let Err(error) = self.terminal.resize(
+            size.cols,
+            size.rows,
+            size.pixel_width as u32,
+            size.pixel_height as u32,
+        ) {
+            debug!(%error, "failed to resize Ghostty terminal state");
+        }
+
         self.size = size;
         Some(size)
     }
 
-    fn draw(&self, buffer: &mut [u32], width: usize, height: usize) {
+    fn process(&mut self, bytes: &[u8]) {
+        self.terminal.vt_write(bytes);
+    }
+
+    fn draw(
+        &mut self,
+        font_renderer: &mut FontRenderer,
+        buffer: &mut [u32],
+        width: usize,
+        height: usize,
+    ) {
         buffer.fill(BLACK);
-        draw_screen(self.parser.screen(), buffer, width, height);
+        draw_screen(
+            &self.terminal,
+            &mut self.render_state,
+            &mut self.rows,
+            &mut self.cells,
+            font_renderer,
+            buffer,
+            width,
+            height,
+        );
     }
 }
 
@@ -135,9 +186,9 @@ impl InputCallback for TextInput {
     }
 }
 
-fn drain_pty_output(output: &Receiver<Vec<u8>>, parser: &mut Parser) {
+fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) {
     for chunk in output.try_iter() {
-        parser.process(&chunk);
+        view.process(&chunk);
     }
 }
 
@@ -243,81 +294,202 @@ fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize) {
     }
 }
 
-fn draw_screen(screen: &Screen, buffer: &mut [u32], width: usize, height: usize) {
-    let (rows, cols) = screen.size();
-
-    for row in 0..rows {
-        for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
-                continue;
-            };
-
-            let x = col as usize * CELL_WIDTH;
-            let y = row as usize * CELL_HEIGHT;
-            draw_cell(cell, buffer, width, height, x, y);
-        }
-    }
-
-    if !screen.hide_cursor() {
-        let (row, col) = screen.cursor_position();
-        draw_rect(
-            buffer,
-            width,
-            height,
-            col as usize * CELL_WIDTH,
-            row as usize * CELL_HEIGHT + CELL_HEIGHT - 2,
-            CELL_WIDTH,
-            2,
-            CURSOR,
-        );
-    }
-}
-
-fn draw_cell(cell: &Cell, buffer: &mut [u32], width: usize, height: usize, x: usize, y: usize) {
-    let (fg, bg) = cell_colors(cell);
-    draw_rect(buffer, width, height, x, y, CELL_WIDTH, CELL_HEIGHT, bg);
-
-    if !cell.has_contents() || cell.is_wide_continuation() {
-        return;
-    }
-
-    let ch = cell.contents().chars().next().unwrap_or(' ');
-    draw_char(buffer, width, height, x, y, ch, fg);
-}
-
-fn draw_char(
+fn draw_screen(
+    terminal: &Terminal<'static, 'static>,
+    render_state: &mut RenderState<'static>,
+    rows: &mut RowIterator<'static>,
+    cells: &mut CellIterator<'static>,
+    font_renderer: &mut FontRenderer,
     buffer: &mut [u32],
     width: usize,
     height: usize,
-    x: usize,
-    y: usize,
-    ch: char,
-    color: u32,
 ) {
-    let glyph = BASIC_FONTS.get(ch).or_else(|| BASIC_FONTS.get('?'));
-
-    let Some(glyph) = glyph else {
+    let Ok(snapshot) = render_state.update(terminal) else {
         return;
     };
+    let cols = snapshot.cols().unwrap_or(0);
+    let mut row_iter = match rows.update(&snapshot) {
+        Ok(iter) => iter,
+        Err(_) => return,
+    };
+    let mut row = 0;
 
-    for (glyph_y, row) in glyph.iter().enumerate() {
-        for glyph_x in 0..8 {
-            if (row >> glyph_x) & 1 == 0 {
-                continue;
+    while let Some(row_ref) = row_iter.next() {
+        let mut cell_iter = match cells.update(row_ref) {
+            Ok(iter) => iter,
+            Err(_) => return,
+        };
+        let y = row as usize * CELL_HEIGHT;
+        let mut col = 0;
+
+        while let Some(cell_ref) = cell_iter.next() {
+            let x = col as usize * CELL_WIDTH;
+            draw_cell(cell_ref, font_renderer, buffer, width, height, x, y);
+            col += 1;
+
+            if col >= cols {
+                break;
             }
+        }
+
+        row += 1;
+    }
+
+    if snapshot.cursor_visible().unwrap_or(false) {
+        if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
+            let cursor_color = snapshot
+                .cursor_color()
+                .ok()
+                .flatten()
+                .map(rgb_color)
+                .unwrap_or(CURSOR);
 
             draw_rect(
                 buffer,
                 width,
                 height,
-                x + glyph_x,
-                y + glyph_y * FONT_SCALE_Y,
-                1,
-                FONT_SCALE_Y,
-                color,
+                cursor.x as usize * CELL_WIDTH,
+                cursor.y as usize * CELL_HEIGHT + CELL_HEIGHT - 2,
+                CELL_WIDTH,
+                2,
+                cursor_color,
             );
         }
     }
+}
+
+fn draw_cell(
+    cell: &CellIteration<'static, '_>,
+    font_renderer: &mut FontRenderer,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) {
+    let Ok(raw_cell) = cell.raw_cell() else {
+        return;
+    };
+    let is_wide_continuation = raw_cell
+        .wide()
+        .map(|wide| matches!(wide, CellWide::SpacerTail))
+        .unwrap_or(false);
+
+    if is_wide_continuation {
+        return;
+    }
+
+    let (fg, bg) = cell_colors(cell);
+    let cell_width = if raw_cell
+        .wide()
+        .map(|wide| matches!(wide, CellWide::Wide | CellWide::SpacerHead))
+        .unwrap_or(false)
+    {
+        CELL_WIDTH * 2
+    } else {
+        CELL_WIDTH
+    };
+
+    draw_rect(buffer, width, height, x, y, cell_width, CELL_HEIGHT, bg);
+
+    if !raw_cell.has_text().unwrap_or(false) {
+        return;
+    }
+
+    let ch = cell
+        .graphemes()
+        .ok()
+        .and_then(|mut graphemes| graphemes.drain(..).next())
+        .unwrap_or(' ');
+    font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
+}
+
+struct FontRenderer {
+    font: Font,
+    cache: HashMap<char, GlyphBitmap>,
+}
+
+struct GlyphBitmap {
+    metrics: Metrics,
+    bitmap: Vec<u8>,
+}
+
+impl FontRenderer {
+    fn new() -> Result<Self> {
+        let font_path = font_path().context("failed to find a terminal font")?;
+        let font_bytes = std::fs::read(&font_path)
+            .with_context(|| format!("failed to read font {}", font_path.display()))?;
+        let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|error| {
+            anyhow::anyhow!("failed to load font {}: {error}", font_path.display())
+        })?;
+
+        info!(font = %font_path.display(), "loaded terminal font");
+
+        Ok(Self {
+            font,
+            cache: HashMap::new(),
+        })
+    }
+
+    fn draw_char(
+        &mut self,
+        buffer: &mut [u32],
+        width: usize,
+        height: usize,
+        x: usize,
+        y: usize,
+        ch: char,
+        color: u32,
+    ) {
+        let glyph = self.glyph(ch);
+        let baseline = y as isize + 16;
+        let draw_x = x as isize + glyph.metrics.xmin as isize;
+        let draw_y = baseline - glyph.metrics.ymin as isize - glyph.metrics.height as isize;
+
+        for glyph_y in 0..glyph.metrics.height {
+            for glyph_x in 0..glyph.metrics.width {
+                let alpha = glyph.bitmap[glyph_y * glyph.metrics.width + glyph_x];
+
+                if alpha == 0 {
+                    continue;
+                }
+
+                blend_pixel(
+                    buffer,
+                    width,
+                    height,
+                    draw_x + glyph_x as isize,
+                    draw_y + glyph_y as isize,
+                    color,
+                    alpha,
+                );
+            }
+        }
+    }
+
+    fn glyph(&mut self, ch: char) -> &GlyphBitmap {
+        self.cache.entry(ch).or_insert_with(|| {
+            let (metrics, bitmap) = self.font.rasterize(ch, FONT_SIZE);
+
+            GlyphBitmap { metrics, bitmap }
+        })
+    }
+}
+
+fn font_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("SPECTRE_FONT_PATH").map(PathBuf::from) {
+        return Some(path);
+    }
+
+    [
+        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.exists())
+    .map(Path::to_path_buf)
 }
 
 fn draw_rect(
@@ -342,31 +514,70 @@ fn draw_rect(
     }
 }
 
-fn cell_colors(cell: &Cell) -> (u32, u32) {
-    let mut fg = terminal_color(cell.fgcolor(), WHITE);
-    let mut bg = terminal_color(cell.bgcolor(), BLACK);
+fn blend_pixel(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: isize,
+    y: isize,
+    color: u32,
+    alpha: u8,
+) {
+    if x < 0 || y < 0 {
+        return;
+    }
 
-    if cell.inverse() {
+    let x = x as usize;
+    let y = y as usize;
+
+    if x >= width || y >= height {
+        return;
+    }
+
+    let index = y * width + x;
+    let dst = buffer[index];
+    let alpha = alpha as u32;
+    let inv_alpha = 255 - alpha;
+
+    let r = (((color >> 16) & 0xff) * alpha + ((dst >> 16) & 0xff) * inv_alpha) / 255;
+    let g = (((color >> 8) & 0xff) * alpha + ((dst >> 8) & 0xff) * inv_alpha) / 255;
+    let b = ((color & 0xff) * alpha + (dst & 0xff) * inv_alpha) / 255;
+
+    buffer[index] = (r << 16) | (g << 8) | b;
+}
+
+fn cell_colors(cell: &CellIteration<'static, '_>) -> (u32, u32) {
+    let style = cell.style().unwrap_or_default();
+    let mut fg = cell
+        .fg_color()
+        .ok()
+        .flatten()
+        .map(rgb_color)
+        .unwrap_or(WHITE);
+    let mut bg = cell
+        .bg_color()
+        .ok()
+        .flatten()
+        .map(rgb_color)
+        .unwrap_or(BLACK);
+
+    if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
     }
 
-    if cell.bold() {
+    if style.bold {
         fg = brighten(fg);
     }
 
-    if cell.dim() {
+    if style.faint {
         fg = dim(fg);
     }
 
     (fg, bg)
 }
 
-fn terminal_color(color: Color, default: u32) -> u32 {
-    match color {
-        Color::Default => default,
-        Color::Rgb(r, g, b) => rgb(r, g, b),
-        Color::Idx(index) => ANSI_COLORS.get(index as usize).copied().unwrap_or(default),
-    }
+fn rgb_color(color: RgbColor) -> u32 {
+    rgb(color.r, color.g, color.b)
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -388,8 +599,3 @@ fn dim(color: u32) -> u32 {
 
     (r << 16) | (g << 8) | b
 }
-
-const ANSI_COLORS: [u32; 16] = [
-    0x1d2021, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984, 0x928374,
-    0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
-];
