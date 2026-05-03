@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, Sender, unbounded};
 use fontdue::{Font, FontSettings, Metrics};
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::style::{PaletteIndex, RgbColor, StyleColor};
 use libghostty_vt::{Terminal, TerminalOptions};
 use minifb::{InputCallback, Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
@@ -25,9 +25,9 @@ use crate::pty::{PtySession, TerminalSize};
 // libghostty-vt for terminal state and keep drawing intentionally small.
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
-const CELL_WIDTH: usize = 10;
-const CELL_HEIGHT: usize = 22;
-const FONT_SIZE: f32 = 17.0;
+const DEFAULT_CELL_WIDTH: usize = 10;
+const DEFAULT_CELL_HEIGHT: usize = 22;
+const DEFAULT_FONT_SIZE: f32 = 17.0;
 const SCROLLBACK_ROWS: usize = 10_000;
 
 const BLACK: u32 = 0x0c0c0c;
@@ -36,6 +36,9 @@ const CURSOR: u32 = 0xb8bb26;
 const ACTIVE_BORDER: u32 = 0x83a598;
 const INACTIVE_BORDER: u32 = 0x3c3836;
 const SPLIT_GAP: usize = 2;
+const GHOSTTY_CONFIG_PATH: &str = "~/.config/ghostty/config";
+const MIN_CELL_WIDTH: usize = 4;
+const MIN_CELL_HEIGHT: usize = 8;
 
 pub struct GhosttyUi {
     config: Config,
@@ -47,6 +50,163 @@ pub struct GhosttyUi {
 struct PendingAgentWrite {
     ready_at: Instant,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalConfig {
+    font_family: Option<String>,
+    font_path: Option<PathBuf>,
+    font_size: f32,
+    metrics: TerminalMetrics,
+    theme: TerminalTheme,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TerminalMetrics {
+    cell_width: usize,
+    cell_height: usize,
+    baseline: isize,
+}
+
+#[derive(Debug, Clone)]
+struct TerminalTheme {
+    background: u32,
+    foreground: u32,
+    cursor: u32,
+    palette: [u32; 256],
+}
+
+impl TerminalConfig {
+    fn load() -> Self {
+        let mut config = Self::default();
+        let config_path = expand_path(GHOSTTY_CONFIG_PATH);
+
+        if let Err(error) = config.load_file(&config_path, 0) {
+            debug!(path = %config_path.display(), %error, "failed to load Ghostty config");
+        }
+
+        config.finalize_metrics();
+        config
+    }
+
+    fn load_file(&mut self, path: &Path, depth: usize) -> Result<()> {
+        if depth > 8 {
+            return Ok(());
+        }
+
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to read {}", path.display()));
+            }
+        };
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("/"));
+
+        for line in contents.lines() {
+            let Some((key, value)) = ghostty_config_entry(line) else {
+                continue;
+            };
+
+            if key == "config-file" {
+                let include_path = ghostty_config_path(value, base_dir);
+                if let Err(error) = self.load_file(&include_path, depth + 1) {
+                    debug!(path = %include_path.display(), %error, "failed to load included Ghostty config");
+                }
+                continue;
+            }
+
+            self.apply_entry(key, value);
+        }
+
+        Ok(())
+    }
+
+    fn apply_entry(&mut self, key: &str, value: &str) {
+        match key {
+            "background" => {
+                if let Some(color) = parse_hex_color(value) {
+                    self.theme.background = color;
+                    self.theme.palette[0] = color;
+                }
+            }
+            "foreground" => {
+                if let Some(color) = parse_hex_color(value) {
+                    self.theme.foreground = color;
+                    self.theme.palette[7] = color;
+                }
+            }
+            "cursor-color" => {
+                if let Some(color) = parse_hex_color(value) {
+                    self.theme.cursor = color;
+                }
+            }
+            "palette" => {
+                if let Some((index, color)) = parse_palette_entry(value) {
+                    self.theme.palette[index as usize] = color;
+                }
+            }
+            "font-family" => self.font_family = Some(unquote(value).to_string()),
+            "font-size" => {
+                if let Ok(font_size) = value.parse::<f32>() {
+                    self.font_size = font_size;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn finalize_metrics(&mut self) {
+        let scale = (self.font_size / DEFAULT_FONT_SIZE).max(0.5);
+        self.metrics.cell_width =
+            ((DEFAULT_CELL_WIDTH as f32 * scale).round() as usize).max(MIN_CELL_WIDTH);
+        self.metrics.cell_height =
+            ((DEFAULT_CELL_HEIGHT as f32 * scale).round() as usize).max(MIN_CELL_HEIGHT);
+        self.metrics.baseline = (self.metrics.cell_height as f32 * 0.73).round() as isize;
+    }
+}
+
+impl Default for TerminalConfig {
+    fn default() -> Self {
+        Self {
+            font_family: None,
+            font_path: std::env::var_os("SPECTRE_FONT_PATH").map(PathBuf::from),
+            font_size: DEFAULT_FONT_SIZE,
+            metrics: TerminalMetrics::default(),
+            theme: TerminalTheme::default(),
+        }
+    }
+}
+
+impl Default for TerminalMetrics {
+    fn default() -> Self {
+        Self {
+            cell_width: DEFAULT_CELL_WIDTH,
+            cell_height: DEFAULT_CELL_HEIGHT,
+            baseline: 16,
+        }
+    }
+}
+
+impl Default for TerminalTheme {
+    fn default() -> Self {
+        let mut palette = [0; 256];
+        let defaults = [
+            BLACK, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, WHITE, 0x928374,
+            0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+        ];
+
+        for (index, color) in defaults.into_iter().enumerate() {
+            palette[index] = color;
+        }
+
+        Self {
+            background: BLACK,
+            foreground: WHITE,
+            cursor: CURSOR,
+            palette,
+        }
+    }
 }
 
 impl GhosttyUi {
@@ -81,9 +241,11 @@ impl GhosttyUi {
         let (input_tx, input_rx) = unbounded();
         window.set_input_callback(Box::new(TextInput::new(input_tx)));
 
-        let mut font_renderer = FontRenderer::new()?;
-        let mut buffer = vec![BLACK; INITIAL_WIDTH * INITIAL_HEIGHT];
-        let mut panes = self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+        let terminal_config = TerminalConfig::load();
+        let mut font_renderer = FontRenderer::new(&terminal_config)?;
+        let mut buffer = vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT];
+        let mut panes =
+            self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT, terminal_config.metrics)?;
         let mut active_pane = 0;
         let mut pane_layout_mode = PaneLayoutMode::Split;
         let mut layout =
@@ -101,7 +263,7 @@ impl GhosttyUi {
 
         while window.is_open() {
             let (width, height) = window.get_size();
-            ensure_buffer_size(&mut buffer, width, height);
+            ensure_buffer_size(&mut buffer, width, height, terminal_config.theme.background);
             let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes);
             let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
             let layout_shortcut_consumed = handle_layout_shortcuts(
@@ -141,7 +303,7 @@ impl GhosttyUi {
                 layout_shortcut_consumed,
             )?;
 
-            buffer.fill(BLACK);
+            buffer.fill(terminal_config.theme.background);
             for (index, pane) in panes.iter_mut().enumerate() {
                 pane.draw(
                     &mut font_renderer,
@@ -169,17 +331,28 @@ impl GhosttyUi {
         Ok(())
     }
 
-    fn create_panes(&self, width: usize, height: usize) -> Result<Vec<TerminalPane>> {
+    fn create_panes(
+        &self,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Result<Vec<TerminalPane>> {
         let layout =
             SplitLayout::for_window(width, height, self.pane_count(), PaneLayoutMode::Split);
         let mut panes = vec![TerminalPane::new(
             "nvim",
             layout.pane(0).width,
             layout.pane(0).height,
+            metrics,
         )?];
 
         if let Some(agent_command) = self.config.agent_command.as_deref() {
-            let mut pane = TerminalPane::new("agent", layout.pane(1).width, layout.pane(1).height)?;
+            let mut pane = TerminalPane::new(
+                "agent",
+                layout.pane(1).width,
+                layout.pane(1).height,
+                metrics,
+            )?;
             pane.spawn_shell_command(agent_command, &self.config.working_directory)?;
             panes.push(pane);
         }
@@ -222,8 +395,9 @@ impl GhosttyUi {
         };
         *active_pane = pane_index;
 
-        let row = (y - rect.y) / CELL_HEIGHT;
-        let column = (x - rect.x) / CELL_WIDTH;
+        let metrics = panes[pane_index].metrics();
+        let row = (y - rect.y) / metrics.cell_height;
+        let column = (x - rect.x) / metrics.cell_width;
         let Some(target) =
             panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
         else {
@@ -312,10 +486,15 @@ struct TerminalPane {
 }
 
 impl TerminalPane {
-    fn new(title: &'static str, width: usize, height: usize) -> Result<Self> {
+    fn new(
+        title: &'static str,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Result<Self> {
         Ok(Self {
             title,
-            view: TerminalView::new(width, height)?,
+            view: TerminalView::new(width, height, metrics)?,
             pty: None,
         })
     }
@@ -406,6 +585,10 @@ impl TerminalPane {
         working_directory: &Path,
     ) -> Option<FileTarget> {
         self.view.file_reference_at(row, column, working_directory)
+    }
+
+    fn metrics(&self) -> TerminalMetrics {
+        self.view.metrics
     }
 }
 
@@ -524,11 +707,12 @@ struct TerminalView {
     visible_rows: Vec<String>,
     hyperlink_tracker: Osc8Tracker,
     size: TerminalSize,
+    metrics: TerminalMetrics,
 }
 
 impl TerminalView {
-    fn new(width: usize, height: usize) -> Result<Self> {
-        let size = terminal_size_for_window(width, height);
+    fn new(width: usize, height: usize, metrics: TerminalMetrics) -> Result<Self> {
+        let size = terminal_size_for_window(width, height, metrics);
         let terminal = Terminal::new(TerminalOptions {
             cols: size.cols,
             rows: size.rows,
@@ -547,11 +731,12 @@ impl TerminalView {
             visible_rows: Vec::new(),
             hyperlink_tracker: Osc8Tracker::new(size),
             size,
+            metrics,
         })
     }
 
     fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
-        let size = terminal_size_for_window(width, height);
+        let size = terminal_size_for_window(width, height, self.metrics);
 
         if size == self.size {
             return None;
@@ -598,6 +783,7 @@ impl TerminalView {
             height,
             origin_x,
             origin_y,
+            self.metrics,
         );
     }
 
@@ -891,9 +1077,9 @@ fn vim_fnameescape(path: &Path) -> String {
     escaped
 }
 
-fn terminal_size_for_window(width: usize, height: usize) -> TerminalSize {
-    let cols = (width / CELL_WIDTH).max(1).min(u16::MAX as usize) as u16;
-    let rows = (height / CELL_HEIGHT).max(1).min(u16::MAX as usize) as u16;
+fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {
+    let cols = (width / metrics.cell_width).max(1).min(u16::MAX as usize) as u16;
+    let rows = (height / metrics.cell_height).max(1).min(u16::MAX as usize) as u16;
 
     TerminalSize {
         rows,
@@ -903,11 +1089,11 @@ fn terminal_size_for_window(width: usize, height: usize) -> TerminalSize {
     }
 }
 
-fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize) {
+fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: u32) {
     let len = width.saturating_mul(height);
 
     if buffer.len() != len {
-        buffer.resize(len, BLACK);
+        buffer.resize(len, fill);
     }
 }
 
@@ -958,6 +1144,7 @@ fn draw_screen(
     height: usize,
     origin_x: usize,
     origin_y: usize,
+    metrics: TerminalMetrics,
 ) {
     let Ok(snapshot) = render_state.update(terminal) else {
         return;
@@ -974,13 +1161,22 @@ fn draw_screen(
             Ok(iter) => iter,
             Err(_) => return,
         };
-        let y = origin_y + row as usize * CELL_HEIGHT;
+        let y = origin_y + row as usize * metrics.cell_height;
         let mut row_text = String::new();
         let mut col = 0;
 
         while let Some(cell_ref) = cell_iter.next() {
-            let x = origin_x + col as usize * CELL_WIDTH;
-            let ch = draw_cell(cell_ref, font_renderer, buffer, width, height, x, y);
+            let x = origin_x + col as usize * metrics.cell_width;
+            let ch = draw_cell(
+                cell_ref,
+                font_renderer,
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                metrics,
+            );
             row_text.push(ch.unwrap_or(' '));
             col += 1;
 
@@ -1000,15 +1196,15 @@ fn draw_screen(
                 .ok()
                 .flatten()
                 .map(rgb_color)
-                .unwrap_or(CURSOR);
+                .unwrap_or(font_renderer.theme.cursor);
 
             draw_rect(
                 buffer,
                 width,
                 height,
-                origin_x + cursor.x as usize * CELL_WIDTH,
-                origin_y + cursor.y as usize * CELL_HEIGHT + CELL_HEIGHT - 2,
-                CELL_WIDTH,
+                origin_x + cursor.x as usize * metrics.cell_width,
+                origin_y + cursor.y as usize * metrics.cell_height + metrics.cell_height - 2,
+                metrics.cell_width,
                 2,
                 cursor_color,
             );
@@ -1024,6 +1220,7 @@ fn draw_cell(
     height: usize,
     x: usize,
     y: usize,
+    metrics: TerminalMetrics,
 ) -> Option<char> {
     let Ok(raw_cell) = cell.raw_cell() else {
         return None;
@@ -1037,18 +1234,27 @@ fn draw_cell(
         return None;
     }
 
-    let (fg, bg) = cell_colors(cell);
+    let (fg, bg) = cell_colors(cell, &font_renderer.theme);
     let cell_width = if raw_cell
         .wide()
         .map(|wide| matches!(wide, CellWide::Wide | CellWide::SpacerHead))
         .unwrap_or(false)
     {
-        CELL_WIDTH * 2
+        metrics.cell_width * 2
     } else {
-        CELL_WIDTH
+        metrics.cell_width
     };
 
-    draw_rect(buffer, width, height, x, y, cell_width, CELL_HEIGHT, bg);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        cell_width,
+        metrics.cell_height,
+        bg,
+    );
 
     if !raw_cell.has_text().unwrap_or(false) {
         return None;
@@ -1065,6 +1271,9 @@ fn draw_cell(
 
 struct FontRenderer {
     font: Font,
+    font_size: f32,
+    baseline: isize,
+    theme: TerminalTheme,
     cache: HashMap<char, GlyphBitmap>,
 }
 
@@ -1074,8 +1283,8 @@ struct GlyphBitmap {
 }
 
 impl FontRenderer {
-    fn new() -> Result<Self> {
-        let font_path = font_path().context("failed to find a terminal font")?;
+    fn new(config: &TerminalConfig) -> Result<Self> {
+        let font_path = font_path(config).context("failed to find a terminal font")?;
         let font_bytes = std::fs::read(&font_path)
             .with_context(|| format!("failed to read font {}", font_path.display()))?;
         let font = Font::from_bytes(font_bytes, FontSettings::default()).map_err(|error| {
@@ -1086,6 +1295,9 @@ impl FontRenderer {
 
         Ok(Self {
             font,
+            font_size: config.font_size,
+            baseline: config.metrics.baseline,
+            theme: config.theme.clone(),
             cache: HashMap::new(),
         })
     }
@@ -1100,8 +1312,8 @@ impl FontRenderer {
         ch: char,
         color: u32,
     ) {
+        let baseline = y as isize + self.baseline;
         let glyph = self.glyph(ch);
-        let baseline = y as isize + 16;
         let draw_x = x as isize + glyph.metrics.xmin as isize;
         let draw_y = baseline - glyph.metrics.ymin as isize - glyph.metrics.height as isize;
 
@@ -1128,15 +1340,19 @@ impl FontRenderer {
 
     fn glyph(&mut self, ch: char) -> &GlyphBitmap {
         self.cache.entry(ch).or_insert_with(|| {
-            let (metrics, bitmap) = self.font.rasterize(ch, FONT_SIZE);
+            let (metrics, bitmap) = self.font.rasterize(ch, self.font_size);
 
             GlyphBitmap { metrics, bitmap }
         })
     }
 }
 
-fn font_path() -> Option<PathBuf> {
-    if let Some(path) = std::env::var_os("SPECTRE_FONT_PATH").map(PathBuf::from) {
+fn font_path(config: &TerminalConfig) -> Option<PathBuf> {
+    if let Some(path) = config.font_path.clone() {
+        return Some(path);
+    }
+
+    if let Some(path) = config.font_family.as_deref().and_then(font_path_for_family) {
         return Some(path);
     }
 
@@ -1149,6 +1365,114 @@ fn font_path() -> Option<PathBuf> {
     .map(Path::new)
     .find(|path| path.exists())
     .map(Path::to_path_buf)
+}
+
+fn font_path_for_family(family: &str) -> Option<PathBuf> {
+    let family = family.to_ascii_lowercase().replace([' ', '-'], "");
+    let candidates = [
+        (
+            ["jetbrainsmononerdfont", "jetbrainsmono"],
+            [
+                "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+                "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
+            ],
+        ),
+        (
+            ["caskaydiamono", "cascadiamono"],
+            [
+                "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Regular.ttf",
+                "/usr/share/fonts/TTF/CascadiaMono.ttf",
+            ],
+        ),
+    ];
+
+    for (names, paths) in candidates {
+        if !names.iter().any(|name| family.contains(name)) {
+            continue;
+        }
+
+        if let Some(path) = paths.into_iter().map(Path::new).find(|path| path.exists()) {
+            return Some(path.to_path_buf());
+        }
+    }
+
+    None
+}
+
+fn ghostty_config_entry(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+
+    let (key, value) = line.split_once('=')?;
+    let mut value = value.trim();
+
+    if let Some(rest) = value.strip_prefix('?') {
+        value = rest.trim();
+    }
+
+    Some((key.trim(), unquote(value)))
+}
+
+fn ghostty_config_path(value: &str, base_dir: &Path) -> PathBuf {
+    let path = expand_path(value);
+
+    if path.is_absolute() {
+        path
+    } else {
+        base_dir.join(path)
+    }
+}
+
+fn expand_path(path: &str) -> PathBuf {
+    let path = unquote(path);
+
+    if path == "~" {
+        return home_dir();
+    }
+
+    if let Some(rest) = path.strip_prefix("~/") {
+        return home_dir().join(rest);
+    }
+
+    PathBuf::from(path)
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn unquote(value: &str) -> &str {
+    value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+fn parse_palette_entry(value: &str) -> Option<(u8, u32)> {
+    let (index, color) = value.split_once('=')?;
+    let index = index.trim().parse::<u8>().ok()?;
+    let color = parse_hex_color(color.trim())?;
+
+    Some((index, color))
+}
+
+fn parse_hex_color(value: &str) -> Option<u32> {
+    let value = value.trim().trim_start_matches('#');
+
+    if value.len() != 6 {
+        return None;
+    }
+
+    u32::from_str_radix(value, 16).ok()
+}
+
+fn color_from_palette(index: PaletteIndex, theme: &TerminalTheme) -> Option<u32> {
+    theme.palette.get(index.0 as usize).copied()
 }
 
 fn file_reference_at(row: &str, column: usize, working_directory: &Path) -> Option<FileTarget> {
@@ -1640,20 +1964,28 @@ fn blend_pixel(
     buffer[index] = (r << 16) | (g << 8) | b;
 }
 
-fn cell_colors(cell: &CellIteration<'static, '_>) -> (u32, u32) {
+fn cell_colors(cell: &CellIteration<'static, '_>, theme: &TerminalTheme) -> (u32, u32) {
     let style = cell.style().unwrap_or_default();
-    let mut fg = cell
-        .fg_color()
-        .ok()
-        .flatten()
-        .map(rgb_color)
-        .unwrap_or(WHITE);
-    let mut bg = cell
-        .bg_color()
-        .ok()
-        .flatten()
-        .map(rgb_color)
-        .unwrap_or(BLACK);
+    let mut fg = match style.fg_color {
+        StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(theme.foreground),
+        StyleColor::Rgb(color) => rgb_color(color),
+        StyleColor::None => cell
+            .fg_color()
+            .ok()
+            .flatten()
+            .map(rgb_color)
+            .unwrap_or(theme.foreground),
+    };
+    let mut bg = match style.bg_color {
+        StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(theme.background),
+        StyleColor::Rgb(color) => rgb_color(color),
+        StyleColor::None => cell
+            .bg_color()
+            .ok()
+            .flatten()
+            .map(rgb_color)
+            .unwrap_or(theme.background),
+    };
 
     if style.inverse {
         std::mem::swap(&mut fg, &mut bg);
@@ -1697,6 +2029,44 @@ fn dim(color: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_ghostty_config_entries() {
+        assert_eq!(
+            ghostty_config_entry("config-file = ?\"~/.config/theme.conf\""),
+            Some(("config-file", "~/.config/theme.conf"))
+        );
+        assert_eq!(
+            ghostty_config_entry("font-family = \"JetBrainsMono Nerd Font\""),
+            Some(("font-family", "JetBrainsMono Nerd Font"))
+        );
+    }
+
+    #[test]
+    fn parses_theme_colors() {
+        let mut config = TerminalConfig::default();
+
+        config.apply_entry("background", "#0f0d21");
+        config.apply_entry("foreground", "#ffffff");
+        config.apply_entry("palette", "4=#b0c3f8");
+
+        assert_eq!(config.theme.background, 0x0f0d21);
+        assert_eq!(config.theme.foreground, 0xffffff);
+        assert_eq!(config.theme.palette[4], 0xb0c3f8);
+    }
+
+    #[test]
+    fn scales_metrics_from_ghostty_font_size() {
+        let mut config = TerminalConfig {
+            font_size: 9.0,
+            ..TerminalConfig::default()
+        };
+
+        config.finalize_metrics();
+
+        assert_eq!(config.metrics.cell_width, 5);
+        assert_eq!(config.metrics.cell_height, 12);
+    }
 
     #[test]
     fn finds_reference_under_column() {
