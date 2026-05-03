@@ -608,19 +608,17 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
     vec![
         OsString::from("--listen"),
         config.nvim_socket_path.clone().into_os_string(),
+        OsString::from("--cmd"),
+        OsString::from(format!(
+            "lua vim.g.spectre_editor_socket = {}",
+            lua_string_literal(&config.editor_socket_path)
+        )),
         OsString::from("-c"),
         OsString::from(format!(
-            "lua {}",
-            nvim_context_bridge_lua(&config.editor_socket_path)
+            "luafile {}",
+            vim_fnameescape(&config.nvim_context_bridge_path)
         )),
     ]
-}
-
-fn nvim_context_bridge_lua(editor_socket_path: &Path) -> String {
-    format!(
-        r#"do local socket={}; local uv=vim.uv or vim.loop; local pending=false; local function encode(payload) if vim.json and vim.json.encode then return vim.json.encode(payload) else return vim.fn.json_encode(payload) end end; local function notify(payload) if not socket or socket=="" or not uv then return end local pipe=uv.new_pipe(false); if not pipe then return end pipe:connect(socket,function(err) if err then pipe:close(); return end pipe:write(encode(payload).."\n",function() pipe:close() end) end) end; local function path() local buf=vim.api.nvim_get_current_buf(); local p=vim.api.nvim_buf_get_name(buf); if p=="" or vim.bo[buf].buftype~="" then return nil end; local stat=uv.fs_stat(p); if not stat or stat.type~="file" then return nil end; return p end; local function active() local p=path(); if not p then return end local pos=vim.api.nvim_win_get_cursor(0); notify({{type="active_buffer_changed",path=p,line=pos[1],column=pos[2]+1}}) end; local function schedule_active() if pending then return end pending=true; vim.defer_fn(function() pending=false; active() end,75) end; local function diagnostics() local p=path(); if not p then return end local errors=0; local warnings=0; for _,d in ipairs(vim.diagnostic.get(0)) do if d.severity==vim.diagnostic.severity.ERROR then errors=errors+1 elseif d.severity==vim.diagnostic.severity.WARN then warnings=warnings+1 end end; notify({{type="diagnostics_changed",path=p,error_count=errors,warning_count=warnings}}) end; local group=vim.api.nvim_create_augroup("SpectreContextSync",{{clear=true}}); vim.api.nvim_create_autocmd({{"BufEnter","BufFilePost","CursorMoved","CursorMovedI"}},{{group=group,callback=schedule_active}}); vim.api.nvim_create_autocmd("DiagnosticChanged",{{group=group,callback=diagnostics}}); vim.schedule(function() active(); diagnostics() end); end"#,
-        lua_string_literal(editor_socket_path)
-    )
 }
 
 fn format_context_update(path: &Path, line: u32, column: u32, working_directory: &Path) -> String {
@@ -648,6 +646,23 @@ fn lua_string_literal(path: &Path) -> String {
 
     quoted.push('"');
     quoted
+}
+
+fn vim_fnameescape(path: &Path) -> String {
+    let mut escaped = String::new();
+
+    for ch in path.to_string_lossy().chars() {
+        match ch {
+            '\\' | ' ' | '\t' | '\n' | '*' | '?' | '[' | '{' | '`' | '$' | '%' | '#' | '\''
+            | '"' | '|' | '!' | '<' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+
+    escaped
 }
 
 fn terminal_size_for_window(width: usize, height: usize) -> TerminalSize {
@@ -1536,20 +1551,23 @@ mod tests {
             agent_command: None,
             nvim_socket_path: PathBuf::from("/tmp/spectre-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/spectre-editor.sock"),
+            nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
             working_directory: PathBuf::from("/repo"),
         };
         let args = nvim_args(&config);
-        let command = args[3].to_string_lossy();
 
         assert_eq!(args[0], OsString::from("--listen"));
         assert_eq!(args[1], OsString::from("/tmp/spectre-nvim.sock"));
-        assert_eq!(args[2], OsString::from("-c"));
-        assert!(command.contains("SpectreContextSync"));
-        assert!(command.contains("/tmp/spectre-editor.sock"));
-        assert!(command.contains("active_buffer_changed"));
-        assert!(command.contains("diagnostics_changed"));
-        assert!(command.contains("buftype"));
-        assert!(command.contains("fs_stat"));
+        assert_eq!(args[2], OsString::from("--cmd"));
+        assert_eq!(
+            args[3],
+            OsString::from(r#"lua vim.g.spectre_editor_socket = "/tmp/spectre-editor.sock""#)
+        );
+        assert_eq!(args[4], OsString::from("-c"));
+        assert_eq!(
+            args[5],
+            OsString::from("luafile /repo/nvim/context\\ bridge.lua")
+        );
     }
 
     #[test]
@@ -1557,6 +1575,14 @@ mod tests {
         assert_eq!(
             format_context_update(Path::new("/repo/src/main.rs"), 42, 7, Path::new("/repo")),
             "Context update: current file is src/main.rs:42:7\n"
+        );
+    }
+
+    #[test]
+    fn vim_fnameescape_escapes_command_path_characters() {
+        assert_eq!(
+            vim_fnameescape(Path::new("/repo/nvim/context bridge's.lua")),
+            "/repo/nvim/context\\ bridge\\'s.lua"
         );
     }
 
