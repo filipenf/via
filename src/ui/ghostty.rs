@@ -151,6 +151,7 @@ struct TerminalView {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     visible_rows: Vec<String>,
+    hyperlink_tracker: Osc8Tracker,
     size: TerminalSize,
 }
 
@@ -173,6 +174,7 @@ impl TerminalView {
             rows,
             cells,
             visible_rows: Vec::new(),
+            hyperlink_tracker: Osc8Tracker::new(size),
             size,
         })
     }
@@ -194,10 +196,12 @@ impl TerminalView {
         }
 
         self.size = size;
+        self.hyperlink_tracker.resize(size);
         Some(size)
     }
 
     fn process(&mut self, bytes: &[u8]) {
+        self.hyperlink_tracker.process(bytes);
         self.terminal.vt_write(bytes);
     }
 
@@ -229,8 +233,26 @@ impl TerminalView {
         column: usize,
         working_directory: &Path,
     ) -> Option<FileTarget> {
+        if let Some(target) = self.hyperlink_target_at(row, column, working_directory) {
+            return Some(target);
+        }
+
         let row = self.visible_rows.get(row)?;
         file_reference_at(row, column, working_directory)
+    }
+
+    fn hyperlink_target_at(
+        &self,
+        row: usize,
+        column: usize,
+        working_directory: &Path,
+    ) -> Option<FileTarget> {
+        self.hyperlink_tracker
+            .links()
+            .get(row)?
+            .iter()
+            .find(|span| column >= span.start && column < span.end)
+            .and_then(|span| file_target_from_uri(&span.uri, working_directory))
     }
 }
 
@@ -620,6 +642,323 @@ struct FileReferenceSpan {
     target: FileTarget,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LinkSpan {
+    start: usize,
+    end: usize,
+    uri: String,
+}
+
+#[derive(Debug)]
+struct Osc8Tracker {
+    rows: Vec<Vec<LinkSpan>>,
+    active_uri: Option<String>,
+    size: TerminalSize,
+    row: usize,
+    column: usize,
+    index: usize,
+}
+
+impl Osc8Tracker {
+    fn new(size: TerminalSize) -> Self {
+        Self {
+            rows: vec![Vec::new(); size.rows as usize],
+            active_uri: None,
+            size,
+            row: 0,
+            column: 0,
+            index: 0,
+        }
+    }
+
+    fn resize(&mut self, size: TerminalSize) {
+        self.size = size;
+        self.rows.resize(size.rows as usize, Vec::new());
+        self.row = self.row.min(size.rows.saturating_sub(1) as usize);
+        self.column = self.column.min(size.cols.saturating_sub(1) as usize);
+    }
+
+    fn links(&self) -> &[Vec<LinkSpan>] {
+        &self.rows
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        self.index = 0;
+
+        while self.index < bytes.len() {
+            match bytes[self.index] {
+                b'\x1b' => self.parse_escape(bytes),
+                b'\n' => self.newline(),
+                b'\r' => {
+                    self.column = 0;
+                    self.index += 1;
+                }
+                byte if byte.is_ascii_control() => {
+                    self.index += 1;
+                }
+                _ => self.print_char(bytes),
+            }
+        }
+    }
+
+    fn parse_escape(&mut self, bytes: &[u8]) {
+        if bytes.get(self.index + 1) == Some(&b']') {
+            self.parse_osc(bytes);
+            return;
+        }
+
+        if bytes.get(self.index + 1) == Some(&b'[') {
+            self.parse_csi(bytes);
+            return;
+        }
+
+        self.index += 1;
+        while self.index < bytes.len() {
+            let byte = bytes[self.index];
+            self.index += 1;
+
+            if (0x40..=0x7e).contains(&byte) {
+                break;
+            }
+        }
+    }
+
+    fn parse_csi(&mut self, bytes: &[u8]) {
+        let start = self.index + 2;
+        let mut cursor = start;
+
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+
+            if (0x40..=0x7e).contains(&byte) {
+                self.apply_csi(&bytes[start..cursor], byte);
+                self.index = cursor + 1;
+                return;
+            }
+
+            cursor += 1;
+        }
+
+        self.index = bytes.len();
+    }
+
+    fn parse_osc(&mut self, bytes: &[u8]) {
+        let payload_start = self.index + 2;
+        let mut cursor = payload_start;
+
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'\x07' {
+                self.apply_osc(&bytes[payload_start..cursor]);
+                self.index = cursor + 1;
+                return;
+            }
+
+            if bytes[cursor] == b'\x1b' && bytes.get(cursor + 1) == Some(&b'\\') {
+                self.apply_osc(&bytes[payload_start..cursor]);
+                self.index = cursor + 2;
+                return;
+            }
+
+            cursor += 1;
+        }
+
+        self.index = bytes.len();
+    }
+
+    fn apply_osc(&mut self, payload: &[u8]) {
+        let Ok(payload) = std::str::from_utf8(payload) else {
+            return;
+        };
+
+        let Some(rest) = payload.strip_prefix("8;") else {
+            return;
+        };
+        let Some((_, uri)) = rest.split_once(';') else {
+            return;
+        };
+
+        if uri.is_empty() {
+            self.active_uri = None;
+        } else {
+            self.active_uri = Some(uri.to_string());
+        }
+    }
+
+    fn print_char(&mut self, bytes: &[u8]) {
+        let Ok(text) = std::str::from_utf8(&bytes[self.index..]) else {
+            self.index += 1;
+            return;
+        };
+        let Some(ch) = text.chars().next() else {
+            self.index += 1;
+            return;
+        };
+
+        self.extend_active_link();
+        self.advance_column();
+        self.index += ch.len_utf8();
+    }
+
+    fn newline(&mut self) {
+        self.row += 1;
+        if self.row >= self.size.rows as usize {
+            self.rows.remove(0);
+            self.rows.push(Vec::new());
+            self.row = self.size.rows.saturating_sub(1) as usize;
+        }
+        self.column = 0;
+        self.index += 1;
+    }
+
+    fn apply_csi(&mut self, params: &[u8], command: u8) {
+        let params = std::str::from_utf8(params).unwrap_or_default();
+        let numbers = csi_numbers(params);
+
+        match command {
+            b'A' => {
+                self.row = self
+                    .row
+                    .saturating_sub(numbers.first().copied().unwrap_or(1))
+            }
+            b'B' => {
+                self.row = (self.row + numbers.first().copied().unwrap_or(1))
+                    .min(self.size.rows.saturating_sub(1) as usize);
+            }
+            b'C' => {
+                self.column = (self.column + numbers.first().copied().unwrap_or(1))
+                    .min(self.size.cols.saturating_sub(1) as usize);
+            }
+            b'D' => {
+                self.column = self
+                    .column
+                    .saturating_sub(numbers.first().copied().unwrap_or(1))
+            }
+            b'H' | b'f' => {
+                self.row = numbers
+                    .first()
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(self.size.rows.saturating_sub(1) as usize);
+                self.column = numbers
+                    .get(1)
+                    .copied()
+                    .unwrap_or(1)
+                    .saturating_sub(1)
+                    .min(self.size.cols.saturating_sub(1) as usize);
+            }
+            b'J' => self.clear_screen(),
+            b'K' => self.clear_current_row(),
+            _ => {}
+        }
+    }
+
+    fn extend_active_link(&mut self) {
+        let Some(uri) = &self.active_uri else {
+            return;
+        };
+        let Some(row) = self.rows.get_mut(self.row) else {
+            return;
+        };
+
+        match row.last_mut() {
+            Some(span) if span.uri == *uri && span.end == self.column => {
+                span.end += 1;
+            }
+            _ => row.push(LinkSpan {
+                start: self.column,
+                end: self.column + 1,
+                uri: uri.clone(),
+            }),
+        }
+    }
+
+    fn advance_column(&mut self) {
+        self.column += 1;
+
+        if self.column >= self.size.cols as usize {
+            self.newline_without_index();
+        }
+    }
+
+    fn newline_without_index(&mut self) {
+        self.row += 1;
+        if self.row >= self.size.rows as usize {
+            self.rows.remove(0);
+            self.rows.push(Vec::new());
+            self.row = self.size.rows.saturating_sub(1) as usize;
+        }
+        self.column = 0;
+    }
+
+    fn clear_screen(&mut self) {
+        self.rows.iter_mut().for_each(Vec::clear);
+        self.row = 0;
+        self.column = 0;
+    }
+
+    fn clear_current_row(&mut self) {
+        if let Some(row) = self.rows.get_mut(self.row) {
+            row.clear();
+        }
+    }
+}
+
+#[cfg(test)]
+fn parse_vt_hyperlinks(bytes: &[u8], size: TerminalSize) -> Vec<Vec<LinkSpan>> {
+    let mut parser = Osc8Tracker::new(size);
+
+    parser.process(bytes);
+    parser.rows
+}
+
+fn csi_numbers(params: &str) -> Vec<usize> {
+    params
+        .trim_start_matches('?')
+        .split(';')
+        .map(|param| param.parse::<usize>().unwrap_or(1))
+        .collect()
+}
+
+fn file_target_from_uri(uri: &str, working_directory: &Path) -> Option<FileTarget> {
+    let path = uri
+        .strip_prefix("file://")
+        .map(percent_decode)
+        .or_else(|| uri.strip_prefix("file:").map(percent_decode))
+        .or_else(|| {
+            if uri.contains("://") {
+                None
+            } else {
+                Some(uri.to_string())
+            }
+        })?;
+
+    Some(FileTarget::parse(&path, working_directory))
+}
+
+fn percent_decode(input: &str) -> String {
+    let mut bytes = Vec::with_capacity(input.len());
+    let input = input.as_bytes();
+    let mut index = 0;
+
+    while index < input.len() {
+        if input[index] == b'%' && index + 2 < input.len() {
+            if let Ok(hex) = std::str::from_utf8(&input[index + 1..index + 3]) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    bytes.push(byte);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+
+        bytes.push(input[index]);
+        index += 1;
+    }
+
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn trim_file_reference(chars: &[char]) -> Option<(usize, usize, String)> {
     let mut start = 0;
     let mut end = chars.len();
@@ -812,5 +1151,82 @@ mod tests {
     #[test]
     fn ignores_plain_words() {
         assert!(file_reference_at("no file here", 1, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn parses_osc8_hyperlink_spans() {
+        let rows = parse_vt_hyperlinks(
+            b"see \x1b]8;;file:///repo/src/main.rs:8\x1b\\main\x1b]8;;\x1b\\ now",
+            test_terminal_size(),
+        );
+
+        assert_eq!(
+            rows[0],
+            vec![LinkSpan {
+                start: 4,
+                end: 8,
+                uri: "file:///repo/src/main.rs:8".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_bel_terminated_osc8_hyperlink_spans() {
+        let rows = parse_vt_hyperlinks(
+            b"\x1b]8;;src/lib.rs:3\x07lib\x1b]8;;\x07",
+            test_terminal_size(),
+        );
+
+        assert_eq!(
+            rows[0],
+            vec![LinkSpan {
+                start: 0,
+                end: 3,
+                uri: "src/lib.rs:3".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn tracks_osc8_links_after_cursor_movement() {
+        let rows = parse_vt_hyperlinks(
+            b"\x1b[2;5H\x1b]8;;file:///repo/src/main.rs:8\x1b\\main\x1b]8;;\x1b\\",
+            test_terminal_size(),
+        );
+
+        assert_eq!(
+            rows[1],
+            vec![LinkSpan {
+                start: 4,
+                end: 8,
+                uri: "file:///repo/src/main.rs:8".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn converts_file_uri_to_target() {
+        let target =
+            file_target_from_uri("file:///repo/src/main%20file.rs:8", Path::new("/fallback"))
+                .unwrap();
+
+        assert_eq!(target.path, PathBuf::from("/repo/src/main file.rs"));
+        assert_eq!(target.line, Some(8));
+    }
+
+    #[test]
+    fn ignores_non_file_uris() {
+        assert!(
+            file_target_from_uri("https://example.com/src/main.rs", Path::new("/repo")).is_none()
+        );
+    }
+
+    fn test_terminal_size() -> TerminalSize {
+        TerminalSize {
+            rows: 5,
+            cols: 40,
+            pixel_width: 400,
+            pixel_height: 100,
+        }
     }
 }
