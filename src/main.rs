@@ -1,4 +1,5 @@
 mod config;
+mod editor;
 mod event;
 mod logging;
 mod mediator;
