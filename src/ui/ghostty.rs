@@ -32,6 +32,9 @@ const SCROLLBACK_ROWS: usize = 10_000;
 const BLACK: u32 = 0x0c0c0c;
 const WHITE: u32 = 0xd8d8d8;
 const CURSOR: u32 = 0xb8bb26;
+const ACTIVE_BORDER: u32 = 0x83a598;
+const INACTIVE_BORDER: u32 = 0x3c3836;
+const SPLIT_GAP: usize = 2;
 
 pub struct GhosttyUi {
     config: Config,
@@ -67,37 +70,63 @@ impl GhosttyUi {
 
         let mut font_renderer = FontRenderer::new()?;
         let mut buffer = vec![BLACK; INITIAL_WIDTH * INITIAL_HEIGHT];
-        let mut view = TerminalView::new(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+        let mut panes = self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT)?;
+        let mut active_pane = 0;
+        let mut layout = SplitLayout::for_window(INITIAL_WIDTH, INITIAL_HEIGHT, panes.len());
         let nvim_args = [
             OsString::from("--listen"),
             self.config.nvim_socket_path.clone().into_os_string(),
         ];
-        let mut pty = PtySession::spawn_with_args(
+
+        panes[0].spawn(
             &self.config.nvim_command,
             nvim_args,
             &self.config.working_directory,
-            view.size,
         )?;
 
-        info!(size = ?view.size, "native terminal window ready");
+        info!(panes = panes.len(), "native terminal window ready");
         let mut left_mouse_down = false;
 
         while window.is_open() {
             let (width, height) = window.get_size();
             ensure_buffer_size(&mut buffer, width, height);
 
-            if let Some(size) = view.resize(width, height) {
-                pty.resize(size)?;
-                debug!(?size, "resized terminal");
+            let new_layout = SplitLayout::for_window(width, height, panes.len());
+            if new_layout != layout {
+                layout = new_layout;
+
+                for (index, pane) in panes.iter_mut().enumerate() {
+                    let rect = layout.pane(index);
+                    if let Some(size) = pane.resize(rect.width, rect.height) {
+                        debug!(pane = pane.title, ?size, "resized terminal pane");
+                    }
+                }
             }
 
-            let output = pty.output().clone();
-            drain_pty_output(&output, &mut view);
-            forward_text_input(&input_rx, &mut pty)?;
-            forward_special_keys(&window, &mut pty)?;
+            for pane in &mut panes {
+                pane.drain_output();
+            }
+            forward_text_input(&input_rx, &mut panes[active_pane])?;
+            forward_special_keys(&window, &mut panes[active_pane])?;
 
-            view.draw(&mut font_renderer, &mut buffer, width, height);
-            self.forward_file_reference_click(&window, &view, &mut left_mouse_down);
+            buffer.fill(BLACK);
+            for (index, pane) in panes.iter_mut().enumerate() {
+                pane.draw(
+                    &mut font_renderer,
+                    &mut buffer,
+                    width,
+                    height,
+                    layout.pane(index),
+                    index == active_pane,
+                );
+            }
+            self.forward_file_reference_click(
+                &window,
+                &panes,
+                &layout,
+                &mut active_pane,
+                &mut left_mouse_down,
+            );
             window
                 .update_with_buffer(&buffer, width, height)
                 .context("failed to update native window")?;
@@ -108,10 +137,37 @@ impl GhosttyUi {
         Ok(())
     }
 
+    fn create_panes(&self, width: usize, height: usize) -> Result<Vec<TerminalPane>> {
+        let layout = SplitLayout::for_window(width, height, self.pane_count());
+        let mut panes = vec![TerminalPane::new(
+            "nvim",
+            layout.pane(0).width,
+            layout.pane(0).height,
+        )?];
+
+        if let Some(agent_command) = self.config.agent_command.as_deref() {
+            let mut pane = TerminalPane::new("agent", layout.pane(1).width, layout.pane(1).height)?;
+            pane.spawn_shell_command(agent_command, &self.config.working_directory)?;
+            panes.push(pane);
+        }
+
+        Ok(panes)
+    }
+
+    fn pane_count(&self) -> usize {
+        if self.config.agent_command.is_some() {
+            2
+        } else {
+            1
+        }
+    }
+
     fn forward_file_reference_click(
         &self,
         window: &Window,
-        view: &TerminalView,
+        panes: &[TerminalPane],
+        layout: &SplitLayout,
+        active_pane: &mut usize,
         left_mouse_down: &mut bool,
     ) {
         let is_down = window.get_mouse_down(MouseButton::Left);
@@ -126,9 +182,17 @@ impl GhosttyUi {
             return;
         };
 
-        let row = (y as usize) / CELL_HEIGHT;
-        let column = (x as usize) / CELL_WIDTH;
-        let Some(target) = view.file_reference_at(row, column, &self.config.working_directory)
+        let x = x as usize;
+        let y = y as usize;
+        let Some((pane_index, rect)) = layout.pane_at(x, y) else {
+            return;
+        };
+        *active_pane = pane_index;
+
+        let row = (y - rect.y) / CELL_HEIGHT;
+        let column = (x - rect.x) / CELL_WIDTH;
+        let Some(target) =
+            panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
         else {
             return;
         };
@@ -142,6 +206,158 @@ impl GhosttyUi {
             path: target.path,
             line: target.line,
         }));
+    }
+}
+
+struct TerminalPane {
+    title: &'static str,
+    view: TerminalView,
+    pty: Option<PtySession>,
+}
+
+impl TerminalPane {
+    fn new(title: &'static str, width: usize, height: usize) -> Result<Self> {
+        Ok(Self {
+            title,
+            view: TerminalView::new(width, height)?,
+            pty: None,
+        })
+    }
+
+    fn spawn<I, S>(&mut self, command: &str, args: I, cwd: &Path) -> Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        self.pty = Some(PtySession::spawn_with_args(
+            command,
+            args,
+            cwd,
+            self.view.size,
+        )?);
+        Ok(())
+    }
+
+    fn spawn_shell_command(&mut self, command: &str, cwd: &Path) -> Result<()> {
+        self.spawn("sh", [OsString::from("-lc"), OsString::from(command)], cwd)
+    }
+
+    fn drain_output(&mut self) {
+        if let Some(pty) = &self.pty {
+            let output = pty.output().clone();
+            drain_pty_output(&output, &mut self.view);
+        }
+    }
+
+    fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
+        let size = self.view.resize(width, height)?;
+
+        if let Some(pty) = &mut self.pty {
+            if let Err(error) = pty.resize(size) {
+                debug!(pane = self.title, %error, "failed to resize PTY");
+            }
+        }
+
+        Some(size)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        if let Some(pty) = &mut self.pty {
+            pty.write_all(bytes)?;
+        }
+
+        Ok(())
+    }
+
+    fn draw(
+        &mut self,
+        font_renderer: &mut FontRenderer,
+        buffer: &mut [u32],
+        buffer_width: usize,
+        buffer_height: usize,
+        rect: PaneRect,
+        active: bool,
+    ) {
+        self.view.draw(
+            font_renderer,
+            buffer,
+            buffer_width,
+            buffer_height,
+            rect.x,
+            rect.y,
+        );
+        draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
+    }
+
+    fn file_reference_at(
+        &self,
+        row: usize,
+        column: usize,
+        working_directory: &Path,
+    ) -> Option<FileTarget> {
+        self.view.file_reference_at(row, column, working_directory)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PaneRect {
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SplitLayout {
+    panes: Vec<PaneRect>,
+}
+
+impl SplitLayout {
+    fn for_window(width: usize, height: usize, pane_count: usize) -> Self {
+        if pane_count <= 1 {
+            return Self {
+                panes: vec![PaneRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                }],
+            };
+        }
+
+        let left_width = width.saturating_sub(SPLIT_GAP) / 2;
+        let right_x = left_width + SPLIT_GAP;
+        let right_width = width.saturating_sub(right_x);
+
+        Self {
+            panes: vec![
+                PaneRect {
+                    x: 0,
+                    y: 0,
+                    width: left_width,
+                    height,
+                },
+                PaneRect {
+                    x: right_x,
+                    y: 0,
+                    width: right_width,
+                    height,
+                },
+            ],
+        }
+    }
+
+    fn pane(&self, index: usize) -> PaneRect {
+        self.panes[index]
+    }
+
+    fn pane_at(&self, x: usize, y: usize) -> Option<(usize, PaneRect)> {
+        self.panes.iter().copied().enumerate().find(|(_, rect)| {
+            x >= rect.x
+                && x < rect.x.saturating_add(rect.width)
+                && y >= rect.y
+                && y < rect.y.saturating_add(rect.height)
+        })
     }
 }
 
@@ -211,8 +427,9 @@ impl TerminalView {
         buffer: &mut [u32],
         width: usize,
         height: usize,
+        origin_x: usize,
+        origin_y: usize,
     ) {
-        buffer.fill(BLACK);
         self.visible_rows.clear();
         draw_screen(
             &self.terminal,
@@ -224,6 +441,8 @@ impl TerminalView {
             buffer,
             width,
             height,
+            origin_x,
+            origin_y,
         );
     }
 
@@ -280,28 +499,28 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) {
     }
 }
 
-fn forward_text_input(input: &Receiver<char>, pty: &mut PtySession) -> Result<()> {
+fn forward_text_input(input: &Receiver<char>, pane: &mut TerminalPane) -> Result<()> {
     for ch in input.try_iter() {
         let mut bytes = [0; 4];
-        pty.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
+        pane.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
     }
 
     Ok(())
 }
 
-fn forward_special_keys(window: &Window, pty: &mut PtySession) -> Result<()> {
+fn forward_special_keys(window: &Window, pane: &mut TerminalPane) -> Result<()> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
 
     for key in window.get_keys_pressed(KeyRepeat::Yes) {
         if ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
-                pty.write_all(&bytes)?;
+                pane.write_all(&bytes)?;
                 continue;
             }
         }
 
         if let Some(bytes) = key_sequence(key) {
-            pty.write_all(bytes)?;
+            pane.write_all(bytes)?;
         }
     }
 
@@ -382,6 +601,41 @@ fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize) {
     }
 }
 
+fn draw_pane_border(buffer: &mut [u32], width: usize, height: usize, rect: PaneRect, active: bool) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let color = if active {
+        ACTIVE_BORDER
+    } else {
+        INACTIVE_BORDER
+    };
+
+    draw_rect(buffer, width, height, rect.x, rect.y, rect.width, 1, color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        rect.x,
+        rect.y + rect.height.saturating_sub(1),
+        rect.width,
+        1,
+        color,
+    );
+    draw_rect(buffer, width, height, rect.x, rect.y, 1, rect.height, color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        rect.x + rect.width.saturating_sub(1),
+        rect.y,
+        1,
+        rect.height,
+        color,
+    );
+}
+
 fn draw_screen(
     terminal: &Terminal<'static, 'static>,
     render_state: &mut RenderState<'static>,
@@ -392,6 +646,8 @@ fn draw_screen(
     buffer: &mut [u32],
     width: usize,
     height: usize,
+    origin_x: usize,
+    origin_y: usize,
 ) {
     let Ok(snapshot) = render_state.update(terminal) else {
         return;
@@ -408,12 +664,12 @@ fn draw_screen(
             Ok(iter) => iter,
             Err(_) => return,
         };
-        let y = row as usize * CELL_HEIGHT;
+        let y = origin_y + row as usize * CELL_HEIGHT;
         let mut row_text = String::new();
         let mut col = 0;
 
         while let Some(cell_ref) = cell_iter.next() {
-            let x = col as usize * CELL_WIDTH;
+            let x = origin_x + col as usize * CELL_WIDTH;
             let ch = draw_cell(cell_ref, font_renderer, buffer, width, height, x, y);
             row_text.push(ch.unwrap_or(' '));
             col += 1;
@@ -440,8 +696,8 @@ fn draw_screen(
                 buffer,
                 width,
                 height,
-                cursor.x as usize * CELL_WIDTH,
-                cursor.y as usize * CELL_HEIGHT + CELL_HEIGHT - 2,
+                origin_x + cursor.x as usize * CELL_WIDTH,
+                origin_y + cursor.y as usize * CELL_HEIGHT + CELL_HEIGHT - 2,
                 CELL_WIDTH,
                 2,
                 cursor_color,
@@ -970,7 +1226,7 @@ fn trim_file_reference(chars: &[char]) -> Option<(usize, usize, String)> {
     while end > start
         && matches!(
             chars[end - 1],
-            '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '.'
+            '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '.' | ':'
         )
     {
         end -= 1;
@@ -1149,8 +1405,59 @@ mod tests {
     }
 
     #[test]
+    fn trims_trailing_colon_without_line_number() {
+        let target =
+            file_reference_at("see src/ui.rs: for details", 5, Path::new("/repo")).unwrap();
+
+        assert_eq!(target.path, PathBuf::from("/repo/src/ui.rs"));
+        assert_eq!(target.line, None);
+    }
+
+    #[test]
     fn ignores_plain_words() {
         assert!(file_reference_at("no file here", 1, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn creates_single_pane_layout_without_agent() {
+        let layout = SplitLayout::for_window(100, 50, 1);
+
+        assert_eq!(
+            layout.pane(0),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 50,
+            }
+        );
+    }
+
+    #[test]
+    fn creates_vertical_split_layout_for_agent() {
+        let layout = SplitLayout::for_window(100, 50, 2);
+
+        assert_eq!(
+            layout.pane(0),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 49,
+                height: 50,
+            }
+        );
+        assert_eq!(
+            layout.pane(1),
+            PaneRect {
+                x: 51,
+                y: 0,
+                width: 49,
+                height: 50,
+            }
+        );
+        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
+        assert_eq!(layout.pane_at(60, 10).map(|(index, _)| index), Some(1));
+        assert_eq!(layout.pane_at(50, 10), None);
     }
 
     #[test]

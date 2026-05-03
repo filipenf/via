@@ -62,23 +62,15 @@ pub struct FileTarget {
 
 impl FileTarget {
     pub fn parse(input: &str, working_directory: &Path) -> Self {
-        let Some((path, line)) = input.rsplit_once(':') else {
-            return Self {
+        match parse_location(input) {
+            Some((path, line)) => Self {
+                path: resolve_path(path, working_directory),
+                line: Some(line),
+            },
+            None => Self {
                 path: resolve_path(input, working_directory),
                 line: None,
-            };
-        };
-
-        let Ok(line) = line.parse::<u32>() else {
-            return Self {
-                path: resolve_path(input, working_directory),
-                line: None,
-            };
-        };
-
-        Self {
-            path: resolve_path(path, working_directory),
-            line: Some(line),
+            },
         }
     }
 
@@ -90,6 +82,20 @@ impl FileTarget {
             None => format!("drop {path}"),
         }
     }
+}
+
+fn parse_location(input: &str) -> Option<(&str, u32)> {
+    let input = input.trim_end_matches(':');
+    let (path, last) = input.rsplit_once(':')?;
+    let last = last.parse::<u32>().ok()?;
+
+    if let Some((path, maybe_line)) = path.rsplit_once(':') {
+        if let Ok(line) = maybe_line.parse::<u32>() {
+            return Some((path, line));
+        }
+    }
+
+    Some((path, last))
 }
 
 fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
@@ -126,6 +132,28 @@ mod tests {
     fn parses_path_with_line() {
         assert_eq!(
             FileTarget::parse("src/main.rs:42", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_path_with_line_and_column() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:42:7", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_path_with_trailing_colon_after_location() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:42:7:", Path::new("/repo")),
             FileTarget {
                 path: PathBuf::from("/repo/src/main.rs"),
                 line: Some(42),
