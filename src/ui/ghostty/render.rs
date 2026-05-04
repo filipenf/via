@@ -1,5 +1,5 @@
 use libghostty_vt::Terminal;
-use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
+use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, StyleColor};
 
@@ -64,21 +64,45 @@ pub(super) fn draw_screen(
     origin_x: usize,
     origin_y: usize,
     metrics: TerminalMetrics,
-) {
+    force_redraw: bool,
+) -> bool {
     let Ok(snapshot) = render_state.update(terminal) else {
-        return;
+        return false;
     };
+    let dirty = snapshot.dirty().unwrap_or(Dirty::Full);
+    if dirty == Dirty::Clean && !force_redraw {
+        return false;
+    }
+
     let cols = snapshot.cols().unwrap_or(0);
     let mut row_iter = match rows.update(&snapshot) {
         Ok(iter) => iter,
-        Err(_) => return,
+        Err(_) => return false,
     };
     let mut row = 0usize;
+    let redraw_all_rows = force_redraw || dirty == Dirty::Full;
 
     while let Some(row_ref) = row_iter.next() {
+        let row_dirty = redraw_all_rows || row_ref.dirty().unwrap_or(true);
+        if row_dirty {
+            draw_rect(
+                buffer,
+                width,
+                height,
+                origin_x,
+                origin_y + row * metrics.cell_height,
+                cols as usize * metrics.cell_width,
+                metrics.cell_height,
+                font_renderer.theme.background,
+            );
+        } else if visible_rows.len() > row {
+            row += 1;
+            continue;
+        }
+
         let mut cell_iter = match cells.update(row_ref) {
             Ok(iter) => iter,
-            Err(_) => return,
+            Err(_) => return false,
         };
         let y = origin_y + row * metrics.cell_height;
         if visible_rows.len() <= row {
@@ -90,16 +114,20 @@ pub(super) fn draw_screen(
 
         while let Some(cell_ref) = cell_iter.next() {
             let x = origin_x + col as usize * metrics.cell_width;
-            let ch = draw_cell(
-                cell_ref,
-                font_renderer,
-                buffer,
-                width,
-                height,
-                x,
-                y,
-                metrics,
-            );
+            let ch = if row_dirty {
+                draw_cell(
+                    cell_ref,
+                    font_renderer,
+                    buffer,
+                    width,
+                    height,
+                    x,
+                    y,
+                    metrics,
+                )
+            } else {
+                cell_char(cell_ref)
+            };
             row_text.push(ch.unwrap_or(' '));
             col += 1;
 
@@ -108,6 +136,9 @@ pub(super) fn draw_screen(
             }
         }
 
+        if row_dirty {
+            let _ = row_ref.set_dirty(false);
+        }
         row += 1;
     }
 
@@ -134,6 +165,9 @@ pub(super) fn draw_screen(
             );
         }
     }
+
+    let _ = snapshot.set_dirty(Dirty::Clean);
+    true
 }
 
 fn draw_cell(
@@ -206,6 +240,17 @@ fn draw_cell(
         font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
     }
     Some(ch)
+}
+
+fn cell_char(cell: &CellIteration<'static, '_>) -> Option<char> {
+    let raw_cell = cell.raw_cell().ok()?;
+    if !raw_cell.has_text().unwrap_or(false) {
+        return None;
+    }
+
+    cell.graphemes()
+        .ok()
+        .and_then(|mut graphemes| graphemes.drain(..).next())
 }
 
 /// Synthetically draw Unicode block element characters (U+2580–U+259F) as exact
