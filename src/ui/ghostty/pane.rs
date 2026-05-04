@@ -57,11 +57,13 @@ impl TerminalPane {
         self.spawn("sh", [OsString::from("-lc"), OsString::from(command)], cwd)
     }
 
-    pub(super) fn drain_output(&mut self) {
+    pub(super) fn drain_output(&mut self) -> bool {
         if let Some(pty) = &self.pty {
             let output = pty.output().clone();
-            drain_pty_output(&output, &mut self.view);
+            return drain_pty_output(&output, &mut self.view);
         }
+
+        false
     }
 
     pub(super) fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
@@ -261,10 +263,15 @@ impl TerminalView {
     }
 }
 
-fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) {
+fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool {
+    let mut had_output = false;
+
     for chunk in output.try_iter() {
+        had_output = true;
         view.process(&chunk);
     }
+
+    had_output
 }
 
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {

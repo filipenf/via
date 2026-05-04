@@ -44,9 +44,10 @@ pub(super) fn forward_text_input(
     window: &Window,
     pane: &mut TerminalPane,
     suppress_input: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
     let super_down = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
+    let mut wrote = false;
 
     for ch in input.try_iter() {
         if suppress_input || ctrl || super_down {
@@ -55,9 +56,10 @@ pub(super) fn forward_text_input(
 
         let mut bytes = [0; 4];
         pane.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
+        wrote = true;
     }
 
-    Ok(())
+    Ok(wrote)
 }
 
 /// Clipboard paste from OS selection (Ctrl+V, Ctrl+Shift+V, Super+V, Shift+Insert).
@@ -66,11 +68,11 @@ pub(super) fn try_clipboard_paste(
     paste_signal: &Receiver<()>,
     pane: &mut TerminalPane,
     suppress_input: bool,
-) -> Result<()> {
+) -> Result<bool> {
     if suppress_input {
         // Drain any pending signals.
         for _ in paste_signal.try_iter() {}
-        return Ok(());
+        return Ok(false);
     }
 
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
@@ -92,21 +94,21 @@ pub(super) fn try_clipboard_paste(
         || super_insert;
 
     if !paste_requested {
-        return Ok(());
+        return Ok(false);
     }
 
     let text = match Clipboard::new().and_then(|mut c| c.get_text()) {
         Ok(t) => t,
         Err(error) => {
             warn!(%error, "clipboard read failed");
-            return Ok(());
+            return Ok(false);
         }
     };
 
     tracing::info!(len = text.len(), "pasting from clipboard");
 
     if text.is_empty() {
-        return Ok(());
+        return Ok(false);
     }
 
     let mut payload = Vec::with_capacity(text.len() + BRACKETED_PASTE_START.len() + 8);
@@ -114,7 +116,7 @@ pub(super) fn try_clipboard_paste(
     payload.extend_from_slice(text.as_bytes());
     payload.extend_from_slice(BRACKETED_PASTE_END);
     pane.write_all(&payload)?;
-    Ok(())
+    Ok(true)
 }
 
 /// Scroll the terminal viewport under the mouse wheel using libghostty scrollback.
@@ -123,35 +125,38 @@ pub(super) fn forward_mouse_scroll(
     layout: &SplitLayout,
     panes: &mut [TerminalPane],
     suppress_input: bool,
-) {
+) -> bool {
     if suppress_input {
-        return;
+        return false;
     }
 
     let Some((_sx, sy)) = window.get_scroll_wheel() else {
-        return;
+        return false;
     };
 
     if sy.abs() < f32::EPSILON {
-        return;
+        return false;
     }
 
     let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
-        return;
+        return false;
     };
 
     let x = x as usize;
     let y = y as usize;
 
     let Some((pane_index, _rect)) = layout.pane_at(x, y) else {
-        return;
+        return false;
     };
 
     let delta_y = (-sy / 40.0).round().clamp(-64.0, 64.0) as isize;
 
     if delta_y != 0 {
         panes[pane_index].scroll_viewport(delta_y);
+        return true;
     }
+
+    false
 }
 
 pub(super) fn forward_special_keys(
@@ -159,10 +164,11 @@ pub(super) fn forward_special_keys(
     window: &Window,
     pane: &mut TerminalPane,
     skip_layout_shortcut: bool,
-) -> Result<()> {
+) -> Result<bool> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let super_key = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
+    let mut wrote = false;
 
     for key in pressed_keys.iter().copied() {
         if skip_layout_shortcut
@@ -192,16 +198,18 @@ pub(super) fn forward_special_keys(
         if ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
                 pane.write_all(&bytes)?;
+                wrote = true;
                 continue;
             }
         }
 
         if let Some(bytes) = key_sequence(key) {
             pane.write_all(bytes)?;
+            wrote = true;
         }
     }
 
-    Ok(())
+    Ok(wrote)
 }
 
 fn ctrl_sequence(key: Key) -> Option<[u8; 1]> {
