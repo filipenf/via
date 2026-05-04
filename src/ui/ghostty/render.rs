@@ -1,16 +1,22 @@
+use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::{RgbColor, StyleColor};
-use libghostty_vt::Terminal;
 
-use super::config::{color_from_palette, TerminalMetrics, TerminalTheme};
+use super::config::{TerminalMetrics, TerminalTheme, color_from_palette};
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 
 const ACTIVE_BORDER: u32 = 0x83a598;
 const INACTIVE_BORDER: u32 = 0x3c3836;
 
-pub(super) fn draw_pane_border(buffer: &mut [u32], width: usize, height: usize, rect: PaneRect, active: bool) {
+pub(super) fn draw_pane_border(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    rect: PaneRect,
+    active: bool,
+) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }

@@ -3,7 +3,11 @@ use std::path::Path;
 use crate::nvim::FileTarget;
 use crate::pty::TerminalSize;
 
-pub(super) fn file_reference_at(row: &str, column: usize, working_directory: &Path) -> Option<FileTarget> {
+pub(super) fn file_reference_at(
+    row: &str,
+    column: usize,
+    working_directory: &Path,
+) -> Option<FileTarget> {
     let spans = file_reference_spans(row, working_directory);
 
     spans

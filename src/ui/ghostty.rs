@@ -23,7 +23,7 @@ mod render;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{TextInput, forward_special_keys, forward_text_input};
-use layout::{PaneLayoutMode, SplitLayout, handle_layout_shortcuts};
+use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
 
 const INITIAL_WIDTH: usize = 960;
@@ -80,8 +80,15 @@ impl GhosttyUi {
             self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT, terminal_config.metrics)?;
         let mut active_pane = 0;
         let mut pane_layout_mode = PaneLayoutMode::Split;
-        let mut layout =
-            SplitLayout::for_window(INITIAL_WIDTH, INITIAL_HEIGHT, panes.len(), pane_layout_mode);
+        let mut pane_split_direction =
+            PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
+        let mut layout = SplitLayout::for_window(
+            INITIAL_WIDTH,
+            INITIAL_HEIGHT,
+            panes.len(),
+            pane_layout_mode,
+            pane_split_direction,
+        );
         let nvim_args = nvim_args(&self.config);
 
         panes[0].spawn(
@@ -103,10 +110,17 @@ impl GhosttyUi {
                 alt,
                 panes.len(),
                 &mut pane_layout_mode,
+                &mut pane_split_direction,
                 &mut active_pane,
             );
 
-            let new_layout = SplitLayout::for_window(width, height, panes.len(), pane_layout_mode);
+            let new_layout = SplitLayout::for_window(
+                width,
+                height,
+                panes.len(),
+                pane_layout_mode,
+                pane_split_direction,
+            );
             if new_layout != layout {
                 layout = new_layout;
 
@@ -169,8 +183,13 @@ impl GhosttyUi {
         height: usize,
         metrics: TerminalMetrics,
     ) -> Result<Vec<TerminalPane>> {
-        let layout =
-            SplitLayout::for_window(width, height, self.pane_count(), PaneLayoutMode::Split);
+        let layout = SplitLayout::for_window(
+            width,
+            height,
+            self.pane_count(),
+            PaneLayoutMode::Split,
+            PaneSplitDirection::for_window(width, height),
+        );
         let mut panes = vec![TerminalPane::new(
             "nvim",
             layout.pane(0).width,
@@ -401,9 +420,7 @@ mod tests {
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
-    use links::{
-        LinkSpan, file_reference_at, file_target_from_uri, parse_vt_hyperlinks,
-    };
+    use links::{LinkSpan, file_reference_at, file_target_from_uri, parse_vt_hyperlinks};
 
     #[test]
     fn parses_ghostty_config_entries() {
@@ -476,7 +493,13 @@ mod tests {
 
     #[test]
     fn creates_single_pane_layout_without_agent() {
-        let layout = SplitLayout::for_window(100, 50, 1, PaneLayoutMode::Split);
+        let layout = SplitLayout::for_window(
+            100,
+            50,
+            1,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Vertical,
+        );
 
         assert_eq!(
             layout.pane(0),
@@ -491,7 +514,13 @@ mod tests {
 
     #[test]
     fn creates_vertical_split_layout_for_agent() {
-        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::Split);
+        let layout = SplitLayout::for_window(
+            100,
+            50,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Vertical,
+        );
 
         assert_eq!(
             layout.pane(0),
@@ -517,8 +546,63 @@ mod tests {
     }
 
     #[test]
+    fn creates_horizontal_split_layout_for_agent() {
+        let layout = SplitLayout::for_window(
+            50,
+            100,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Horizontal,
+        );
+
+        assert_eq!(
+            layout.pane(0),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 50,
+                height: 49,
+            }
+        );
+        assert_eq!(
+            layout.pane(1),
+            PaneRect {
+                x: 0,
+                y: 51,
+                width: 50,
+                height: 49,
+            }
+        );
+        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
+        assert_eq!(layout.pane_at(10, 60).map(|(index, _)| index), Some(1));
+        assert_eq!(layout.pane_at(10, 50), None);
+    }
+
+    #[test]
+    fn selects_initial_split_direction_from_window_shape() {
+        assert_eq!(
+            PaneSplitDirection::for_window(50, 100),
+            PaneSplitDirection::Horizontal
+        );
+        assert_eq!(
+            PaneSplitDirection::for_window(100, 50),
+            PaneSplitDirection::Vertical
+        );
+        assert_eq!(
+            PaneSplitDirection::for_window(100, 100),
+            PaneSplitDirection::Vertical
+        );
+    }
+
+    #[test]
     fn creates_nvim_maximized_layout() {
-        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::NvimMaximized);
+        let layout = SplitLayout::for_window(
+            100,
+            50,
+            2,
+            PaneLayoutMode::NvimMaximized,
+            PaneSplitDirection::Vertical,
+        );
 
         assert_eq!(
             layout.pane(0),
@@ -543,7 +627,13 @@ mod tests {
 
     #[test]
     fn creates_agent_maximized_layout() {
-        let layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::AgentMaximized);
+        let layout = SplitLayout::for_window(
+            100,
+            50,
+            2,
+            PaneLayoutMode::AgentMaximized,
+            PaneSplitDirection::Vertical,
+        );
 
         assert_eq!(
             layout.pane(0),
@@ -568,8 +658,20 @@ mod tests {
 
     #[test]
     fn maximized_layouts_keep_hidden_panes_zero_sized() {
-        let nvim_layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::NvimMaximized);
-        let agent_layout = SplitLayout::for_window(100, 50, 2, PaneLayoutMode::AgentMaximized);
+        let nvim_layout = SplitLayout::for_window(
+            100,
+            50,
+            2,
+            PaneLayoutMode::NvimMaximized,
+            PaneSplitDirection::Vertical,
+        );
+        let agent_layout = SplitLayout::for_window(
+            100,
+            50,
+            2,
+            PaneLayoutMode::AgentMaximized,
+            PaneSplitDirection::Vertical,
+        );
 
         assert_eq!(nvim_layout.pane(1).width, 0);
         assert_eq!(nvim_layout.pane(1).height, 0);
@@ -580,6 +682,7 @@ mod tests {
     #[test]
     fn maps_alt_number_shortcuts_to_layout_modes() {
         let mut mode = PaneLayoutMode::Split;
+        let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
         assert!(handle_layout_shortcuts(
@@ -587,6 +690,7 @@ mod tests {
             true,
             2,
             &mut mode,
+            &mut split_direction,
             &mut active_pane
         ));
         assert_eq!(mode, PaneLayoutMode::NvimMaximized);
@@ -596,6 +700,7 @@ mod tests {
             true,
             2,
             &mut mode,
+            &mut split_direction,
             &mut active_pane
         ));
         assert_eq!(mode, PaneLayoutMode::Split);
@@ -605,6 +710,7 @@ mod tests {
             true,
             2,
             &mut mode,
+            &mut split_direction,
             &mut active_pane
         ));
         assert_eq!(mode, PaneLayoutMode::AgentMaximized);
@@ -614,6 +720,7 @@ mod tests {
     #[test]
     fn maps_alt_arrow_shortcuts_to_active_panes() {
         let mut mode = PaneLayoutMode::Split;
+        let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
         assert!(handle_layout_shortcuts(
@@ -621,6 +728,7 @@ mod tests {
             true,
             2,
             &mut mode,
+            &mut split_direction,
             &mut active_pane
         ));
         assert_eq!(mode, PaneLayoutMode::Split);
@@ -630,10 +738,39 @@ mod tests {
             true,
             2,
             &mut mode,
+            &mut split_direction,
             &mut active_pane
         ));
         assert_eq!(mode, PaneLayoutMode::Split);
         assert_eq!(active_pane, 1);
+    }
+
+    #[test]
+    fn maps_alt_j_shortcut_to_split_direction_toggle() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut split_direction = PaneSplitDirection::Vertical;
+        let mut active_pane = 0;
+
+        assert!(handle_layout_shortcuts(
+            &[Key::J],
+            true,
+            2,
+            &mut mode,
+            &mut split_direction,
+            &mut active_pane
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(split_direction, PaneSplitDirection::Horizontal);
+        assert_eq!(active_pane, 0);
+        assert!(handle_layout_shortcuts(
+            &[Key::J],
+            true,
+            2,
+            &mut mode,
+            &mut split_direction,
+            &mut active_pane
+        ));
+        assert_eq!(split_direction, PaneSplitDirection::Vertical);
     }
 
     #[test]
