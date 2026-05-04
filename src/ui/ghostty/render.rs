@@ -184,8 +184,205 @@ fn draw_cell(
         .ok()
         .and_then(|mut graphemes| graphemes.drain(..).next())
         .unwrap_or(' ');
-    font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
+
+    if !try_draw_block_char(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        cell_width,
+        metrics.cell_height,
+        ch,
+        fg,
+    ) {
+        font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
+    }
     Some(ch)
+}
+
+/// Synthetically draw Unicode block element characters (U+2580–U+259F) as exact
+/// pixel rectangles so they tile seamlessly, matching what Ghostty's sprite renderer does.
+/// Returns `true` if the character was handled.
+fn try_draw_block_char(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: usize,
+    y: usize,
+    cell_w: usize,
+    cell_h: usize,
+    ch: char,
+    color: u32,
+) -> bool {
+    match ch {
+        // ▀ Upper half block
+        '\u{2580}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 2, color);
+        }
+        // ▁ Lower one eighth block
+        '\u{2581}' => {
+            let h = cell_h / 8;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▂ Lower one quarter block
+        '\u{2582}' => {
+            let h = cell_h / 4;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▃ Lower three eighths block
+        '\u{2583}' => {
+            let h = (cell_h * 3) / 8;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▄ Lower half block
+        '\u{2584}' => {
+            let h = cell_h / 2;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▅ Lower five eighths block
+        '\u{2585}' => {
+            let h = (cell_h * 5) / 8;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▆ Lower three quarters block
+        '\u{2586}' => {
+            let h = (cell_h * 3) / 4;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // ▇ Lower seven eighths block
+        '\u{2587}' => {
+            let h = (cell_h * 7) / 8;
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h - h, cell_w, h, color);
+        }
+        // █ Full block
+        '\u{2588}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h, color);
+        }
+        // ▉ Left seven eighths block
+        '\u{2589}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, (cell_w * 7) / 8, cell_h, color);
+        }
+        // ▊ Left three quarters block
+        '\u{258A}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, (cell_w * 3) / 4, cell_h, color);
+        }
+        // ▋ Left five eighths block
+        '\u{258B}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, (cell_w * 5) / 8, cell_h, color);
+        }
+        // ▌ Left half block
+        '\u{258C}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h, color);
+        }
+        // ▍ Left three eighths block
+        '\u{258D}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, (cell_w * 3) / 8, cell_h, color);
+        }
+        // ▎ Left one quarter block
+        '\u{258E}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 4, cell_h, color);
+        }
+        // ▏ Left one eighth block
+        '\u{258F}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 8, cell_h, color);
+        }
+        // ▐ Right half block
+        '\u{2590}' => {
+            let w = cell_w / 2;
+            draw_rect(buffer, buf_w, buf_h, x + cell_w - w, y, w, cell_h, color);
+        }
+        // ░ Light shade (25%)
+        '\u{2591}' => {
+            draw_shade(buffer, buf_w, buf_h, x, y, cell_w, cell_h, color, 64);
+        }
+        // ▒ Medium shade (50%)
+        '\u{2592}' => {
+            draw_shade(buffer, buf_w, buf_h, x, y, cell_w, cell_h, color, 128);
+        }
+        // ▓ Dark shade (75%)
+        '\u{2593}' => {
+            draw_shade(buffer, buf_w, buf_h, x, y, cell_w, cell_h, color, 192);
+        }
+        // ▔ Upper one eighth block
+        '\u{2594}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 8, color);
+        }
+        // ▕ Right one eighth block
+        '\u{2595}' => {
+            let w = cell_w / 8;
+            draw_rect(buffer, buf_w, buf_h, x + cell_w - w, y, w, cell_h, color);
+        }
+        // ▖ Quadrant lower left
+        '\u{2596}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▗ Quadrant lower right
+        '\u{2597}' => {
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▘ Quadrant upper left
+        '\u{2598}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h / 2, color);
+        }
+        // ▙ Quadrant upper left and lower left and lower right
+        '\u{2599}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h, color);
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▚ Quadrant upper left and lower right
+        '\u{259A}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h / 2, color);
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▛ Quadrant upper left and upper right and lower left
+        '\u{259B}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 2, color);
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▜ Quadrant upper left and upper right and lower right
+        '\u{259C}' => {
+            draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 2, color);
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▝ Quadrant upper right
+        '\u{259D}' => {
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
+        }
+        // ▞ Quadrant upper right and lower left
+        '\u{259E}' => {
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+        }
+        // ▟ Quadrant upper right and lower left and lower right
+        '\u{259F}' => {
+            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
+            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w, cell_h / 2, color);
+        }
+        _ => return false,
+    }
+    true
+}
+
+fn draw_shade(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: usize,
+    y: usize,
+    cell_w: usize,
+    cell_h: usize,
+    color: u32,
+    alpha: u8,
+) {
+    let max_y = (y + cell_h).min(buf_h);
+    let max_x = (x + cell_w).min(buf_w);
+
+    for row in y..max_y {
+        for col in x..max_x {
+            blend_pixel(buffer, buf_w, buf_h, col as isize, row as isize, color, alpha);
+        }
+    }
 }
 
 fn draw_rect(
