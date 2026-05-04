@@ -209,8 +209,19 @@ impl TerminalView {
     }
 
     fn process(&mut self, bytes: &[u8]) {
+        let should_follow_output = self.is_viewport_at_bottom();
         self.hyperlink_tracker.process(bytes);
         self.terminal.vt_write(bytes);
+        if should_follow_output {
+            self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        }
+    }
+
+    fn is_viewport_at_bottom(&self) -> bool {
+        self.terminal
+            .scrollbar()
+            .map(|scrollbar| scrollbar.offset.saturating_add(scrollbar.len) >= scrollbar.total)
+            .unwrap_or(true)
     }
 
     pub(super) fn draw(
@@ -288,5 +299,51 @@ fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetric
         cols,
         pixel_width: width.min(u16::MAX as usize) as u16,
         pixel_height: height.min(u16::MAX as usize) as u16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn output_keeps_viewport_at_bottom_when_following() {
+        let mut view = test_view();
+
+        write_numbered_lines(&mut view, 10);
+
+        assert!(view.is_viewport_at_bottom());
+    }
+
+    #[test]
+    fn output_preserves_manual_scrollback_position() {
+        let mut view = test_view();
+        write_numbered_lines(&mut view, 10);
+        view.scroll_viewport(-2);
+
+        assert!(!view.is_viewport_at_bottom());
+
+        view.process(b"L11\r\n");
+
+        assert!(!view.is_viewport_at_bottom());
+    }
+
+    fn test_view() -> TerminalView {
+        TerminalView::new(
+            10,
+            3,
+            TerminalMetrics {
+                cell_width: 1,
+                cell_height: 1,
+                baseline: 0,
+            },
+        )
+        .expect("test terminal view")
+    }
+
+    fn write_numbered_lines(view: &mut TerminalView, count: usize) {
+        for index in 1..=count {
+            view.process(format!("L{index:02}\r\n").as_bytes());
+        }
     }
 }
