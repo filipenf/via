@@ -4,19 +4,20 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::PhysicalKey;
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::config::Config;
 use crate::event::{Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
+use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 
 mod config;
 mod font;
@@ -29,10 +30,10 @@ mod render;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{
-    forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
-    forward_text_input, try_clipboard_paste, Key, Modifiers,
+    Key, Modifiers, forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
+    forward_text_input, try_clipboard_paste,
 };
-use layout::{handle_layout_shortcuts, PaneLayoutMode, PaneSplitDirection, SplitLayout};
+use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
 
 const INITIAL_WIDTH: usize = 960;
@@ -67,8 +68,10 @@ impl GhosttyUi {
     }
 
     pub fn run(self) -> Result<()> {
-        let event_loop = EventLoop::new().context("failed to create native event loop")?;
-        let mut app = WinitGhosttyApp::new(self)?;
+        let event_loop = EventLoop::<UserEvent>::with_user_event()
+            .build()
+            .context("failed to create native event loop")?;
+        let mut app = WinitGhosttyApp::new(self, event_loop.create_proxy())?;
 
         event_loop
             .run_app(&mut app)
@@ -82,11 +85,23 @@ impl GhosttyUi {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum UserEvent {
+    PtyOutput,
+}
+
+impl OutputNotifier for EventLoopProxy<UserEvent> {
+    fn notify_output(&self) {
+        let _ = self.send_event(UserEvent::PtyOutput);
+    }
+}
+
 struct WinitGhosttyApp {
     config: Config,
     events: EventSender,
     ui_commands: TokioReceiver<UiCommand>,
     pending_agent_write: Option<PendingAgentWrite>,
+    output_notifier: CoalescedOutputNotifier<EventLoopProxy<UserEvent>>,
     window: Option<Arc<Window>>,
     window_id: Option<WindowId>,
     softbuffer_context: Option<softbuffer::Context<Arc<Window>>>,
@@ -109,7 +124,8 @@ struct WinitGhosttyApp {
 }
 
 impl WinitGhosttyApp {
-    fn new(ui: GhosttyUi) -> Result<Self> {
+    fn new(ui: GhosttyUi, event_loop_proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
+        let output_notifier = CoalescedOutputNotifier::new(event_loop_proxy);
         let terminal_config = TerminalConfig::load();
         let font_renderer = FontRenderer::new(&terminal_config)?;
         let pane_split_direction = PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
@@ -127,6 +143,7 @@ impl WinitGhosttyApp {
             events: ui.events,
             ui_commands: ui.ui_commands,
             pending_agent_write: ui.pending_agent_write,
+            output_notifier,
             window: None,
             window_id: None,
             softbuffer_context: None,
@@ -184,6 +201,7 @@ impl WinitGhosttyApp {
                 &self.config.nvim_command,
                 nvim_args,
                 &self.config.working_directory,
+                self.output_notifier.clone(),
             )?;
             self.relayout();
             info!(panes = self.panes.len(), "native terminal window ready");
@@ -225,7 +243,11 @@ impl WinitGhosttyApp {
                 layout.pane(1).height,
                 metrics,
             )?;
-            pane.spawn_shell_command(agent_command, &self.config.working_directory)?;
+            pane.spawn_shell_command(
+                agent_command,
+                &self.config.working_directory,
+                self.output_notifier.clone(),
+            )?;
             panes.push(pane);
         }
 
@@ -455,6 +477,7 @@ impl WinitGhosttyApp {
         for pane in &mut self.panes {
             self.dirty |= pane.drain_output();
         }
+        self.output_notifier.clear();
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.flush_pending_agent_write()?;
         Ok(())
@@ -577,7 +600,22 @@ impl WinitGhosttyApp {
     }
 }
 
-impl ApplicationHandler for WinitGhosttyApp {
+impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::PtyOutput => {
+                if let Err(error) = self.drain_background_work() {
+                    self.fail(event_loop, error);
+                    return;
+                }
+
+                if self.dirty {
+                    self.request_redraw();
+                }
+            }
+        }
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if let Err(error) = self.initialize_window(event_loop) {
             self.fail(event_loop, error);
@@ -666,11 +704,7 @@ impl ApplicationHandler for WinitGhosttyApp {
 }
 
 fn pane_count(config: &Config) -> usize {
-    if config.agent_command.is_some() {
-        2
-    } else {
-        1
-    }
+    if config.agent_command.is_some() { 2 } else { 1 }
 }
 
 fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
@@ -771,7 +805,7 @@ mod tests {
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
-    use links::{file_reference_at, file_target_from_uri, parse_vt_hyperlinks, LinkSpan};
+    use links::{LinkSpan, file_reference_at, file_target_from_uri, parse_vt_hyperlinks};
 
     #[test]
     fn parses_ghostty_config_entries() {

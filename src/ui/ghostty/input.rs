@@ -253,7 +253,7 @@ pub(super) fn forward_special_keys(
     pane: &mut TerminalPane,
     skip_layout_shortcut: bool,
 ) -> Result<bool> {
-    let mut wrote = false;
+    let mut payload = Vec::with_capacity(16);
 
     for key in pressed_keys.iter().copied() {
         if skip_layout_shortcut
@@ -287,19 +287,22 @@ pub(super) fn forward_special_keys(
 
         if modifiers.ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
-                pane.write_all(&bytes)?;
-                wrote = true;
+                payload.extend_from_slice(&bytes);
                 continue;
             }
         }
 
         if let Some(bytes) = key_sequence(key) {
-            pane.write_all(bytes)?;
-            wrote = true;
+            payload.extend_from_slice(bytes);
         }
     }
 
-    Ok(wrote)
+    if payload.is_empty() {
+        return Ok(false);
+    }
+
+    pane.write_all(&payload)?;
+    Ok(true)
 }
 
 fn ctrl_sequence(key: Key) -> Option<[u8; 1]> {

@@ -9,12 +9,12 @@ use libghostty_vt::{Terminal, TerminalOptions};
 use tracing::{debug, warn};
 
 use crate::nvim::FileTarget;
-use crate::pty::{PtySession, TerminalSize};
+use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{file_reference_at, file_target_from_uri, Osc8Tracker};
+use super::links::{Osc8Tracker, file_reference_at, file_target_from_uri};
 use super::render::{draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
@@ -39,22 +39,43 @@ impl TerminalPane {
         })
     }
 
-    pub(super) fn spawn<I, S>(&mut self, command: &str, args: I, cwd: &Path) -> Result<()>
+    pub(super) fn spawn<I, S, N>(
+        &mut self,
+        command: &str,
+        args: I,
+        cwd: &Path,
+        output_notifier: N,
+    ) -> Result<()>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
+        N: OutputNotifier,
     {
         self.pty = Some(PtySession::spawn_with_args(
             command,
             args,
             cwd,
             self.view.size,
+            output_notifier,
         )?);
         Ok(())
     }
 
-    pub(super) fn spawn_shell_command(&mut self, command: &str, cwd: &Path) -> Result<()> {
-        self.spawn("sh", [OsString::from("-lc"), OsString::from(command)], cwd)
+    pub(super) fn spawn_shell_command<N>(
+        &mut self,
+        command: &str,
+        cwd: &Path,
+        output_notifier: N,
+    ) -> Result<()>
+    where
+        N: OutputNotifier,
+    {
+        self.spawn(
+            "sh",
+            [OsString::from("-lc"), OsString::from(command)],
+            cwd,
+            output_notifier,
+        )
     }
 
     pub(super) fn drain_output(&mut self) -> bool {
