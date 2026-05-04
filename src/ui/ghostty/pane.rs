@@ -140,6 +140,11 @@ impl TerminalPane {
     pub(super) fn metrics(&self) -> TerminalMetrics {
         self.view.metrics
     }
+
+    /// Visible terminal rows in the current pane (for page-scroll step size).
+    pub(super) fn viewport_rows(&self) -> usize {
+        self.view.size.rows as usize
+    }
 }
 
 struct TerminalView {
