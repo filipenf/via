@@ -17,13 +17,42 @@ pub(super) enum PaneLayoutMode {
     AgentMaximized,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneSplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+impl PaneSplitDirection {
+    pub(super) fn for_window(width: usize, height: usize) -> Self {
+        if height > width {
+            Self::Horizontal
+        } else {
+            Self::Vertical
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Vertical => Self::Horizontal,
+            Self::Horizontal => Self::Vertical,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct SplitLayout {
     panes: Vec<PaneRect>,
 }
 
 impl SplitLayout {
-    pub(super) fn for_window(width: usize, height: usize, pane_count: usize, mode: PaneLayoutMode) -> Self {
+    pub(super) fn for_window(
+        width: usize,
+        height: usize,
+        pane_count: usize,
+        mode: PaneLayoutMode,
+        split_direction: PaneSplitDirection,
+    ) -> Self {
         if pane_count <= 1 {
             return Self {
                 panes: vec![PaneRect {
@@ -73,25 +102,9 @@ impl SplitLayout {
             };
         }
 
-        let left_width = width.saturating_sub(SPLIT_GAP) / 2;
-        let right_x = left_width + SPLIT_GAP;
-        let right_width = width.saturating_sub(right_x);
-
-        Self {
-            panes: vec![
-                PaneRect {
-                    x: 0,
-                    y: 0,
-                    width: left_width,
-                    height,
-                },
-                PaneRect {
-                    x: right_x,
-                    y: 0,
-                    width: right_width,
-                    height,
-                },
-            ],
+        match split_direction {
+            PaneSplitDirection::Vertical => vertical_split_layout(width, height),
+            PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
         }
     }
 
@@ -113,6 +126,7 @@ pub(super) fn handle_layout_shortcuts(
     alt: bool,
     pane_count: usize,
     mode: &mut PaneLayoutMode,
+    split_direction: &mut PaneSplitDirection,
     active_pane: &mut usize,
 ) -> bool {
     if !alt {
@@ -120,6 +134,11 @@ pub(super) fn handle_layout_shortcuts(
     }
 
     for key in pressed_keys {
+        if *key == Key::J {
+            *split_direction = split_direction.toggled();
+            return true;
+        }
+
         if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
             if next_active_pane < pane_count {
                 *active_pane = next_active_pane;
@@ -167,5 +186,51 @@ pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
         Key::Key2 => Some(PaneLayoutMode::Split),
         Key::Key3 => Some(PaneLayoutMode::AgentMaximized),
         _ => None,
+    }
+}
+
+fn vertical_split_layout(width: usize, height: usize) -> SplitLayout {
+    let left_width = width.saturating_sub(SPLIT_GAP) / 2;
+    let right_x = left_width + SPLIT_GAP;
+    let right_width = width.saturating_sub(right_x);
+
+    SplitLayout {
+        panes: vec![
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: left_width,
+                height,
+            },
+            PaneRect {
+                x: right_x,
+                y: 0,
+                width: right_width,
+                height,
+            },
+        ],
+    }
+}
+
+fn horizontal_split_layout(width: usize, height: usize) -> SplitLayout {
+    let top_height = height.saturating_sub(SPLIT_GAP) / 2;
+    let bottom_y = top_height + SPLIT_GAP;
+    let bottom_height = height.saturating_sub(bottom_y);
+
+    SplitLayout {
+        panes: vec![
+            PaneRect {
+                x: 0,
+                y: 0,
+                width,
+                height: top_height,
+            },
+            PaneRect {
+                x: 0,
+                y: bottom_y,
+                width,
+                height: bottom_height,
+            },
+        ],
     }
 }
