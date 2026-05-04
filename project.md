@@ -44,6 +44,6 @@ This project brief outlines a lightweight, high-performance coordination layer t
 
 ### 6. TODOs
 
-[ ] Fix viewport scrolling
+[x] Fix viewport scrolling
+[x] Improve navigation: Shortcuts should be Alt 1 (neovim), Alt 2 (agent). Alt+Shift+1 (neovim full), Alt+Shift+2 (agent full), Alt+Shift+3 split horizontal/vertical toggle
 [ ] Static linking or alternative ways for distributing, ideally single binary
-[ ] Improve navigation: Shortcuts should be Alt 1 (neovim), Alt 2 (agent). Alt+Shift+1 (neovim full), Alt+Shift+2 (agent full), Alt+Shift+3 split horizontal/vertical toggle

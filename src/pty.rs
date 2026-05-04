@@ -1,12 +1,50 @@
 use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::{Receiver, unbounded};
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tracing::{debug, info};
+
+pub trait OutputNotifier: Send + 'static {
+    fn notify_output(&self);
+}
+
+#[derive(Clone)]
+pub struct CoalescedOutputNotifier<N> {
+    notifier: N,
+    pending: Arc<AtomicBool>,
+}
+
+impl<N> CoalescedOutputNotifier<N> {
+    pub fn new(notifier: N) -> Self {
+        Self {
+            notifier,
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn clear(&self) {
+        self.pending.store(false, Ordering::Release);
+    }
+}
+
+impl<N> OutputNotifier for CoalescedOutputNotifier<N>
+where
+    N: OutputNotifier,
+{
+    fn notify_output(&self) {
+        if self.pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        self.notifier.notify_output();
+    }
+}
 
 pub struct PtySession {
     master: Box<dyn MasterPty + Send>,
@@ -25,15 +63,17 @@ pub struct TerminalSize {
 }
 
 impl PtySession {
-    pub fn spawn_with_args<I, S>(
+    pub fn spawn_with_args<I, S, N>(
         command: &str,
         args: I,
         cwd: &Path,
         size: TerminalSize,
+        output_notifier: N,
     ) -> Result<Self>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
+        N: OutputNotifier,
     {
         let pty_system = native_pty_system();
         let pair = pty_system
@@ -73,6 +113,7 @@ impl PtySession {
                         if output_tx.send(buffer[..read].to_vec()).is_err() {
                             break;
                         }
+                        output_notifier.notify_output();
                     }
                     Err(error) => {
                         debug!(%error, "PTY reader stopped");

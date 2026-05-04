@@ -73,15 +73,19 @@ pub(super) fn draw_screen(
         Ok(iter) => iter,
         Err(_) => return,
     };
-    let mut row = 0;
+    let mut row = 0usize;
 
     while let Some(row_ref) = row_iter.next() {
         let mut cell_iter = match cells.update(row_ref) {
             Ok(iter) => iter,
             Err(_) => return,
         };
-        let y = origin_y + row as usize * metrics.cell_height;
-        let mut row_text = String::new();
+        let y = origin_y + row * metrics.cell_height;
+        if visible_rows.len() <= row {
+            visible_rows.push(String::with_capacity(cols as usize));
+        }
+        let row_text = &mut visible_rows[row];
+        row_text.clear();
         let mut col = 0;
 
         while let Some(cell_ref) = cell_iter.next() {
@@ -104,9 +108,10 @@ pub(super) fn draw_screen(
             }
         }
 
-        visible_rows.push(row_text);
         row += 1;
     }
+
+    visible_rows.truncate(row);
 
     if snapshot.cursor_visible().unwrap_or(false) {
         if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
@@ -164,16 +169,18 @@ fn draw_cell(
         metrics.cell_width
     };
 
-    draw_rect(
-        buffer,
-        width,
-        height,
-        x,
-        y,
-        cell_width,
-        metrics.cell_height,
-        bg,
-    );
+    if bg != font_renderer.theme.background {
+        draw_rect(
+            buffer,
+            width,
+            height,
+            x,
+            y,
+            cell_width,
+            metrics.cell_height,
+            bg,
+        );
+    }
 
     if !raw_cell.has_text().unwrap_or(false) {
         return None;
@@ -315,11 +322,29 @@ fn try_draw_block_char(
         }
         // ▖ Quadrant lower left
         '\u{2596}' => {
-            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▗ Quadrant lower right
         '\u{2597}' => {
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▘ Quadrant upper left
         '\u{2598}' => {
@@ -328,36 +353,117 @@ fn try_draw_block_char(
         // ▙ Quadrant upper left and lower left and lower right
         '\u{2599}' => {
             draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h, color);
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▚ Quadrant upper left and lower right
         '\u{259A}' => {
             draw_rect(buffer, buf_w, buf_h, x, y, cell_w / 2, cell_h / 2, color);
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▛ Quadrant upper left and upper right and lower left
         '\u{259B}' => {
             draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 2, color);
-            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▜ Quadrant upper left and upper right and lower right
         '\u{259C}' => {
             draw_rect(buffer, buf_w, buf_h, x, y, cell_w, cell_h / 2, color);
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▝ Quadrant upper right
         '\u{259D}' => {
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▞ Quadrant upper right and lower left
         '\u{259E}' => {
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
-            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w / 2, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x,
+                y + cell_h / 2,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
         }
         // ▟ Quadrant upper right and lower left and lower right
         '\u{259F}' => {
-            draw_rect(buffer, buf_w, buf_h, x + cell_w / 2, y, cell_w / 2, cell_h / 2, color);
-            draw_rect(buffer, buf_w, buf_h, x, y + cell_h / 2, cell_w, cell_h / 2, color);
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x + cell_w / 2,
+                y,
+                cell_w / 2,
+                cell_h / 2,
+                color,
+            );
+            draw_rect(
+                buffer,
+                buf_w,
+                buf_h,
+                x,
+                y + cell_h / 2,
+                cell_w,
+                cell_h / 2,
+                color,
+            );
         }
         _ => return false,
     }
@@ -380,7 +486,15 @@ fn draw_shade(
 
     for row in y..max_y {
         for col in x..max_x {
-            blend_pixel(buffer, buf_w, buf_h, col as isize, row as isize, color, alpha);
+            blend_pixel(
+                buffer,
+                buf_w,
+                buf_h,
+                col as isize,
+                row as isize,
+                color,
+                alpha,
+            );
         }
     }
 }
@@ -398,12 +512,13 @@ fn draw_rect(
     let max_y = (y + rect_height).min(height);
     let max_x = (x + rect_width).min(width);
 
+    if x >= max_x {
+        return;
+    }
+
     for row in y..max_y {
         let row_start = row * width;
-
-        for col in x..max_x {
-            buffer[row_start + col] = color;
-        }
+        buffer[row_start + x..row_start + max_x].fill(color);
     }
 }
 
@@ -428,6 +543,11 @@ pub(super) fn blend_pixel(
     }
 
     let index = y * width + x;
+    if alpha == 255 {
+        buffer[index] = color;
+        return;
+    }
+
     let dst = buffer[index];
     let alpha = alpha as u32;
     let inv_alpha = 255 - alpha;
