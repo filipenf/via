@@ -120,6 +120,7 @@ struct WinitGhosttyApp {
     cursor_position: Option<(usize, usize)>,
     left_mouse_down: bool,
     dirty: bool,
+    force_redraw: bool,
     error: Option<anyhow::Error>,
 }
 
@@ -162,6 +163,7 @@ impl WinitGhosttyApp {
             cursor_position: None,
             left_mouse_down: false,
             dirty: true,
+            force_redraw: true,
             error: None,
         })
     }
@@ -281,6 +283,7 @@ impl WinitGhosttyApp {
 
         self.resize_terminals(width as usize, height as usize);
         self.dirty = true;
+        self.force_redraw = true;
         self.request_redraw();
         Ok(())
     }
@@ -297,18 +300,22 @@ impl WinitGhosttyApp {
         self.font_renderer = FontRenderer::new(&self.terminal_config)?;
         self.relayout();
         self.dirty = true;
+        self.force_redraw = true;
         Ok(())
     }
 
     fn resize_terminals(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;
-        self.dirty |= ensure_buffer_size(
+        if ensure_buffer_size(
             &mut self.buffer,
             width,
             height,
             self.terminal_config.theme.background,
-        );
+        ) {
+            self.dirty = true;
+            self.force_redraw = true;
+        }
         self.relayout();
     }
 
@@ -330,6 +337,7 @@ impl WinitGhosttyApp {
 
         self.layout = new_layout;
         self.dirty = true;
+        self.force_redraw = true;
 
         for (index, pane) in self.panes.iter_mut().enumerate() {
             let rect = self.layout.pane(index);
@@ -511,16 +519,25 @@ impl WinitGhosttyApp {
             return Ok(());
         };
 
-        self.buffer.fill(self.terminal_config.theme.background);
+        if self.force_redraw {
+            self.buffer.fill(self.terminal_config.theme.background);
+        }
+        let mut redrawn = self.force_redraw;
         for (index, pane) in self.panes.iter_mut().enumerate() {
-            pane.draw(
+            redrawn |= pane.draw(
                 &mut self.font_renderer,
                 &mut self.buffer,
                 self.width,
                 self.height,
                 self.layout.pane(index),
                 index == self.active_pane,
+                self.force_redraw,
             );
+        }
+
+        if !redrawn {
+            self.dirty = false;
+            return Ok(());
         }
 
         let mut surface_buffer = surface
@@ -532,6 +549,7 @@ impl WinitGhosttyApp {
             .present()
             .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
         self.dirty = false;
+        self.force_redraw = false;
         Ok(())
     }
 

@@ -133,20 +133,25 @@ impl TerminalPane {
         buffer_height: usize,
         rect: PaneRect,
         active: bool,
-    ) {
+        force_redraw: bool,
+    ) -> bool {
         if rect.width == 0 || rect.height == 0 {
-            return;
+            return false;
         }
 
-        self.view.draw(
+        let redrawn = self.view.draw(
             font_renderer,
             buffer,
             buffer_width,
             buffer_height,
             rect.x,
             rect.y,
+            force_redraw,
         );
-        draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
+        if redrawn || force_redraw {
+            draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
+        }
+        redrawn
     }
 
     pub(super) fn file_reference_at(
@@ -253,8 +258,8 @@ impl TerminalView {
         height: usize,
         origin_x: usize,
         origin_y: usize,
-    ) {
-        self.visible_rows.clear();
+        force_redraw: bool,
+    ) -> bool {
         draw_screen(
             &self.terminal,
             &mut self.render_state,
@@ -268,7 +273,8 @@ impl TerminalView {
             origin_x,
             origin_y,
             self.metrics,
-        );
+            force_redraw,
+        )
     }
 
     pub(super) fn file_reference_at(
