@@ -100,10 +100,18 @@ impl GhosttyUi {
 
         info!(panes = panes.len(), "native terminal window ready");
         let mut left_mouse_down = false;
+        let mut force_redraw = true;
 
         while window.is_open() {
+            let mut frame_dirty = force_redraw;
+            force_redraw = false;
             let (width, height) = window.get_size();
-            ensure_buffer_size(&mut buffer, width, height, terminal_config.theme.background);
+            frame_dirty |= ensure_buffer_size(
+                &mut buffer,
+                width,
+                height,
+                terminal_config.theme.background,
+            );
             let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes);
             let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
             let layout_shortcut_consumed = handle_layout_shortcuts(
@@ -114,6 +122,7 @@ impl GhosttyUi {
                 &mut pane_split_direction,
                 &mut active_pane,
             );
+            frame_dirty |= layout_shortcut_consumed;
 
             let new_layout = SplitLayout::for_window(
                 width,
@@ -124,6 +133,7 @@ impl GhosttyUi {
             );
             if new_layout != layout {
                 layout = new_layout;
+                frame_dirty = true;
 
                 for (index, pane) in panes.iter_mut().enumerate() {
                     let rect = layout.pane(index);
@@ -138,29 +148,48 @@ impl GhosttyUi {
             }
 
             for pane in &mut panes {
-                pane.drain_output();
+                frame_dirty |= pane.drain_output();
             }
-            self.forward_ui_commands(&mut panes)?;
-            self.flush_pending_agent_write(&mut panes)?;
-            forward_text_input(&input_rx, &window, &mut panes[active_pane], layout_shortcut_consumed)?;
-            try_clipboard_paste(
+            frame_dirty |= self.forward_ui_commands(&mut panes)?;
+            frame_dirty |= self.flush_pending_agent_write(&mut panes)?;
+            frame_dirty |= forward_text_input(
+                &input_rx,
+                &window,
+                &mut panes[active_pane],
+                layout_shortcut_consumed,
+            )?;
+            frame_dirty |= try_clipboard_paste(
                 &window,
                 &paste_rx,
                 &mut panes[active_pane],
                 layout_shortcut_consumed,
             )?;
-            forward_special_keys(
+            frame_dirty |= forward_special_keys(
                 &pressed_keys,
                 &window,
                 &mut panes[active_pane],
                 layout_shortcut_consumed,
             )?;
-            forward_mouse_scroll(
+            frame_dirty |= forward_mouse_scroll(
                 &window,
                 &layout,
                 &mut panes,
                 layout_shortcut_consumed,
             );
+            frame_dirty |= self.forward_file_reference_click(
+                &window,
+                &panes,
+                &layout,
+                &mut active_pane,
+                &mut left_mouse_down,
+            );
+
+            if !frame_dirty {
+                window.update();
+                std::thread::sleep(Duration::from_millis(8));
+                continue;
+            }
+
             buffer.fill(terminal_config.theme.background);
             for (index, pane) in panes.iter_mut().enumerate() {
                 pane.draw(
@@ -172,18 +201,9 @@ impl GhosttyUi {
                     index == active_pane,
                 );
             }
-            self.forward_file_reference_click(
-                &window,
-                &panes,
-                &layout,
-                &mut active_pane,
-                &mut left_mouse_down,
-            );
             window
                 .update_with_buffer(&buffer, width, height)
                 .context("failed to update native window")?;
-
-            std::thread::sleep(Duration::from_millis(1));
         }
 
         Ok(())
@@ -238,24 +258,25 @@ impl GhosttyUi {
         layout: &SplitLayout,
         active_pane: &mut usize,
         left_mouse_down: &mut bool,
-    ) {
+    ) -> bool {
         let is_down = window.get_mouse_down(MouseButton::Left);
         let just_pressed = is_down && !*left_mouse_down;
         *left_mouse_down = is_down;
 
         if !just_pressed {
-            return;
+            return false;
         }
 
         let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
-            return;
+            return false;
         };
 
         let x = x as usize;
         let y = y as usize;
         let Some((pane_index, rect)) = layout.pane_at(x, y) else {
-            return;
+            return false;
         };
+        let pane_changed = *active_pane != pane_index;
         *active_pane = pane_index;
 
         let metrics = panes[pane_index].metrics();
@@ -264,7 +285,7 @@ impl GhosttyUi {
         let Some(target) =
             panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
         else {
-            return;
+            return pane_changed;
         };
 
         info!(
@@ -276,10 +297,15 @@ impl GhosttyUi {
             path: target.path,
             line: target.line,
         }));
+
+        true
     }
 
-    fn forward_ui_commands(&mut self, panes: &mut [TerminalPane]) -> Result<()> {
+    fn forward_ui_commands(&mut self, panes: &mut [TerminalPane]) -> Result<bool> {
+        let mut changed = false;
+
         while let Ok(command) = self.ui_commands.try_recv() {
+            changed = true;
             match command {
                 UiCommand::EditorContextChanged { path, line, column } => {
                     let Some(agent_pane) = panes.get_mut(1) else {
@@ -317,28 +343,29 @@ impl GhosttyUi {
             }
         }
 
-        Ok(())
+        Ok(changed)
     }
 
-    fn flush_pending_agent_write(&mut self, panes: &mut [TerminalPane]) -> Result<()> {
+    fn flush_pending_agent_write(&mut self, panes: &mut [TerminalPane]) -> Result<bool> {
         let Some(pending) = &self.pending_agent_write else {
-            return Ok(());
+            return Ok(false);
         };
 
         if Instant::now() < pending.ready_at {
-            return Ok(());
+            return Ok(false);
         }
 
         let Some(agent_pane) = panes.get_mut(1) else {
             self.pending_agent_write = None;
-            return Ok(());
+            return Ok(false);
         };
         let pending = self
             .pending_agent_write
             .take()
             .expect("pending write exists");
 
-        agent_pane.write_all(&pending.bytes)
+        agent_pane.write_all(&pending.bytes)?;
+        Ok(true)
     }
 }
 
@@ -416,12 +443,15 @@ fn vim_fnameescape(path: &Path) -> String {
     escaped
 }
 
-fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: u32) {
+fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: u32) -> bool {
     let len = width.saturating_mul(height);
 
     if buffer.len() != len {
         buffer.resize(len, fill);
+        return true;
     }
+
+    false
 }
 
 #[cfg(test)]
