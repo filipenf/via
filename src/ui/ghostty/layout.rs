@@ -1,4 +1,4 @@
-use minifb::Key;
+use super::input::Key;
 
 const SPLIT_GAP: usize = 2;
 

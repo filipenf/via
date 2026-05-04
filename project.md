@@ -41,3 +41,9 @@ This project brief outlines a lightweight, high-performance coordination layer t
  3. **Low Overhead:** The coordination layer stays out of the way, letting the user stay in "flow" within the Neovim environment.
 
 > **Design Philosophy:** "The editor is the heart, the agent is the brain, and the terminal wrapper is the nervous system."
+
+### 6. TODOs
+
+[ ] Fix viewport scrolling
+[ ] Static linking or alternative ways for distributing, ideally single binary
+[ ] Improve navigation: Shortcuts should be Alt 1 (neovim), Alt 2 (agent). Alt+Shift+1 (neovim full), Alt+Shift+2 (agent full), Alt+Shift+3 split horizontal/vertical toggle

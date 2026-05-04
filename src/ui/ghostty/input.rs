@@ -1,8 +1,7 @@
 use anyhow::Result;
 use arboard::Clipboard;
-use crossbeam_channel::{Receiver, Sender};
-use minifb::{InputCallback, Key, KeyRepeat, MouseMode, Window};
 use tracing::warn;
+use winit::keyboard::KeyCode;
 
 use super::layout::{SplitLayout, pane_layout_shortcut, pane_navigation_shortcut};
 use super::pane::TerminalPane;
@@ -10,90 +9,138 @@ use super::pane::TerminalPane;
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
 const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
-pub(super) struct TextInput {
-    input: Sender<char>,
-    paste_signal: Sender<()>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Key {
+    A,
+    B,
+    C,
+    D,
+    E,
+    F,
+    G,
+    H,
+    I,
+    J,
+    K,
+    L,
+    M,
+    N,
+    O,
+    P,
+    Q,
+    R,
+    S,
+    T,
+    U,
+    V,
+    W,
+    X,
+    Y,
+    Z,
+    Key1,
+    Key2,
+    Key3,
+    Enter,
+    NumPadEnter,
+    Backspace,
+    Tab,
+    Escape,
+    Up,
+    Down,
+    Right,
+    Left,
+    Home,
+    End,
+    PageUp,
+    PageDown,
+    Insert,
+    Delete,
 }
 
-impl TextInput {
-    pub(super) fn new(input: Sender<char>, paste_signal: Sender<()>) -> Self {
-        Self { input, paste_signal }
+impl Key {
+    pub(super) fn from_key_code(code: KeyCode) -> Option<Self> {
+        let key = match code {
+            KeyCode::KeyA => Self::A,
+            KeyCode::KeyB => Self::B,
+            KeyCode::KeyC => Self::C,
+            KeyCode::KeyD => Self::D,
+            KeyCode::KeyE => Self::E,
+            KeyCode::KeyF => Self::F,
+            KeyCode::KeyG => Self::G,
+            KeyCode::KeyH => Self::H,
+            KeyCode::KeyI => Self::I,
+            KeyCode::KeyJ => Self::J,
+            KeyCode::KeyK => Self::K,
+            KeyCode::KeyL => Self::L,
+            KeyCode::KeyM => Self::M,
+            KeyCode::KeyN => Self::N,
+            KeyCode::KeyO => Self::O,
+            KeyCode::KeyP => Self::P,
+            KeyCode::KeyQ => Self::Q,
+            KeyCode::KeyR => Self::R,
+            KeyCode::KeyS => Self::S,
+            KeyCode::KeyT => Self::T,
+            KeyCode::KeyU => Self::U,
+            KeyCode::KeyV => Self::V,
+            KeyCode::KeyW => Self::W,
+            KeyCode::KeyX => Self::X,
+            KeyCode::KeyY => Self::Y,
+            KeyCode::KeyZ => Self::Z,
+            KeyCode::Digit1 => Self::Key1,
+            KeyCode::Digit2 => Self::Key2,
+            KeyCode::Digit3 => Self::Key3,
+            KeyCode::Enter => Self::Enter,
+            KeyCode::NumpadEnter => Self::NumPadEnter,
+            KeyCode::Backspace => Self::Backspace,
+            KeyCode::Tab => Self::Tab,
+            KeyCode::Escape => Self::Escape,
+            KeyCode::ArrowUp => Self::Up,
+            KeyCode::ArrowDown => Self::Down,
+            KeyCode::ArrowRight => Self::Right,
+            KeyCode::ArrowLeft => Self::Left,
+            KeyCode::Home => Self::Home,
+            KeyCode::End => Self::End,
+            KeyCode::PageUp => Self::PageUp,
+            KeyCode::PageDown => Self::PageDown,
+            KeyCode::Insert => Self::Insert,
+            KeyCode::Delete => Self::Delete,
+            _ => return None,
+        };
+
+        Some(key)
     }
 }
 
-impl InputCallback for TextInput {
-    fn add_char(&mut self, uni_char: u32) {
-        // Ctrl+Shift+V arrives as 'V' (86) or 'v' (118) through the text callback while minifb does
-        // not report V reliably via is_key_pressed when modifiers are held.
-        // Ctrl+V alone arrives as 0x16 (SYN): do not signal paste — Neovim uses ^V (visual block, etc.).
-        // Super+V uses the same unicode paths; the main loop pairs paste_signal with super_key.
-        if matches!(uni_char, 86 | 118) {
-            let _ = self.paste_signal.send(());
-        }
-
-        if let Some(ch) = char::from_u32(uni_char) {
-            let _ = self.input.send(ch);
-        }
-    }
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Modifiers {
+    pub(super) ctrl: bool,
+    pub(super) shift: bool,
+    pub(super) alt: bool,
+    pub(super) super_key: bool,
 }
 
 pub(super) fn forward_text_input(
-    input: &Receiver<char>,
-    window: &Window,
+    text: &str,
+    modifiers: Modifiers,
     pane: &mut TerminalPane,
     suppress_input: bool,
 ) -> Result<bool> {
-    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-    let super_down = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
-    let mut wrote = false;
-
-    for ch in input.try_iter() {
-        if suppress_input || ctrl || super_down {
-            continue;
-        }
-
-        let mut bytes = [0; 4];
-        pane.write_all(ch.encode_utf8(&mut bytes).as_bytes())?;
-        wrote = true;
+    if suppress_input || modifiers.ctrl || modifiers.super_key || text.is_empty() {
+        return Ok(false);
     }
 
-    Ok(wrote)
+    pane.write_all(text.as_bytes())?;
+    Ok(true)
 }
 
 /// Clipboard paste from OS selection (Ctrl+Shift+V, Super+V, Shift+Insert). Plain Ctrl+V is not
 /// intercepted so Neovim/shell receive `^V` (e.g. visual block mode).
 pub(super) fn try_clipboard_paste(
-    window: &Window,
-    paste_signal: &Receiver<()>,
+    paste_requested: bool,
     pane: &mut TerminalPane,
     suppress_input: bool,
 ) -> Result<bool> {
-    if suppress_input {
-        // Drain any pending signals.
-        for _ in paste_signal.try_iter() {}
-        return Ok(false);
-    }
-
-    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
-    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-    let super_key = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
-    let insert_pressed = window.is_key_pressed(Key::Insert, KeyRepeat::No);
-    let super_v = super_key && window.is_key_pressed(Key::V, KeyRepeat::No);
-    // Super+Insert: some stacks report this chord instead of Super+V; same paste intent.
-    let super_insert = super_key && insert_pressed;
-
-    // paste_signal fires for 'V'/'v' from the text callback (Ctrl+Shift+V, Super+V, etc.).
-    // OS paste from that path: Ctrl+Shift+V, or Super+V — never plain Ctrl+V (Neovim ^V).
-    let got_paste_signal = paste_signal.try_iter().next().is_some();
-    let paste_from_text_callback =
-        got_paste_signal && (super_key || (ctrl && shift));
-
-    let paste_requested = paste_from_text_callback
-        || (insert_pressed && shift)
-        || super_v
-        || super_insert;
-
-    if !paste_requested {
+    if suppress_input || !paste_requested {
         return Ok(false);
     }
 
@@ -119,9 +166,51 @@ pub(super) fn try_clipboard_paste(
     Ok(true)
 }
 
+/// Keyboard scroll of the active pane's viewport (Shift+PgUp / Shift+PgDn). Does not send escape
+/// sequences to the PTY—same behavior as the mouse wheel. Ghostty: scroll up (into scrollback) is a
+/// negative delta.
+pub(super) fn forward_keyboard_viewport_scroll(
+    pressed_keys: &[Key],
+    modifiers: Modifiers,
+    active_pane: usize,
+    panes: &mut [TerminalPane],
+    suppress_input: bool,
+) -> bool {
+    if suppress_input {
+        return false;
+    }
+
+    if !modifiers.shift {
+        return false;
+    }
+
+    let Some(pane) = panes.get_mut(active_pane) else {
+        return false;
+    };
+
+    let step = pane.viewport_rows().max(1) as isize;
+
+    for key in pressed_keys.iter().copied() {
+        match key {
+            Key::PageUp => {
+                pane.scroll_viewport(-step);
+                return true;
+            }
+            Key::PageDown => {
+                pane.scroll_viewport(step);
+                return true;
+            }
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Scroll the terminal viewport under the mouse wheel using libghostty scrollback.
 pub(super) fn forward_mouse_scroll(
-    window: &Window,
+    scroll_delta: (f32, f32),
+    cursor_position: Option<(usize, usize)>,
     layout: &SplitLayout,
     panes: &mut [TerminalPane],
     suppress_input: bool,
@@ -130,44 +219,40 @@ pub(super) fn forward_mouse_scroll(
         return false;
     }
 
-    let Some((_sx, sy)) = window.get_scroll_wheel() else {
-        return false;
-    };
+    let (sx, sy) = scroll_delta;
+    // Combine axes so shift+horizontal wheel / sideways trackpad still scrolls the terminal.
+    let sy = sy + sx;
 
-    if sy.abs() < f32::EPSILON {
+    if sy.abs() <= 1e-4 {
         return false;
     }
 
-    let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
+    let Some((x, y)) = cursor_position else {
         return false;
     };
-
-    let x = x as usize;
-    let y = y as usize;
 
     let Some((pane_index, _rect)) = layout.pane_at(x, y) else {
         return false;
     };
 
-    let delta_y = (-sy / 40.0).round().clamp(-64.0, 64.0) as isize;
-
-    if delta_y != 0 {
-        panes[pane_index].scroll_viewport(delta_y);
-        return true;
+    // Ghostty: scroll up (into scrollback) is negative. Match low-amplitude axis events: rounding
+    // `-sy/40` often yields 0 for a single notch on Wayland/X11.
+    let scaled = -sy / 40.0;
+    let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
+    if delta_y == 0 {
+        delta_y = -sy.signum() as isize;
     }
 
-    false
+    panes[pane_index].scroll_viewport(delta_y);
+    true
 }
 
 pub(super) fn forward_special_keys(
     pressed_keys: &[Key],
-    window: &Window,
+    modifiers: Modifiers,
     pane: &mut TerminalPane,
     skip_layout_shortcut: bool,
 ) -> Result<bool> {
-    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
-    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
-    let super_key = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
     let mut wrote = false;
 
     for key in pressed_keys.iter().copied() {
@@ -177,25 +262,30 @@ pub(super) fn forward_special_keys(
             continue;
         }
 
-        if ctrl && key == Key::V && shift {
+        if modifiers.ctrl && key == Key::V && modifiers.shift {
             continue;
         }
 
-        if key == Key::Insert && shift {
+        if key == Key::Insert && modifiers.shift {
             continue;
         }
 
         // Super+Insert paste (or stray Insert with Super held): never send <Insert> to the shell —
         // in Vim insert mode that toggles replace mode.
-        if key == Key::Insert && super_key {
+        if key == Key::Insert && modifiers.super_key {
             continue;
         }
 
-        if super_key && key == Key::V {
+        if modifiers.super_key && key == Key::V {
             continue;
         }
 
-        if ctrl {
+        // Viewport scroll handled in `forward_keyboard_viewport_scroll`; do not send CSI Page keys.
+        if modifiers.shift && matches!(key, Key::PageUp | Key::PageDown) {
+            continue;
+        }
+
+        if modifiers.ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
                 pane.write_all(&bytes)?;
                 wrote = true;

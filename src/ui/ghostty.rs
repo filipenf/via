@@ -1,12 +1,18 @@
 use std::ffi::OsString;
+use std::num::NonZeroU32;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
-use crossbeam_channel::unbounded;
-use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
+use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info};
+use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::PhysicalKey;
+use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::config::Config;
 use crate::event::{Event, UiCommand, UiEvent};
@@ -22,7 +28,10 @@ mod render;
 
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
-use input::{TextInput, forward_mouse_scroll, forward_special_keys, forward_text_input, try_clipboard_paste};
+use input::{
+    Key, Modifiers, forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
+    forward_text_input, try_clipboard_paste,
+};
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
 
@@ -57,155 +66,135 @@ impl GhosttyUi {
         );
     }
 
-    pub fn run(mut self) -> Result<()> {
-        let mut window = Window::new(
-            "Spectre",
-            INITIAL_WIDTH,
-            INITIAL_HEIGHT,
-            WindowOptions {
-                resize: true,
-                ..WindowOptions::default()
-            },
-        )
-        .context("failed to create native window")?;
-        window.set_target_fps(60);
+    pub fn run(self) -> Result<()> {
+        let event_loop = EventLoop::new().context("failed to create native event loop")?;
+        let mut app = WinitGhosttyApp::new(self)?;
 
-        let (input_tx, input_rx) = unbounded();
-        let (paste_tx, paste_rx) = unbounded();
-        window.set_input_callback(Box::new(TextInput::new(input_tx, paste_tx)));
+        event_loop
+            .run_app(&mut app)
+            .context("native event loop failed")?;
 
-        let terminal_config = TerminalConfig::load();
-        let mut font_renderer = FontRenderer::new(&terminal_config)?;
-        let mut buffer = vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT];
-        let mut panes =
-            self.create_panes(INITIAL_WIDTH, INITIAL_HEIGHT, terminal_config.metrics)?;
-        let mut active_pane = 0;
-        let mut pane_layout_mode = PaneLayoutMode::Split;
-        let mut pane_split_direction =
-            PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
-        let mut layout = SplitLayout::for_window(
-            INITIAL_WIDTH,
-            INITIAL_HEIGHT,
-            panes.len(),
-            pane_layout_mode,
-            pane_split_direction,
-        );
-        let nvim_args = nvim_args(&self.config);
-
-        panes[0].spawn(
-            &self.config.nvim_command,
-            nvim_args,
-            &self.config.working_directory,
-        )?;
-
-        info!(panes = panes.len(), "native terminal window ready");
-        let mut left_mouse_down = false;
-        let mut force_redraw = true;
-
-        while window.is_open() {
-            let mut frame_dirty = force_redraw;
-            force_redraw = false;
-            let (width, height) = window.get_size();
-            frame_dirty |= ensure_buffer_size(
-                &mut buffer,
-                width,
-                height,
-                terminal_config.theme.background,
-            );
-            let pressed_keys = window.get_keys_pressed(KeyRepeat::Yes);
-            let alt = window.is_key_down(Key::LeftAlt) || window.is_key_down(Key::RightAlt);
-            let layout_shortcut_consumed = handle_layout_shortcuts(
-                &pressed_keys,
-                alt,
-                panes.len(),
-                &mut pane_layout_mode,
-                &mut pane_split_direction,
-                &mut active_pane,
-            );
-            frame_dirty |= layout_shortcut_consumed;
-
-            let new_layout = SplitLayout::for_window(
-                width,
-                height,
-                panes.len(),
-                pane_layout_mode,
-                pane_split_direction,
-            );
-            if new_layout != layout {
-                layout = new_layout;
-                frame_dirty = true;
-
-                for (index, pane) in panes.iter_mut().enumerate() {
-                    let rect = layout.pane(index);
-                    if rect.width == 0 || rect.height == 0 {
-                        continue;
-                    }
-
-                    if let Some(size) = pane.resize(rect.width, rect.height) {
-                        debug!(pane = pane.title, ?size, "resized terminal pane");
-                    }
-                }
-            }
-
-            for pane in &mut panes {
-                frame_dirty |= pane.drain_output();
-            }
-            frame_dirty |= self.forward_ui_commands(&mut panes)?;
-            frame_dirty |= self.flush_pending_agent_write(&mut panes)?;
-            frame_dirty |= forward_text_input(
-                &input_rx,
-                &window,
-                &mut panes[active_pane],
-                layout_shortcut_consumed,
-            )?;
-            frame_dirty |= try_clipboard_paste(
-                &window,
-                &paste_rx,
-                &mut panes[active_pane],
-                layout_shortcut_consumed,
-            )?;
-            frame_dirty |= forward_special_keys(
-                &pressed_keys,
-                &window,
-                &mut panes[active_pane],
-                layout_shortcut_consumed,
-            )?;
-            frame_dirty |= forward_mouse_scroll(
-                &window,
-                &layout,
-                &mut panes,
-                layout_shortcut_consumed,
-            );
-            frame_dirty |= self.forward_file_reference_click(
-                &window,
-                &panes,
-                &layout,
-                &mut active_pane,
-                &mut left_mouse_down,
-            );
-
-            if !frame_dirty {
-                window.update();
-                std::thread::sleep(Duration::from_millis(8));
-                continue;
-            }
-
-            buffer.fill(terminal_config.theme.background);
-            for (index, pane) in panes.iter_mut().enumerate() {
-                pane.draw(
-                    &mut font_renderer,
-                    &mut buffer,
-                    width,
-                    height,
-                    layout.pane(index),
-                    index == active_pane,
-                );
-            }
-            window
-                .update_with_buffer(&buffer, width, height)
-                .context("failed to update native window")?;
+        if let Some(error) = app.error {
+            return Err(error);
         }
 
+        Ok(())
+    }
+}
+
+struct WinitGhosttyApp {
+    config: Config,
+    events: EventSender,
+    ui_commands: TokioReceiver<UiCommand>,
+    pending_agent_write: Option<PendingAgentWrite>,
+    window: Option<Arc<Window>>,
+    window_id: Option<WindowId>,
+    softbuffer_context: Option<softbuffer::Context<Arc<Window>>>,
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    terminal_config: TerminalConfig,
+    font_renderer: FontRenderer,
+    buffer: Vec<u32>,
+    panes: Vec<TerminalPane>,
+    active_pane: usize,
+    pane_layout_mode: PaneLayoutMode,
+    pane_split_direction: PaneSplitDirection,
+    layout: SplitLayout,
+    width: usize,
+    height: usize,
+    modifiers: Modifiers,
+    cursor_position: Option<(usize, usize)>,
+    left_mouse_down: bool,
+    dirty: bool,
+    error: Option<anyhow::Error>,
+}
+
+impl WinitGhosttyApp {
+    fn new(ui: GhosttyUi) -> Result<Self> {
+        let terminal_config = TerminalConfig::load();
+        let font_renderer = FontRenderer::new(&terminal_config)?;
+        let pane_split_direction = PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
+        let pane_count = pane_count(&ui.config);
+        let layout = SplitLayout::for_window(
+            INITIAL_WIDTH,
+            INITIAL_HEIGHT,
+            pane_count,
+            PaneLayoutMode::Split,
+            pane_split_direction,
+        );
+
+        Ok(Self {
+            config: ui.config,
+            events: ui.events,
+            ui_commands: ui.ui_commands,
+            pending_agent_write: ui.pending_agent_write,
+            window: None,
+            window_id: None,
+            softbuffer_context: None,
+            surface: None,
+            terminal_config: terminal_config.clone(),
+            font_renderer,
+            buffer: vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT],
+            panes: Vec::new(),
+            active_pane: 0,
+            pane_layout_mode: PaneLayoutMode::Split,
+            pane_split_direction,
+            layout,
+            width: INITIAL_WIDTH,
+            height: INITIAL_HEIGHT,
+            modifiers: Modifiers::default(),
+            cursor_position: None,
+            left_mouse_down: false,
+            dirty: true,
+            error: None,
+        })
+    }
+
+    fn initialize_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
+
+        let attributes = WindowAttributes::default()
+            .with_title("Spectre")
+            .with_resizable(true)
+            .with_inner_size(PhysicalSize::new(
+                INITIAL_WIDTH as u32,
+                INITIAL_HEIGHT as u32,
+            ));
+        let window = Arc::new(
+            event_loop
+                .create_window(attributes)
+                .context("failed to create native window")?,
+        );
+        window.set_ime_allowed(true);
+
+        let context = softbuffer::Context::new(window.clone())
+            .map_err(|error| anyhow!("failed to create softbuffer context: {error:?}"))?;
+        let mut surface = softbuffer::Surface::new(&context, window.clone())
+            .map_err(|error| anyhow!("failed to create softbuffer surface: {error:?}"))?;
+        let size = window.inner_size();
+        self.resize_surface(&mut surface, size.width, size.height)?;
+        self.resize_terminals(size.width as usize, size.height as usize);
+
+        if self.panes.is_empty() {
+            self.panes =
+                self.create_panes(self.width, self.height, self.terminal_config.metrics)?;
+            let nvim_args = nvim_args(&self.config);
+            self.panes[0].spawn(
+                &self.config.nvim_command,
+                nvim_args,
+                &self.config.working_directory,
+            )?;
+            self.relayout();
+            info!(panes = self.panes.len(), "native terminal window ready");
+        }
+
+        self.window_id = Some(window.id());
+        self.window = Some(window);
+        self.softbuffer_context = Some(context);
+        self.surface = Some(surface);
+        self.dirty = true;
+        self.request_redraw();
         Ok(())
     }
 
@@ -218,7 +207,7 @@ impl GhosttyUi {
         let layout = SplitLayout::for_window(
             width,
             height,
-            self.pane_count(),
+            pane_count(&self.config),
             PaneLayoutMode::Split,
             PaneSplitDirection::for_window(width, height),
         );
@@ -243,47 +232,207 @@ impl GhosttyUi {
         Ok(panes)
     }
 
-    fn pane_count(&self) -> usize {
-        if self.config.agent_command.is_some() {
-            2
-        } else {
-            1
+    fn resize_surface(
+        &mut self,
+        surface: &mut softbuffer::Surface<Arc<Window>, Arc<Window>>,
+        width: u32,
+        height: u32,
+    ) -> Result<()> {
+        let Some(width) = NonZeroU32::new(width) else {
+            return Ok(());
+        };
+        let Some(height) = NonZeroU32::new(height) else {
+            return Ok(());
+        };
+
+        surface
+            .resize(width, height)
+            .map_err(|error| anyhow!("failed to resize softbuffer surface: {error:?}"))
+    }
+
+    fn resize_window(&mut self, width: u32, height: u32) -> Result<()> {
+        if let Some(mut surface) = self.surface.take() {
+            self.resize_surface(&mut surface, width, height)?;
+            self.surface = Some(surface);
+        }
+
+        self.resize_terminals(width as usize, height as usize);
+        self.dirty = true;
+        self.request_redraw();
+        Ok(())
+    }
+
+    fn resize_terminals(&mut self, width: usize, height: usize) {
+        self.width = width;
+        self.height = height;
+        self.dirty |= ensure_buffer_size(
+            &mut self.buffer,
+            width,
+            height,
+            self.terminal_config.theme.background,
+        );
+        self.relayout();
+    }
+
+    fn relayout(&mut self) {
+        if self.panes.is_empty() {
+            return;
+        }
+
+        let new_layout = SplitLayout::for_window(
+            self.width,
+            self.height,
+            self.panes.len(),
+            self.pane_layout_mode,
+            self.pane_split_direction,
+        );
+        if new_layout == self.layout {
+            return;
+        }
+
+        self.layout = new_layout;
+        self.dirty = true;
+
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            let rect = self.layout.pane(index);
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+
+            if let Some(size) = pane.resize(rect.width, rect.height) {
+                debug!(pane = pane.title, ?size, "resized terminal pane");
+            }
         }
     }
 
-    fn forward_file_reference_click(
-        &self,
-        window: &Window,
-        panes: &[TerminalPane],
-        layout: &SplitLayout,
-        active_pane: &mut usize,
-        left_mouse_down: &mut bool,
-    ) -> bool {
-        let is_down = window.get_mouse_down(MouseButton::Left);
-        let just_pressed = is_down && !*left_mouse_down;
-        *left_mouse_down = is_down;
-
-        if !just_pressed {
-            return false;
+    fn handle_key_event(&mut self, event: KeyEvent) -> Result<()> {
+        if event.state != ElementState::Pressed || self.panes.is_empty() {
+            return Ok(());
         }
 
-        let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
-            return false;
+        let key = match event.physical_key {
+            PhysicalKey::Code(code) => Key::from_key_code(code),
+            PhysicalKey::Unidentified(_) => None,
+        };
+        let pressed_keys = key.into_iter().collect::<Vec<_>>();
+        let layout_shortcut_consumed = handle_layout_shortcuts(
+            &pressed_keys,
+            self.modifiers.alt,
+            self.panes.len(),
+            &mut self.pane_layout_mode,
+            &mut self.pane_split_direction,
+            &mut self.active_pane,
+        );
+        if layout_shortcut_consumed {
+            self.relayout();
+            self.dirty = true;
+        }
+
+        let paste_requested = !event.repeat
+            && key
+                .map(|key| paste_requested(key, self.modifiers))
+                .unwrap_or(false);
+        if paste_requested {
+            self.dirty |= try_clipboard_paste(
+                true,
+                &mut self.panes[self.active_pane],
+                layout_shortcut_consumed,
+            )?;
+            return Ok(());
+        }
+
+        self.dirty |= forward_keyboard_viewport_scroll(
+            &pressed_keys,
+            self.modifiers,
+            self.active_pane,
+            &mut self.panes,
+            layout_shortcut_consumed,
+        );
+        self.dirty |= forward_special_keys(
+            &pressed_keys,
+            self.modifiers,
+            &mut self.panes[self.active_pane],
+            layout_shortcut_consumed,
+        )?;
+
+        if let Some(text) = event
+            .text
+            .as_deref()
+            .filter(|text| text.chars().all(|ch| !ch.is_control()))
+        {
+            self.dirty |= forward_text_input(
+                text,
+                self.modifiers,
+                &mut self.panes[self.active_pane],
+                layout_shortcut_consumed,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn handle_text_commit(&mut self, text: &str) -> Result<()> {
+        if self.panes.is_empty() {
+            return Ok(());
+        }
+
+        self.dirty |= forward_text_input(
+            text,
+            self.modifiers,
+            &mut self.panes[self.active_pane],
+            false,
+        )?;
+        Ok(())
+    }
+
+    fn handle_mouse_scroll(&mut self, delta: MouseScrollDelta) {
+        if self.panes.is_empty() {
+            return;
+        }
+
+        let scroll_delta = match delta {
+            MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
+            MouseScrollDelta::PixelDelta(position) => (position.x as f32, position.y as f32),
         };
 
-        let x = x as usize;
-        let y = y as usize;
-        let Some((pane_index, rect)) = layout.pane_at(x, y) else {
+        self.dirty |= forward_mouse_scroll(
+            scroll_delta,
+            self.cursor_position,
+            &self.layout,
+            &mut self.panes,
+            false,
+        );
+    }
+
+    fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
+        if button != MouseButton::Left {
+            return;
+        }
+
+        let is_down = state == ElementState::Pressed;
+        let just_pressed = is_down && !self.left_mouse_down;
+        self.left_mouse_down = is_down;
+
+        if just_pressed {
+            self.dirty |= self.forward_file_reference_click();
+        }
+    }
+
+    fn forward_file_reference_click(&mut self) -> bool {
+        let Some((x, y)) = self.cursor_position else {
             return false;
         };
-        let pane_changed = *active_pane != pane_index;
-        *active_pane = pane_index;
+        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+            return false;
+        };
+        let pane_changed = self.active_pane != pane_index;
+        self.active_pane = pane_index;
 
-        let metrics = panes[pane_index].metrics();
+        let metrics = self.panes[pane_index].metrics();
         let row = (y - rect.y) / metrics.cell_height;
         let column = (x - rect.x) / metrics.cell_width;
         let Some(target) =
-            panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
+            self.panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
         else {
             return pane_changed;
         };
@@ -301,14 +450,59 @@ impl GhosttyUi {
         true
     }
 
-    fn forward_ui_commands(&mut self, panes: &mut [TerminalPane]) -> Result<bool> {
+    fn drain_background_work(&mut self) -> Result<()> {
+        for pane in &mut self.panes {
+            self.dirty |= pane.drain_output();
+        }
+        self.dirty |= self.forward_ui_commands()?;
+        self.dirty |= self.flush_pending_agent_write()?;
+        Ok(())
+    }
+
+    fn render(&mut self) -> Result<()> {
+        if self.width == 0 || self.height == 0 {
+            return Ok(());
+        }
+
+        let Some(window) = self.window.as_ref() else {
+            return Ok(());
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
+
+        self.buffer.fill(self.terminal_config.theme.background);
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            pane.draw(
+                &mut self.font_renderer,
+                &mut self.buffer,
+                self.width,
+                self.height,
+                self.layout.pane(index),
+                index == self.active_pane,
+            );
+        }
+
+        let mut surface_buffer = surface
+            .buffer_mut()
+            .map_err(|error| anyhow!("failed to acquire softbuffer frame: {error:?}"))?;
+        surface_buffer.copy_from_slice(&self.buffer);
+        window.pre_present_notify();
+        surface_buffer
+            .present()
+            .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
+        self.dirty = false;
+        Ok(())
+    }
+
+    fn forward_ui_commands(&mut self) -> Result<bool> {
         let mut changed = false;
 
         while let Ok(command) = self.ui_commands.try_recv() {
             changed = true;
             match command {
                 UiCommand::EditorContextChanged { path, line, column } => {
-                    let Some(agent_pane) = panes.get_mut(1) else {
+                    let Some(agent_pane) = self.panes.get_mut(1) else {
                         continue;
                     };
                     let update =
@@ -323,7 +517,7 @@ impl GhosttyUi {
                     start_line,
                     end_line,
                 } => {
-                    let Some(agent_pane) = panes.get_mut(1) else {
+                    let Some(agent_pane) = self.panes.get_mut(1) else {
                         continue;
                     };
                     let update = format_selection_update(
@@ -346,7 +540,7 @@ impl GhosttyUi {
         Ok(changed)
     }
 
-    fn flush_pending_agent_write(&mut self, panes: &mut [TerminalPane]) -> Result<bool> {
+    fn flush_pending_agent_write(&mut self) -> Result<bool> {
         let Some(pending) = &self.pending_agent_write else {
             return Ok(false);
         };
@@ -355,7 +549,7 @@ impl GhosttyUi {
             return Ok(false);
         }
 
-        let Some(agent_pane) = panes.get_mut(1) else {
+        let Some(agent_pane) = self.panes.get_mut(1) else {
             self.pending_agent_write = None;
             return Ok(false);
         };
@@ -367,6 +561,116 @@ impl GhosttyUi {
         agent_pane.write_all(&pending.bytes)?;
         Ok(true)
     }
+
+    fn request_redraw(&self) {
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    fn fail(&mut self, event_loop: &ActiveEventLoop, error: anyhow::Error) {
+        if self.error.is_none() {
+            self.error = Some(error);
+        }
+        event_loop.exit();
+    }
+}
+
+impl ApplicationHandler for WinitGhosttyApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.initialize_window(event_loop) {
+            self.fail(event_loop, error);
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if Some(window_id) != self.window_id {
+            return;
+        }
+
+        let result = match event {
+            WindowEvent::CloseRequested => {
+                event_loop.exit();
+                Ok(())
+            }
+            WindowEvent::Resized(size) => self.resize_window(size.width, size.height),
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let Some(window) = self.window.as_ref() else {
+                    return;
+                };
+                let size = window.inner_size();
+                self.resize_window(size.width, size.height)
+            }
+            WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(event),
+            WindowEvent::ModifiersChanged(modifiers) => {
+                let state = modifiers.state();
+                self.modifiers = Modifiers {
+                    ctrl: state.control_key(),
+                    shift: state.shift_key(),
+                    alt: state.alt_key(),
+                    super_key: state.super_key(),
+                };
+                Ok(())
+            }
+            WindowEvent::Ime(Ime::Commit(text)) => self.handle_text_commit(&text),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position =
+                    Some((position.x.max(0.0) as usize, position.y.max(0.0) as usize));
+                Ok(())
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_position = None;
+                Ok(())
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                self.handle_mouse_scroll(delta);
+                Ok(())
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                self.handle_mouse_input(state, button);
+                Ok(())
+            }
+            WindowEvent::RedrawRequested => self.render(),
+            _ => Ok(()),
+        };
+
+        if let Err(error) = result {
+            self.fail(event_loop, error);
+            return;
+        }
+
+        if self.dirty {
+            self.request_redraw();
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(error) = self.drain_background_work() {
+            self.fail(event_loop, error);
+            return;
+        }
+
+        if self.dirty {
+            self.request_redraw();
+            event_loop.set_control_flow(ControlFlow::Wait);
+        } else {
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(8)));
+        }
+    }
+}
+
+fn pane_count(config: &Config) -> usize {
+    if config.agent_command.is_some() { 2 } else { 1 }
+}
+
+fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
+    (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
+        || (key == Key::Insert && (modifiers.shift || modifiers.super_key))
 }
 
 fn nvim_args(config: &Config) -> Vec<OsString> {
