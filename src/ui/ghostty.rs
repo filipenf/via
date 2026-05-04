@@ -22,7 +22,7 @@ mod render;
 
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
-use input::{TextInput, forward_special_keys, forward_text_input};
+use input::{TextInput, forward_mouse_scroll, forward_special_keys, forward_text_input, try_clipboard_paste};
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
 
@@ -142,13 +142,23 @@ impl GhosttyUi {
             self.forward_ui_commands(&mut panes)?;
             self.flush_pending_agent_write(&mut panes)?;
             forward_text_input(&input_rx, &mut panes[active_pane], layout_shortcut_consumed)?;
+            try_clipboard_paste(
+                &window,
+                &mut panes[active_pane],
+                layout_shortcut_consumed,
+            )?;
             forward_special_keys(
                 &pressed_keys,
                 &window,
                 &mut panes[active_pane],
                 layout_shortcut_consumed,
             )?;
-
+            forward_mouse_scroll(
+                &window,
+                &layout,
+                &mut panes,
+                layout_shortcut_consumed,
+            );
             buffer.fill(terminal_config.theme.background);
             for (index, pane) in panes.iter_mut().enumerate() {
                 pane.draw(

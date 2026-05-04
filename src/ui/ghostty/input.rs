@@ -1,9 +1,14 @@
 use anyhow::Result;
+use arboard::Clipboard;
 use crossbeam_channel::{Receiver, Sender};
-use minifb::{InputCallback, Key, Window};
+use minifb::{InputCallback, Key, KeyRepeat, MouseMode, Window};
+use tracing::warn;
 
-use super::layout::{pane_layout_shortcut, pane_navigation_shortcut};
+use super::layout::{SplitLayout, pane_layout_shortcut, pane_navigation_shortcut};
 use super::pane::TerminalPane;
+
+const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
+const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 pub(super) struct TextInput {
     input: Sender<char>,
@@ -40,6 +45,84 @@ pub(super) fn forward_text_input(
     Ok(())
 }
 
+/// Clipboard paste from OS selection (Ctrl+Shift+V, Shift+Insert). Must run before
+/// [`forward_special_keys`] so duplicate keystrokes are not sent to the PTY.
+pub(super) fn try_clipboard_paste(
+    window: &Window,
+    pane: &mut TerminalPane,
+    suppress_input: bool,
+) -> Result<()> {
+    if suppress_input {
+        return Ok(());
+    }
+
+    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+
+    let paste_requested = (window.is_key_pressed(Key::V, KeyRepeat::No) && ctrl && shift)
+        || (window.is_key_pressed(Key::Insert, KeyRepeat::No) && shift);
+
+    if !paste_requested {
+        return Ok(());
+    }
+
+    let text = match Clipboard::new().and_then(|mut c| c.get_text()) {
+        Ok(t) => t,
+        Err(error) => {
+            warn!(%error, "clipboard read failed");
+            return Ok(());
+        }
+    };
+
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    let mut payload = Vec::with_capacity(text.len() + BRACKETED_PASTE_START.len() + 8);
+    payload.extend_from_slice(BRACKETED_PASTE_START);
+    payload.extend_from_slice(text.as_bytes());
+    payload.extend_from_slice(BRACKETED_PASTE_END);
+    pane.write_all(&payload)?;
+    Ok(())
+}
+
+/// Scroll the terminal viewport under the mouse wheel using libghostty scrollback.
+pub(super) fn forward_mouse_scroll(
+    window: &Window,
+    layout: &SplitLayout,
+    panes: &mut [TerminalPane],
+    suppress_input: bool,
+) {
+    if suppress_input {
+        return;
+    }
+
+    let Some((_sx, sy)) = window.get_scroll_wheel() else {
+        return;
+    };
+
+    if sy.abs() < f32::EPSILON {
+        return;
+    }
+
+    let Some((x, y)) = window.get_unscaled_mouse_pos(MouseMode::Clamp) else {
+        return;
+    };
+
+    let x = x as usize;
+    let y = y as usize;
+
+    let Some((pane_index, _rect)) = layout.pane_at(x, y) else {
+        return;
+    };
+
+    let delta_y = (-sy / 40.0).round().clamp(-64.0, 64.0) as isize;
+
+    if delta_y != 0 {
+        panes[pane_index].scroll_viewport(delta_y);
+    }
+}
+
 pub(super) fn forward_special_keys(
     pressed_keys: &[Key],
     window: &Window,
@@ -47,11 +130,20 @@ pub(super) fn forward_special_keys(
     skip_layout_shortcut: bool,
 ) -> Result<()> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+    let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
 
     for key in pressed_keys.iter().copied() {
         if skip_layout_shortcut
             && (pane_layout_shortcut(key).is_some() || pane_navigation_shortcut(key).is_some())
         {
+            continue;
+        }
+
+        if ctrl && key == Key::V && shift {
+            continue;
+        }
+
+        if key == Key::Insert && shift {
             continue;
         }
 

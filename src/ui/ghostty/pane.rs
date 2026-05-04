@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, TerminalOptions};
 use tracing::{debug, warn};
 
@@ -73,6 +74,14 @@ impl TerminalPane {
         }
 
         Some(size)
+    }
+
+    pub(super) fn scroll_viewport(&mut self, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+
+        self.view.scroll_viewport(delta);
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
@@ -186,6 +195,10 @@ impl TerminalView {
         self.size = size;
         self.hyperlink_tracker.resize(size);
         Some(size)
+    }
+
+    fn scroll_viewport(&mut self, delta: isize) {
+        self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
     }
 
     fn process(&mut self, bytes: &[u8]) {
