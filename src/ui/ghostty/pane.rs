@@ -14,7 +14,7 @@ use crate::pty::{PtySession, TerminalSize};
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{Osc8Tracker, file_reference_at, file_target_from_uri};
+use super::links::{file_reference_at, file_target_from_uri, Osc8Tracker};
 use super::render::{draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;

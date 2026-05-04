@@ -4,7 +4,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info};
 use winit::application::ApplicationHandler;
@@ -29,10 +29,10 @@ mod render;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{
-    Key, Modifiers, forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
-    forward_text_input, try_clipboard_paste,
+    forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
+    forward_text_input, try_clipboard_paste, Key, Modifiers,
 };
-use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
+use layout::{handle_layout_shortcuts, PaneLayoutMode, PaneSplitDirection, SplitLayout};
 use pane::TerminalPane;
 
 const INITIAL_WIDTH: usize = 960;
@@ -318,6 +318,7 @@ impl WinitGhosttyApp {
         let layout_shortcut_consumed = handle_layout_shortcuts(
             &pressed_keys,
             self.modifiers.alt,
+            self.modifiers.shift,
             self.panes.len(),
             &mut self.pane_layout_mode,
             &mut self.pane_split_direction,
@@ -665,7 +666,11 @@ impl ApplicationHandler for WinitGhosttyApp {
 }
 
 fn pane_count(config: &Config) -> usize {
-    if config.agent_command.is_some() { 2 } else { 1 }
+    if config.agent_command.is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
@@ -766,7 +771,7 @@ mod tests {
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
-    use links::{LinkSpan, file_reference_at, file_target_from_uri, parse_vt_hyperlinks};
+    use links::{file_reference_at, file_target_from_uri, parse_vt_hyperlinks, LinkSpan};
 
     #[test]
     fn parses_ghostty_config_entries() {
@@ -1026,13 +1031,44 @@ mod tests {
     }
 
     #[test]
-    fn maps_alt_number_shortcuts_to_layout_modes() {
+    fn maps_alt_number_shortcuts_to_active_panes() {
+        let mut mode = PaneLayoutMode::AgentMaximized;
+        let mut split_direction = PaneSplitDirection::Vertical;
+        let mut active_pane = 1;
+
+        assert!(handle_layout_shortcuts(
+            &[Key::Key1],
+            true,
+            false,
+            2,
+            &mut mode,
+            &mut split_direction,
+            &mut active_pane
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 0);
+        assert!(handle_layout_shortcuts(
+            &[Key::Key2],
+            true,
+            false,
+            2,
+            &mut mode,
+            &mut split_direction,
+            &mut active_pane
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 1);
+    }
+
+    #[test]
+    fn maps_alt_shift_number_shortcuts_to_layout_modes() {
         let mut mode = PaneLayoutMode::Split;
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
         assert!(handle_layout_shortcuts(
             &[Key::Key1],
+            true,
             true,
             2,
             &mut mode,
@@ -1044,15 +1080,6 @@ mod tests {
         assert!(handle_layout_shortcuts(
             &[Key::Key2],
             true,
-            2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
-        ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 0);
-        assert!(handle_layout_shortcuts(
-            &[Key::Key3],
             true,
             2,
             &mut mode,
@@ -1072,6 +1099,7 @@ mod tests {
         assert!(handle_layout_shortcuts(
             &[Key::Left],
             true,
+            false,
             2,
             &mut mode,
             &mut split_direction,
@@ -1082,6 +1110,7 @@ mod tests {
         assert!(handle_layout_shortcuts(
             &[Key::Right],
             true,
+            false,
             2,
             &mut mode,
             &mut split_direction,
@@ -1092,13 +1121,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_alt_j_shortcut_to_split_direction_toggle() {
-        let mut mode = PaneLayoutMode::Split;
+    fn maps_alt_shift_3_shortcut_to_split_direction_toggle() {
+        let mut mode = PaneLayoutMode::AgentMaximized;
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 0;
 
         assert!(handle_layout_shortcuts(
-            &[Key::J],
+            &[Key::Key3],
+            true,
             true,
             2,
             &mut mode,
@@ -1109,7 +1139,8 @@ mod tests {
         assert_eq!(split_direction, PaneSplitDirection::Horizontal);
         assert_eq!(active_pane, 0);
         assert!(handle_layout_shortcuts(
-            &[Key::J],
+            &[Key::Key3],
+            true,
             true,
             2,
             &mut mode,
