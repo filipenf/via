@@ -124,6 +124,7 @@ impl SplitLayout {
 pub(super) fn handle_layout_shortcuts(
     pressed_keys: &[Key],
     alt: bool,
+    shift: bool,
     pane_count: usize,
     mode: &mut PaneLayoutMode,
     split_direction: &mut PaneSplitDirection,
@@ -134,31 +135,37 @@ pub(super) fn handle_layout_shortcuts(
     }
 
     for key in pressed_keys {
-        if *key == Key::J {
-            *split_direction = split_direction.toggled();
-            return true;
-        }
+        if shift {
+            if *key == Key::Key3 {
+                *mode = PaneLayoutMode::Split;
+                *split_direction = split_direction.toggled();
+                return true;
+            }
 
-        if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
-            if next_active_pane < pane_count {
+            let Some(next_mode) = pane_layout_shortcut(*key) else {
+                continue;
+            };
+
+            if next_mode == PaneLayoutMode::AgentMaximized && pane_count < 2 {
+                continue;
+            }
+
+            *mode = next_mode;
+            if let Some(next_active_pane) = focused_pane_for_layout(next_mode) {
                 *active_pane = next_active_pane;
             }
             return true;
         }
 
-        let Some(next_mode) = pane_layout_shortcut(*key) else {
-            continue;
-        };
-
-        if next_mode == PaneLayoutMode::AgentMaximized && pane_count < 2 {
-            continue;
+        if let Some(next_active_pane) =
+            pane_focus_shortcut(*key).or_else(|| pane_navigation_shortcut(*key))
+        {
+            if next_active_pane < pane_count {
+                *mode = PaneLayoutMode::Split;
+                *active_pane = next_active_pane;
+                return true;
+            }
         }
-
-        *mode = next_mode;
-        if let Some(next_active_pane) = focused_pane_for_layout(next_mode) {
-            *active_pane = next_active_pane;
-        }
-        return true;
     }
 
     false
@@ -180,11 +187,18 @@ pub(super) fn pane_navigation_shortcut(key: Key) -> Option<usize> {
     }
 }
 
+fn pane_focus_shortcut(key: Key) -> Option<usize> {
+    match key {
+        Key::Key1 => Some(0),
+        Key::Key2 => Some(1),
+        _ => None,
+    }
+}
+
 pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
     match key {
         Key::Key1 => Some(PaneLayoutMode::NvimMaximized),
-        Key::Key2 => Some(PaneLayoutMode::Split),
-        Key::Key3 => Some(PaneLayoutMode::AgentMaximized),
+        Key::Key2 => Some(PaneLayoutMode::AgentMaximized),
         _ => None,
     }
 }
