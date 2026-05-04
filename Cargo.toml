@@ -5,7 +5,9 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.100"
-arboard = "3"
+# `wayland-data-control`: on Linux Wayland, the default X11 clipboard path often sees an empty
+# clipboard when copying from native Wayland apps; this enables the wl-clipboard protocol instead.
+arboard = { version = "3", features = ["wayland-data-control"] }
 crossbeam-channel = "0.5.15"
 fontdue = "0.9.3"
 libghostty-vt = "0.1.1"

@@ -12,16 +12,27 @@ const BRACKETED_PASTE_END: &[u8] = b"\x1b[201~";
 
 pub(super) struct TextInput {
     input: Sender<char>,
+    paste_signal: Sender<()>,
 }
 
 impl TextInput {
-    pub(super) fn new(input: Sender<char>) -> Self {
-        Self { input }
+    pub(super) fn new(input: Sender<char>, paste_signal: Sender<()>) -> Self {
+        Self { input, paste_signal }
     }
 }
 
 impl InputCallback for TextInput {
     fn add_char(&mut self, uni_char: u32) {
+        // Ctrl+Shift+V arrives as uppercase 'V' (86) through the text callback
+        // while minifb never reports V via is_key_pressed when Ctrl+Shift is held.
+        // Ctrl+V (without shift) arrives as 0x16 (SYN).
+        // Super+V typically arrives as 'v' / 'V' (118 / 86) with no Ctrl modifier — the main loop
+        // pairs paste_signal with super_key (see try_clipboard_paste).
+        // Signal the main loop to check for a paste in any of these cases.
+        if matches!(uni_char, 0x16 | 86 | 118) {
+            let _ = self.paste_signal.send(());
+        }
+
         if let Some(ch) = char::from_u32(uni_char) {
             let _ = self.input.send(ch);
         }
@@ -30,11 +41,15 @@ impl InputCallback for TextInput {
 
 pub(super) fn forward_text_input(
     input: &Receiver<char>,
+    window: &Window,
     pane: &mut TerminalPane,
     suppress_input: bool,
 ) -> Result<()> {
+    let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+    let super_down = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
+
     for ch in input.try_iter() {
-        if suppress_input {
+        if suppress_input || ctrl || super_down {
             continue;
         }
 
@@ -45,22 +60,36 @@ pub(super) fn forward_text_input(
     Ok(())
 }
 
-/// Clipboard paste from OS selection (Ctrl+Shift+V, Shift+Insert). Must run before
-/// [`forward_special_keys`] so duplicate keystrokes are not sent to the PTY.
+/// Clipboard paste from OS selection (Ctrl+V, Ctrl+Shift+V, Super+V, Shift+Insert).
 pub(super) fn try_clipboard_paste(
     window: &Window,
+    paste_signal: &Receiver<()>,
     pane: &mut TerminalPane,
     suppress_input: bool,
 ) -> Result<()> {
     if suppress_input {
+        // Drain any pending signals.
+        for _ in paste_signal.try_iter() {}
         return Ok(());
     }
 
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
+    let super_key = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
+    let insert_pressed = window.is_key_pressed(Key::Insert, KeyRepeat::No);
+    let super_v = super_key && window.is_key_pressed(Key::V, KeyRepeat::No);
+    // Super+Insert: some stacks report this chord instead of Super+V; same paste intent.
+    let super_insert = super_key && insert_pressed;
 
-    let paste_requested = (window.is_key_pressed(Key::V, KeyRepeat::No) && ctrl && shift)
-        || (window.is_key_pressed(Key::Insert, KeyRepeat::No) && shift);
+    // paste_signal fires when add_char sees Ctrl+V (0x16), 'V' (86), or 'v' (118). That path
+    // must accept Ctrl *or* Super — Super+V does not set the Ctrl modifier.
+    let got_paste_signal = paste_signal.try_iter().next().is_some();
+    let paste_from_text_callback = got_paste_signal && (ctrl || super_key);
+
+    let paste_requested = paste_from_text_callback
+        || (insert_pressed && shift)
+        || super_v
+        || super_insert;
 
     if !paste_requested {
         return Ok(());
@@ -73,6 +102,8 @@ pub(super) fn try_clipboard_paste(
             return Ok(());
         }
     };
+
+    tracing::info!(len = text.len(), "pasting from clipboard");
 
     if text.is_empty() {
         return Ok(());
@@ -131,6 +162,7 @@ pub(super) fn forward_special_keys(
 ) -> Result<()> {
     let ctrl = window.is_key_down(Key::LeftCtrl) || window.is_key_down(Key::RightCtrl);
     let shift = window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift);
+    let super_key = window.is_key_down(Key::LeftSuper) || window.is_key_down(Key::RightSuper);
 
     for key in pressed_keys.iter().copied() {
         if skip_layout_shortcut
@@ -144,6 +176,16 @@ pub(super) fn forward_special_keys(
         }
 
         if key == Key::Insert && shift {
+            continue;
+        }
+
+        // Super+Insert paste (or stray Insert with Super held): never send <Insert> to the shell —
+        // in Vim insert mode that toggles replace mode.
+        if key == Key::Insert && super_key {
+            continue;
+        }
+
+        if super_key && key == Key::V {
             continue;
         }
 
