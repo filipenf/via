@@ -71,7 +71,8 @@ impl GhosttyUi {
         window.set_target_fps(60);
 
         let (input_tx, input_rx) = unbounded();
-        window.set_input_callback(Box::new(TextInput::new(input_tx)));
+        let (paste_tx, paste_rx) = unbounded();
+        window.set_input_callback(Box::new(TextInput::new(input_tx, paste_tx)));
 
         let terminal_config = TerminalConfig::load();
         let mut font_renderer = FontRenderer::new(&terminal_config)?;
@@ -141,9 +142,10 @@ impl GhosttyUi {
             }
             self.forward_ui_commands(&mut panes)?;
             self.flush_pending_agent_write(&mut panes)?;
-            forward_text_input(&input_rx, &mut panes[active_pane], layout_shortcut_consumed)?;
+            forward_text_input(&input_rx, &window, &mut panes[active_pane], layout_shortcut_consumed)?;
             try_clipboard_paste(
                 &window,
+                &paste_rx,
                 &mut panes[active_pane],
                 layout_shortcut_consumed,
             )?;
