@@ -26,6 +26,13 @@ fn libghostty_vt_lib_dir() -> Option<PathBuf> {
             continue;
         }
 
+        // Prefer the local build tree path first. This avoids depending on
+        // root-output contents, which can become stale or point to renamed paths.
+        let local_lib_dir = entry.path().join("out").join("ghostty-install").join("lib");
+        if local_lib_dir.exists() {
+            return Some(local_lib_dir);
+        }
+
         let root_output = entry.path().join("root-output");
         let Ok(output_dir) = fs::read_to_string(root_output) else {
             continue;
