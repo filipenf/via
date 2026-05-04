@@ -189,6 +189,7 @@ impl WinitGhosttyApp {
             .map_err(|error| anyhow!("failed to create softbuffer context: {error:?}"))?;
         let mut surface = softbuffer::Surface::new(&context, window.clone())
             .map_err(|error| anyhow!("failed to create softbuffer surface: {error:?}"))?;
+        self.update_font_scale(window.scale_factor())?;
         let size = window.inner_size();
         self.resize_surface(&mut surface, size.width, size.height)?;
         self.resize_terminals(size.width as usize, size.height as usize);
@@ -281,6 +282,21 @@ impl WinitGhosttyApp {
         self.resize_terminals(width as usize, height as usize);
         self.dirty = true;
         self.request_redraw();
+        Ok(())
+    }
+
+    fn update_font_scale(&mut self, scale_factor: f64) -> Result<()> {
+        let previous_metrics = self.terminal_config.metrics;
+        self.terminal_config
+            .finalize_metrics_for_scale(scale_factor);
+
+        if self.terminal_config.metrics == previous_metrics {
+            return Ok(());
+        }
+
+        self.font_renderer = FontRenderer::new(&self.terminal_config)?;
+        self.relayout();
+        self.dirty = true;
         Ok(())
     }
 
@@ -638,12 +654,13 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
                 Ok(())
             }
             WindowEvent::Resized(size) => self.resize_window(size.width, size.height),
-            WindowEvent::ScaleFactorChanged { .. } => {
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                let result = self.update_font_scale(scale_factor);
                 let Some(window) = self.window.as_ref() else {
                     return;
                 };
                 let size = window.inner_size();
-                self.resize_window(size.width, size.height)
+                result.and_then(|_| self.resize_window(size.width, size.height))
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key_event(event),
             WindowEvent::ModifiersChanged(modifiers) => {
@@ -844,6 +861,20 @@ mod tests {
         assert_eq!(config.font_pixels, 12.0);
         assert_eq!(config.metrics.cell_width, 8);
         assert_eq!(config.metrics.cell_height, 17);
+    }
+
+    #[test]
+    fn scales_metrics_from_window_scale_factor() {
+        let mut config = TerminalConfig {
+            font_size: 9.0,
+            ..TerminalConfig::default()
+        };
+
+        config.finalize_metrics_for_scale(1.25);
+
+        assert_eq!(config.font_pixels, 15.0);
+        assert_eq!(config.metrics.cell_width, 9);
+        assert_eq!(config.metrics.cell_height, 21);
     }
 
     #[test]

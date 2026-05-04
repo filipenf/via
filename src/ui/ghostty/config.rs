@@ -27,7 +27,7 @@ pub(super) struct TerminalConfig {
     pub(super) theme: TerminalTheme,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct TerminalMetrics {
     pub(super) cell_width: usize,
     pub(super) cell_height: usize,
@@ -123,7 +123,15 @@ impl TerminalConfig {
     }
 
     pub(super) fn finalize_metrics(&mut self) {
-        self.font_pixels = points_to_pixels(self.font_size);
+        self.finalize_metrics_for_dpi(DEFAULT_FONT_DPI);
+    }
+
+    pub(super) fn finalize_metrics_for_scale(&mut self, scale_factor: f64) {
+        self.finalize_metrics_for_dpi(DEFAULT_FONT_DPI * scale_factor.max(0.5) as f32);
+    }
+
+    fn finalize_metrics_for_dpi(&mut self, dpi: f32) {
+        self.font_pixels = points_to_pixels(self.font_size, dpi);
         let scale = (self.font_pixels / DEFAULT_FONT_PIXEL_SIZE).max(0.5);
         self.metrics.cell_width =
             ((DEFAULT_CELL_WIDTH as f32 * scale).round() as usize).max(MIN_CELL_WIDTH);
@@ -177,8 +185,8 @@ impl Default for TerminalTheme {
     }
 }
 
-fn points_to_pixels(points: f32) -> f32 {
-    points * DEFAULT_FONT_DPI / 72.0
+fn points_to_pixels(points: f32, dpi: f32) -> f32 {
+    points * dpi / 72.0
 }
 
 pub(super) fn ghostty_config_entry(line: &str) -> Option<(&str, &str)> {
