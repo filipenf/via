@@ -23,13 +23,11 @@ impl TextInput {
 
 impl InputCallback for TextInput {
     fn add_char(&mut self, uni_char: u32) {
-        // Ctrl+Shift+V arrives as uppercase 'V' (86) through the text callback
-        // while minifb never reports V via is_key_pressed when Ctrl+Shift is held.
-        // Ctrl+V (without shift) arrives as 0x16 (SYN).
-        // Super+V typically arrives as 'v' / 'V' (118 / 86) with no Ctrl modifier — the main loop
-        // pairs paste_signal with super_key (see try_clipboard_paste).
-        // Signal the main loop to check for a paste in any of these cases.
-        if matches!(uni_char, 0x16 | 86 | 118) {
+        // Ctrl+Shift+V arrives as 'V' (86) or 'v' (118) through the text callback while minifb does
+        // not report V reliably via is_key_pressed when modifiers are held.
+        // Ctrl+V alone arrives as 0x16 (SYN): do not signal paste — Neovim uses ^V (visual block, etc.).
+        // Super+V uses the same unicode paths; the main loop pairs paste_signal with super_key.
+        if matches!(uni_char, 86 | 118) {
             let _ = self.paste_signal.send(());
         }
 
@@ -62,7 +60,8 @@ pub(super) fn forward_text_input(
     Ok(wrote)
 }
 
-/// Clipboard paste from OS selection (Ctrl+V, Ctrl+Shift+V, Super+V, Shift+Insert).
+/// Clipboard paste from OS selection (Ctrl+Shift+V, Super+V, Shift+Insert). Plain Ctrl+V is not
+/// intercepted so Neovim/shell receive `^V` (e.g. visual block mode).
 pub(super) fn try_clipboard_paste(
     window: &Window,
     paste_signal: &Receiver<()>,
@@ -83,10 +82,11 @@ pub(super) fn try_clipboard_paste(
     // Super+Insert: some stacks report this chord instead of Super+V; same paste intent.
     let super_insert = super_key && insert_pressed;
 
-    // paste_signal fires when add_char sees Ctrl+V (0x16), 'V' (86), or 'v' (118). That path
-    // must accept Ctrl *or* Super — Super+V does not set the Ctrl modifier.
+    // paste_signal fires for 'V'/'v' from the text callback (Ctrl+Shift+V, Super+V, etc.).
+    // OS paste from that path: Ctrl+Shift+V, or Super+V — never plain Ctrl+V (Neovim ^V).
     let got_paste_signal = paste_signal.try_iter().next().is_some();
-    let paste_from_text_callback = got_paste_signal && (ctrl || super_key);
+    let paste_from_text_callback =
+        got_paste_signal && (super_key || (ctrl && shift));
 
     let paste_requested = paste_from_text_callback
         || (insert_pressed && shift)
