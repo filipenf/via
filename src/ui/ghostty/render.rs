@@ -80,7 +80,10 @@ pub(super) fn draw_screen(
         Err(_) => return false,
     };
     let mut row = 0usize;
-    let redraw_all_rows = force_redraw || dirty == Dirty::Full;
+    // Only force all rows when explicitly requested (e.g., resize, font change).
+    // For content updates (including scroll), rely on per-row dirty tracking
+    // to avoid redrawing unchanged rows.
+    let redraw_all_rows = force_redraw;
 
     while let Some(row_ref) = row_iter.next() {
         let row_dirty = redraw_all_rows || row_ref.dirty().unwrap_or(true);
