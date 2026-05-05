@@ -1,11 +1,13 @@
 use std::ffi::OsString;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, TerminalOptions};
+
 use tracing::{debug, warn};
 
 use crate::nvim::FileTarget;
@@ -15,9 +17,12 @@ use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 use super::links::{Osc8Tracker, file_reference_at, file_target_from_uri};
-use super::render::{draw_pane_border, draw_screen};
+use super::render::{DamageRect, draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
+const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(20);
+const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
+const PTY_DRAIN_MIN_CHUNKS: usize = 2;
 
 pub(super) struct TerminalPane {
     pub(super) title: &'static str,
@@ -134,6 +139,7 @@ impl TerminalPane {
         rect: PaneRect,
         active: bool,
         force_redraw: bool,
+        damage: &mut Vec<DamageRect>,
     ) -> bool {
         if rect.width == 0 || rect.height == 0 {
             return false;
@@ -147,6 +153,7 @@ impl TerminalPane {
             rect.x,
             rect.y,
             force_redraw,
+            damage,
         );
         if redrawn || force_redraw {
             draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
@@ -234,11 +241,10 @@ impl TerminalView {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
     }
 
-    fn process(&mut self, bytes: &[u8]) {
-        let should_follow_output = self.is_viewport_at_bottom();
+    fn process(&mut self, bytes: &[u8], follow_output: bool) {
         self.hyperlink_tracker.process(bytes);
         self.terminal.vt_write(bytes);
-        if should_follow_output {
+        if follow_output {
             self.terminal.scroll_viewport(ScrollViewport::Bottom);
         }
     }
@@ -259,6 +265,7 @@ impl TerminalView {
         origin_x: usize,
         origin_y: usize,
         force_redraw: bool,
+        damage: &mut Vec<DamageRect>,
     ) -> bool {
         draw_screen(
             &self.terminal,
@@ -274,6 +281,7 @@ impl TerminalView {
             origin_y,
             self.metrics,
             force_redraw,
+            damage,
         )
     }
 
@@ -307,11 +315,30 @@ impl TerminalView {
 }
 
 fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool {
+    let started_at = Instant::now();
+    let follow_output = view.is_viewport_at_bottom();
     let mut had_output = false;
+    let mut chunks = 0usize;
+    let mut bytes = 0usize;
 
-    for chunk in output.try_iter() {
+    while let Ok(chunk) = output.try_recv() {
         had_output = true;
-        view.process(&chunk);
+        chunks += 1;
+        bytes += chunk.len();
+        view.process(&chunk, false);
+
+        if chunks >= PTY_DRAIN_MIN_CHUNKS && started_at.elapsed() >= PTY_DRAIN_BUDGET {
+            break;
+        }
+    }
+
+    if had_output && follow_output {
+        view.terminal.scroll_viewport(ScrollViewport::Bottom);
+    }
+
+    let elapsed = started_at.elapsed();
+    if elapsed > PTY_DRAIN_WARN_THRESHOLD {
+        warn!(?elapsed, chunks, bytes, "slow PTY drain");
     }
 
     had_output
@@ -350,7 +377,7 @@ mod tests {
 
         assert!(!view.is_viewport_at_bottom());
 
-        view.process(b"L11\r\n");
+        view.process(b"L11\r\n", false);
 
         assert!(!view.is_viewport_at_bottom());
     }
@@ -370,7 +397,7 @@ mod tests {
 
     fn write_numbered_lines(view: &mut TerminalView, count: usize) {
         for index in 1..=count {
-            view.process(format!("L{index:02}\r\n").as_bytes());
+            view.process(format!("L{index:02}\r\n").as_bytes(), true);
         }
     }
 }

@@ -6,7 +6,6 @@ use fontdue::{Font, FontSettings, Metrics};
 use tracing::info;
 
 use super::config::{TerminalConfig, TerminalTheme};
-use super::render::blend_pixel;
 
 pub(super) struct FontRenderer {
     font: Font,
@@ -55,24 +54,41 @@ impl FontRenderer {
         let glyph = self.glyph(ch);
         let draw_x = x as isize + glyph.metrics.xmin as isize;
         let draw_y = baseline - glyph.metrics.ymin as isize - glyph.metrics.height as isize;
+        let start_x = draw_x.max(0) as usize;
+        let start_y = draw_y.max(0) as usize;
+        let end_x = (draw_x + glyph.metrics.width as isize).clamp(0, width as isize) as usize;
+        let end_y = (draw_y + glyph.metrics.height as isize).clamp(0, height as isize) as usize;
 
-        for glyph_y in 0..glyph.metrics.height {
-            for glyph_x in 0..glyph.metrics.width {
-                let alpha = glyph.bitmap[glyph_y * glyph.metrics.width + glyph_x];
+        if start_x >= end_x || start_y >= end_y {
+            return;
+        }
+
+        for screen_y in start_y..end_y {
+            let glyph_y = (screen_y as isize - draw_y) as usize;
+            let glyph_row = glyph_y * glyph.metrics.width;
+            let buffer_row = screen_y * width;
+
+            for screen_x in start_x..end_x {
+                let glyph_x = (screen_x as isize - draw_x) as usize;
+                let alpha = glyph.bitmap[glyph_row + glyph_x];
 
                 if alpha == 0 {
                     continue;
                 }
 
-                blend_pixel(
-                    buffer,
-                    width,
-                    height,
-                    draw_x + glyph_x as isize,
-                    draw_y + glyph_y as isize,
-                    color,
-                    alpha,
-                );
+                let index = buffer_row + screen_x;
+                if alpha == 255 {
+                    buffer[index] = color;
+                    continue;
+                }
+
+                let dst = buffer[index];
+                let alpha = alpha as u32;
+                let inv_alpha = 255 - alpha;
+                let r = (((color >> 16) & 0xff) * alpha + ((dst >> 16) & 0xff) * inv_alpha) / 255;
+                let g = (((color >> 8) & 0xff) * alpha + ((dst >> 8) & 0xff) * inv_alpha) / 255;
+                let b = ((color & 0xff) * alpha + (dst & 0xff) * inv_alpha) / 255;
+                buffer[index] = (r << 16) | (g << 8) | b;
             }
         }
     }

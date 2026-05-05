@@ -1,3 +1,5 @@
+use std::num::NonZeroU32;
+
 use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
@@ -9,6 +11,14 @@ use super::layout::PaneRect;
 
 const ACTIVE_BORDER: u32 = 0x83a598;
 const INACTIVE_BORDER: u32 = 0x3c3836;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DamageRect {
+    pub(super) x: usize,
+    pub(super) y: usize,
+    pub(super) width: usize,
+    pub(super) height: usize,
+}
 
 pub(super) fn draw_pane_border(
     buffer: &mut [u32],
@@ -65,6 +75,7 @@ pub(super) fn draw_screen(
     origin_y: usize,
     metrics: TerminalMetrics,
     force_redraw: bool,
+    damage: &mut Vec<DamageRect>,
 ) -> bool {
     let Ok(snapshot) = render_state.update(terminal) else {
         return false;
@@ -88,15 +99,26 @@ pub(super) fn draw_screen(
     while let Some(row_ref) = row_iter.next() {
         let row_dirty = redraw_all_rows || row_ref.dirty().unwrap_or(true);
         if row_dirty {
+            let row_y = origin_y + row * metrics.cell_height;
+            let row_width = cols as usize * metrics.cell_width;
             draw_rect(
                 buffer,
                 width,
                 height,
                 origin_x,
-                origin_y + row * metrics.cell_height,
-                cols as usize * metrics.cell_width,
+                row_y,
+                row_width,
                 metrics.cell_height,
                 font_renderer.theme.background,
+            );
+            push_damage(
+                damage,
+                origin_x,
+                row_y,
+                row_width,
+                metrics.cell_height,
+                width,
+                height,
             );
         } else if visible_rows.len() > row {
             row += 1;
@@ -149,6 +171,9 @@ pub(super) fn draw_screen(
 
     if snapshot.cursor_visible().unwrap_or(false) {
         if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
+            let cursor_x = origin_x + cursor.x as usize * metrics.cell_width;
+            let cursor_y =
+                origin_y + cursor.y as usize * metrics.cell_height + metrics.cell_height - 2;
             let cursor_color = snapshot
                 .cursor_color()
                 .ok()
@@ -160,17 +185,64 @@ pub(super) fn draw_screen(
                 buffer,
                 width,
                 height,
-                origin_x + cursor.x as usize * metrics.cell_width,
-                origin_y + cursor.y as usize * metrics.cell_height + metrics.cell_height - 2,
+                cursor_x,
+                cursor_y,
                 metrics.cell_width,
                 2,
                 cursor_color,
+            );
+            push_damage(
+                damage,
+                cursor_x,
+                cursor_y,
+                metrics.cell_width,
+                2,
+                width,
+                height,
             );
         }
     }
 
     let _ = snapshot.set_dirty(Dirty::Clean);
     true
+}
+
+pub(super) fn softbuffer_rects(damage: &[DamageRect]) -> Vec<softbuffer::Rect> {
+    damage
+        .iter()
+        .filter_map(|rect| {
+            Some(softbuffer::Rect {
+                x: rect.x.try_into().ok()?,
+                y: rect.y.try_into().ok()?,
+                width: NonZeroU32::new(rect.width.try_into().ok()?)?,
+                height: NonZeroU32::new(rect.height.try_into().ok()?)?,
+            })
+        })
+        .collect()
+}
+
+fn push_damage(
+    damage: &mut Vec<DamageRect>,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    width: usize,
+    height: usize,
+) {
+    let max_y = (y + rect_height).min(height);
+    let max_x = (x + rect_width).min(width);
+
+    if x >= max_x || y >= max_y {
+        return;
+    }
+
+    damage.push(DamageRect {
+        x,
+        y,
+        width: max_x - x,
+        height: max_y - y,
+    });
 }
 
 fn draw_cell(
@@ -223,11 +295,11 @@ fn draw_cell(
         return None;
     }
 
-    let ch = cell
-        .graphemes()
-        .ok()
-        .and_then(|mut graphemes| graphemes.drain(..).next())
-        .unwrap_or(' ');
+    let ch = first_grapheme(cell).unwrap_or(' ');
+
+    if ch == ' ' {
+        return Some(ch);
+    }
 
     if !try_draw_block_char(
         buffer,
@@ -251,9 +323,17 @@ fn cell_char(cell: &CellIteration<'static, '_>) -> Option<char> {
         return None;
     }
 
-    cell.graphemes()
-        .ok()
-        .and_then(|mut graphemes| graphemes.drain(..).next())
+    first_grapheme(cell)
+}
+
+fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
+    if cell.graphemes_len().ok()? == 0 {
+        return None;
+    }
+
+    let mut graphemes = ['\0'];
+    cell.graphemes_buf(&mut graphemes).ok()?;
+    Some(graphemes[0])
 }
 
 /// Synthetically draw Unicode block element characters (U+2580–U+259F) as exact
