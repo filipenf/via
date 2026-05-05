@@ -388,13 +388,17 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        self.dirty |= forward_keyboard_viewport_scroll(
+        let keyboard_scrolled = forward_keyboard_viewport_scroll(
             &pressed_keys,
             self.modifiers,
             self.active_pane,
             &mut self.panes,
             layout_shortcut_consumed,
         );
+        if keyboard_scrolled {
+            self.dirty = true;
+            self.force_redraw = true;
+        }
         self.dirty |= forward_special_keys(
             &pressed_keys,
             self.modifiers,
@@ -442,13 +446,17 @@ impl WinitGhosttyApp {
             MouseScrollDelta::PixelDelta(position) => (position.x as f32, position.y as f32),
         };
 
-        self.dirty |= forward_mouse_scroll(
+        let scrolled = forward_mouse_scroll(
             scroll_delta,
             self.cursor_position,
             &self.layout,
             &mut self.panes,
             false,
         );
+        if scrolled {
+            self.dirty = true;
+            self.force_redraw = true;
+        }
     }
 
     fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
@@ -498,10 +506,13 @@ impl WinitGhosttyApp {
     }
 
     fn drain_background_work(&mut self) -> Result<()> {
+        // Clear the coalescing flag *before* draining so that any PTY data arriving
+        // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
+        // rather than being silently swallowed.
+        self.output_notifier.clear();
         for pane in &mut self.panes {
             self.dirty |= pane.drain_output();
         }
-        self.output_notifier.clear();
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.flush_pending_agent_write()?;
         Ok(())
@@ -733,7 +744,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
             self.request_redraw();
             event_loop.set_control_flow(ControlFlow::Wait);
         } else {
-            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(8)));
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
         }
     }
 }
