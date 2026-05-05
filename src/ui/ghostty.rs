@@ -6,12 +6,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::PhysicalKey;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::config::Config;
@@ -35,9 +35,14 @@ use input::{
 };
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
+use render::{DamageRect, softbuffer_rects};
 
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
+const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
+const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
+const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(20);
 
 pub struct GhosttyUi {
     config: Config,
@@ -109,6 +114,7 @@ struct WinitGhosttyApp {
     terminal_config: TerminalConfig,
     font_renderer: FontRenderer,
     buffer: Vec<u32>,
+    damage: Vec<DamageRect>,
     panes: Vec<TerminalPane>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
@@ -121,6 +127,10 @@ struct WinitGhosttyApp {
     left_mouse_down: bool,
     dirty: bool,
     force_redraw: bool,
+    next_redraw_at: Instant,
+    arrow_repeat_redraw_deferred: bool,
+    skip_background_drain_once: bool,
+    last_arrow_repeat_at: Option<Instant>,
     error: Option<anyhow::Error>,
 }
 
@@ -152,6 +162,7 @@ impl WinitGhosttyApp {
             terminal_config: terminal_config.clone(),
             font_renderer,
             buffer: vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT],
+            damage: Vec::new(),
             panes: Vec::new(),
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
@@ -164,6 +175,10 @@ impl WinitGhosttyApp {
             left_mouse_down: false,
             dirty: true,
             force_redraw: true,
+            next_redraw_at: Instant::now(),
+            arrow_repeat_redraw_deferred: false,
+            skip_background_drain_once: false,
+            last_arrow_repeat_at: None,
             error: None,
         })
     }
@@ -356,6 +371,25 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
+        self.arrow_repeat_redraw_deferred = event.repeat
+            && matches!(
+                event.physical_key,
+                PhysicalKey::Code(KeyCode::ArrowUp | KeyCode::ArrowDown)
+            );
+        self.skip_background_drain_once = self.arrow_repeat_redraw_deferred;
+        if self.arrow_repeat_redraw_deferred {
+            let now = Instant::now();
+            if let Some(last_arrow_repeat_at) = self.last_arrow_repeat_at {
+                let gap = now.saturating_duration_since(last_arrow_repeat_at);
+                if gap > INPUT_LAG_WARN_THRESHOLD {
+                    warn!(?gap, "arrow repeat input lag detected");
+                }
+            }
+            self.last_arrow_repeat_at = Some(now);
+        } else if !event.repeat {
+            self.last_arrow_repeat_at = None;
+        }
+
         let key = match event.physical_key {
             PhysicalKey::Code(code) => Key::from_key_code(code),
             PhysicalKey::Unidentified(_) => None,
@@ -380,7 +414,7 @@ impl WinitGhosttyApp {
                 .map(|key| paste_requested(key, self.modifiers))
                 .unwrap_or(false);
         if paste_requested {
-            self.dirty |= try_clipboard_paste(
+            try_clipboard_paste(
                 true,
                 &mut self.panes[self.active_pane],
                 layout_shortcut_consumed,
@@ -399,7 +433,7 @@ impl WinitGhosttyApp {
             self.dirty = true;
             self.force_redraw = true;
         }
-        self.dirty |= forward_special_keys(
+        forward_special_keys(
             &pressed_keys,
             self.modifiers,
             &mut self.panes[self.active_pane],
@@ -411,7 +445,7 @@ impl WinitGhosttyApp {
             .as_deref()
             .filter(|text| text.chars().all(|ch| !ch.is_control()))
         {
-            self.dirty |= forward_text_input(
+            forward_text_input(
                 text,
                 self.modifiers,
                 &mut self.panes[self.active_pane],
@@ -427,7 +461,7 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        self.dirty |= forward_text_input(
+        forward_text_input(
             text,
             self.modifiers,
             &mut self.panes[self.active_pane],
@@ -519,6 +553,7 @@ impl WinitGhosttyApp {
     }
 
     fn render(&mut self) -> Result<()> {
+        let render_started_at = Instant::now();
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
@@ -533,6 +568,7 @@ impl WinitGhosttyApp {
         if self.force_redraw {
             self.buffer.fill(self.terminal_config.theme.background);
         }
+        self.damage.clear();
         let mut redrawn = self.force_redraw;
         for (index, pane) in self.panes.iter_mut().enumerate() {
             redrawn |= pane.draw(
@@ -543,6 +579,7 @@ impl WinitGhosttyApp {
                 self.layout.pane(index),
                 index == self.active_pane,
                 self.force_redraw,
+                &mut self.damage,
             );
         }
 
@@ -554,13 +591,36 @@ impl WinitGhosttyApp {
         let mut surface_buffer = surface
             .buffer_mut()
             .map_err(|error| anyhow!("failed to acquire softbuffer frame: {error:?}"))?;
-        surface_buffer.copy_from_slice(&self.buffer);
+        copy_damage_to_surface(
+            &self.buffer,
+            &mut surface_buffer,
+            self.width,
+            self.force_redraw,
+            &self.damage,
+        );
         window.pre_present_notify();
-        surface_buffer
-            .present()
-            .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
+        if self.force_redraw {
+            surface_buffer
+                .present()
+                .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
+        } else {
+            let rects = softbuffer_rects(&self.damage);
+            surface_buffer
+                .present_with_damage(&rects)
+                .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
+        }
+        let render_elapsed = render_started_at.elapsed();
+        if render_elapsed > RENDER_WARN_THRESHOLD {
+            warn!(
+                ?render_elapsed,
+                damage_rects = self.damage.len(),
+                "slow render frame"
+            );
+        }
+        self.next_redraw_at = Instant::now() + self.target_frame_interval();
         self.dirty = false;
         self.force_redraw = false;
+        self.arrow_repeat_redraw_deferred = false;
         Ok(())
     }
 
@@ -632,8 +692,29 @@ impl WinitGhosttyApp {
     }
 
     fn request_redraw(&self) {
+        if Instant::now() < self.next_redraw_at {
+            return;
+        }
+
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn target_frame_interval(&self) -> Duration {
+        if self.arrow_repeat_redraw_deferred {
+            REPEATED_ARROW_REDRAW_INTERVAL
+        } else {
+            TARGET_FRAME_INTERVAL
+        }
+    }
+
+    fn set_wait_for_next_redraw(&self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now < self.next_redraw_at {
+            event_loop.set_control_flow(ControlFlow::wait_duration(self.next_redraw_at - now));
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
     }
 
@@ -656,6 +737,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 
                 if self.dirty {
                     self.request_redraw();
+                    self.set_wait_for_next_redraw(event_loop);
                 }
             }
         }
@@ -720,7 +802,10 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
                 self.handle_mouse_input(state, button);
                 Ok(())
             }
-            WindowEvent::RedrawRequested => self.render(),
+            WindowEvent::RedrawRequested => {
+                self.skip_background_drain_once = false;
+                self.render()
+            }
             _ => Ok(()),
         };
 
@@ -729,8 +814,16 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
             return;
         }
 
+        if self.skip_background_drain_once {
+            self.skip_background_drain_once = false;
+        } else if let Err(error) = self.drain_background_work() {
+            self.fail(event_loop, error);
+            return;
+        }
+
         if self.dirty {
             self.request_redraw();
+            self.set_wait_for_next_redraw(event_loop);
         }
     }
 
@@ -742,7 +835,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 
         if self.dirty {
             self.request_redraw();
-            event_loop.set_control_flow(ControlFlow::Wait);
+            self.set_wait_for_next_redraw(event_loop);
         } else {
             event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
         }
@@ -841,6 +934,27 @@ fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: 
     }
 
     false
+}
+
+fn copy_damage_to_surface(
+    buffer: &[u32],
+    surface_buffer: &mut [u32],
+    width: usize,
+    force_redraw: bool,
+    damage: &[DamageRect],
+) {
+    if force_redraw || damage.is_empty() {
+        surface_buffer.copy_from_slice(buffer);
+        return;
+    }
+
+    for rect in damage {
+        for y in rect.y..rect.y + rect.height {
+            let start = y * width + rect.x;
+            let end = start + rect.width;
+            surface_buffer[start..end].copy_from_slice(&buffer[start..end]);
+        }
+    }
 }
 
 #[cfg(test)]

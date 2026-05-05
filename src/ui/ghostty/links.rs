@@ -207,25 +207,25 @@ impl Osc8Tracker {
     }
 
     fn print_char(&mut self, bytes: &[u8]) {
-        let Ok(text) = std::str::from_utf8(&bytes[self.index..]) else {
-            self.index += 1;
-            return;
-        };
-        let Some(ch) = text.chars().next() else {
-            self.index += 1;
-            return;
+        let byte = bytes[self.index];
+        let len = if byte < 0x80 {
+            1
+        } else {
+            match std::str::from_utf8(&bytes[self.index..]) {
+                Ok(text) => text.chars().next().map(char::len_utf8).unwrap_or(1),
+                Err(error) => error.valid_up_to().max(1),
+            }
         };
 
         self.extend_active_link();
         self.advance_column();
-        self.index += ch.len_utf8();
+        self.index += len;
     }
 
     fn newline(&mut self) {
         self.row += 1;
         if self.row >= self.size.rows as usize {
-            self.rows.remove(0);
-            self.rows.push(Vec::new());
+            self.scroll_rows_up();
             self.row = self.size.rows.saturating_sub(1) as usize;
         }
         self.column = 0;
@@ -233,39 +233,22 @@ impl Osc8Tracker {
     }
 
     fn apply_csi(&mut self, params: &[u8], command: u8) {
-        let params = std::str::from_utf8(params).unwrap_or_default();
-        let numbers = csi_numbers(params);
+        let (first, second) = first_two_csi_numbers(params);
 
         match command {
-            b'A' => {
-                self.row = self
-                    .row
-                    .saturating_sub(numbers.first().copied().unwrap_or(1))
-            }
+            b'A' => self.row = self.row.saturating_sub(first),
             b'B' => {
-                self.row = (self.row + numbers.first().copied().unwrap_or(1))
-                    .min(self.size.rows.saturating_sub(1) as usize);
+                self.row = (self.row + first).min(self.size.rows.saturating_sub(1) as usize);
             }
             b'C' => {
-                self.column = (self.column + numbers.first().copied().unwrap_or(1))
-                    .min(self.size.cols.saturating_sub(1) as usize);
+                self.column = (self.column + first).min(self.size.cols.saturating_sub(1) as usize);
             }
-            b'D' => {
-                self.column = self
-                    .column
-                    .saturating_sub(numbers.first().copied().unwrap_or(1))
-            }
+            b'D' => self.column = self.column.saturating_sub(first),
             b'H' | b'f' => {
-                self.row = numbers
-                    .first()
-                    .copied()
-                    .unwrap_or(1)
+                self.row = first
                     .saturating_sub(1)
                     .min(self.size.rows.saturating_sub(1) as usize);
-                self.column = numbers
-                    .get(1)
-                    .copied()
-                    .unwrap_or(1)
+                self.column = second
                     .saturating_sub(1)
                     .min(self.size.cols.saturating_sub(1) as usize);
             }
@@ -306,11 +289,21 @@ impl Osc8Tracker {
     fn newline_without_index(&mut self) {
         self.row += 1;
         if self.row >= self.size.rows as usize {
-            self.rows.remove(0);
-            self.rows.push(Vec::new());
+            self.scroll_rows_up();
             self.row = self.size.rows.saturating_sub(1) as usize;
         }
         self.column = 0;
+    }
+
+    fn scroll_rows_up(&mut self) {
+        if self.rows.is_empty() {
+            return;
+        }
+
+        self.rows.rotate_left(1);
+        if let Some(row) = self.rows.last_mut() {
+            row.clear();
+        }
     }
 
     fn clear_screen(&mut self) {
@@ -334,12 +327,41 @@ pub(super) fn parse_vt_hyperlinks(bytes: &[u8], size: TerminalSize) -> Vec<Vec<L
     parser.rows
 }
 
-fn csi_numbers(params: &str) -> Vec<usize> {
-    params
-        .trim_start_matches('?')
-        .split(';')
-        .map(|param| param.parse::<usize>().unwrap_or(1))
-        .collect()
+fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
+    let mut numbers = [1usize; 2];
+    let mut index = 0usize;
+    let mut value = 0usize;
+    let mut has_value = false;
+
+    for byte in params.iter().copied() {
+        match byte {
+            b'?' => {}
+            b'0'..=b'9' => {
+                has_value = true;
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as usize);
+            }
+            b';' => {
+                if index < numbers.len() {
+                    numbers[index] = if has_value { value } else { 1 };
+                }
+                index += 1;
+                value = 0;
+                has_value = false;
+                if index >= numbers.len() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if index < numbers.len() {
+        numbers[index] = if has_value { value } else { 1 };
+    }
+
+    (numbers[0], numbers[1])
 }
 
 pub(super) fn file_target_from_uri(uri: &str, working_directory: &Path) -> Option<FileTarget> {
