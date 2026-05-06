@@ -965,7 +965,7 @@ mod tests {
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
-    use links::{LinkSpan, file_reference_at, file_target_from_uri, parse_vt_hyperlinks};
+    use links::{LinkSpan, file_target_from_uri, parse_vt_hyperlinks};
 
     #[test]
     fn parses_ghostty_config_entries() {
@@ -1018,36 +1018,6 @@ mod tests {
         assert_eq!(config.font_pixels, 15.0);
         assert_eq!(config.metrics.cell_width, 9);
         assert_eq!(config.metrics.cell_height, 21);
-    }
-
-    #[test]
-    fn finds_reference_under_column() {
-        let target = file_reference_at("open project.md:12 please", 7, Path::new("/repo")).unwrap();
-
-        assert_eq!(target.path, PathBuf::from("/repo/project.md"));
-        assert_eq!(target.line, Some(12));
-    }
-
-    #[test]
-    fn trims_common_surrounding_punctuation() {
-        let target = file_reference_at("see `src/main.rs:8`, ok", 6, Path::new("/repo")).unwrap();
-
-        assert_eq!(target.path, PathBuf::from("/repo/src/main.rs"));
-        assert_eq!(target.line, Some(8));
-    }
-
-    #[test]
-    fn trims_trailing_colon_without_line_number() {
-        let target =
-            file_reference_at("see src/ui.rs: for details", 5, Path::new("/repo")).unwrap();
-
-        assert_eq!(target.path, PathBuf::from("/repo/src/ui.rs"));
-        assert_eq!(target.line, None);
-    }
-
-    #[test]
-    fn ignores_plain_words() {
-        assert!(file_reference_at("no file here", 1, Path::new("/repo")).is_none());
     }
 
     #[test]

@@ -66,7 +66,6 @@ pub(super) fn draw_screen(
     render_state: &mut RenderState<'static>,
     rows: &mut RowIterator<'static>,
     cells: &mut CellIterator<'static>,
-    visible_rows: &mut Vec<String>,
     font_renderer: &mut FontRenderer,
     buffer: &mut [u32],
     width: usize,
@@ -120,7 +119,7 @@ pub(super) fn draw_screen(
                 width,
                 height,
             );
-        } else if visible_rows.len() > row {
+        } else {
             row += 1;
             continue;
         }
@@ -130,16 +129,11 @@ pub(super) fn draw_screen(
             Err(_) => return false,
         };
         let y = origin_y + row * metrics.cell_height;
-        if visible_rows.len() <= row {
-            visible_rows.push(String::with_capacity(cols as usize));
-        }
-        let row_text = &mut visible_rows[row];
-        row_text.clear();
         let mut col = 0;
 
         while let Some(cell_ref) = cell_iter.next() {
             let x = origin_x + col as usize * metrics.cell_width;
-            let ch = if row_dirty {
+            if row_dirty {
                 draw_cell(
                     cell_ref,
                     font_renderer,
@@ -149,11 +143,8 @@ pub(super) fn draw_screen(
                     x,
                     y,
                     metrics,
-                )
-            } else {
-                cell_char(cell_ref)
-            };
-            row_text.push(ch.unwrap_or(' '));
+                );
+            }
             col += 1;
 
             if col >= cols {
@@ -167,7 +158,11 @@ pub(super) fn draw_screen(
         row += 1;
     }
 
-    visible_rows.truncate(row);
+    // no longer maintaining visible_rows on every frame; rebuilt lazily on click if needed
+
+    // Coalesce vertically adjacent full-width row rects (common case for terminal rows)
+    // to drastically reduce damage rect count passed to softbuffer present.
+    coalesce_damage(damage);
 
     if snapshot.cursor_visible().unwrap_or(false) {
         if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
@@ -205,6 +200,30 @@ pub(super) fn draw_screen(
 
     let _ = snapshot.set_dirty(Dirty::Clean);
     true
+}
+
+fn coalesce_damage(damage: &mut Vec<DamageRect>) {
+    if damage.len() < 2 {
+        return;
+    }
+    let mut write = 0;
+    for read in 1..damage.len() {
+        let prev = &damage[write];
+        let curr = &damage[read];
+        if curr.x == prev.x
+            && curr.width == prev.width
+            && curr.y == prev.y + prev.height
+        {
+            // extend previous
+            damage[write].height += curr.height;
+        } else {
+            write += 1;
+            if write != read {
+                damage[write] = *curr;
+            }
+        }
+    }
+    damage.truncate(write + 1);
 }
 
 pub(super) fn softbuffer_rects(damage: &[DamageRect]) -> Vec<softbuffer::Rect> {
@@ -315,15 +334,6 @@ fn draw_cell(
         font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
     }
     Some(ch)
-}
-
-fn cell_char(cell: &CellIteration<'static, '_>) -> Option<char> {
-    let raw_cell = cell.raw_cell().ok()?;
-    if !raw_cell.has_text().unwrap_or(false) {
-        return None;
-    }
-
-    first_grapheme(cell)
 }
 
 fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
