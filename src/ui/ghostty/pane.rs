@@ -16,13 +16,11 @@ use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{Osc8Tracker, file_reference_at, file_target_from_uri};
+use super::links::{Osc8Tracker, file_target_from_uri};
 use super::render::{DamageRect, draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
-const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(20);
-const PTY_DRAIN_BUDGET: Duration = Duration::from_millis(8);
-const PTY_DRAIN_MIN_CHUNKS: usize = 2;
+const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 
 pub(super) struct TerminalPane {
     pub(super) title: &'static str,
@@ -39,7 +37,7 @@ impl TerminalPane {
     ) -> Result<Self> {
         Ok(Self {
             title,
-            view: TerminalView::new(width, height, metrics)?,
+            view: TerminalView::new(width, height, metrics, title == "agent")?,
             pty: None,
         })
     }
@@ -185,14 +183,14 @@ struct TerminalView {
     render_state: RenderState<'static>,
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
-    visible_rows: Vec<String>,
     hyperlink_tracker: Osc8Tracker,
+    osc8_enabled: bool,
     size: TerminalSize,
     metrics: TerminalMetrics,
 }
 
 impl TerminalView {
-    pub(super) fn new(width: usize, height: usize, metrics: TerminalMetrics) -> Result<Self> {
+    pub(super) fn new(width: usize, height: usize, metrics: TerminalMetrics, osc8_enabled: bool) -> Result<Self> {
         let size = terminal_size_for_window(width, height, metrics);
         let terminal = Terminal::new(TerminalOptions {
             cols: size.cols,
@@ -209,8 +207,8 @@ impl TerminalView {
             render_state,
             rows,
             cells,
-            visible_rows: Vec::new(),
             hyperlink_tracker: Osc8Tracker::new(size),
+            osc8_enabled,
             size,
             metrics,
         })
@@ -242,7 +240,9 @@ impl TerminalView {
     }
 
     fn process(&mut self, bytes: &[u8], follow_output: bool) {
-        self.hyperlink_tracker.process(bytes);
+        if self.osc8_enabled {
+            self.hyperlink_tracker.process(bytes);
+        }
         self.terminal.vt_write(bytes);
         if follow_output {
             self.terminal.scroll_viewport(ScrollViewport::Bottom);
@@ -272,7 +272,6 @@ impl TerminalView {
             &mut self.render_state,
             &mut self.rows,
             &mut self.cells,
-            &mut self.visible_rows,
             font_renderer,
             buffer,
             width,
@@ -294,9 +293,7 @@ impl TerminalView {
         if let Some(target) = self.hyperlink_target_at(row, column, working_directory) {
             return Some(target);
         }
-
-        let row = self.visible_rows.get(row)?;
-        file_reference_at(row, column, working_directory)
+        None
     }
 
     fn hyperlink_target_at(
@@ -326,10 +323,6 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool
         chunks += 1;
         bytes += chunk.len();
         view.process(&chunk, false);
-
-        if chunks >= PTY_DRAIN_MIN_CHUNKS && started_at.elapsed() >= PTY_DRAIN_BUDGET {
-            break;
-        }
     }
 
     if had_output && follow_output {
@@ -391,6 +384,7 @@ mod tests {
                 cell_height: 1,
                 baseline: 0,
             },
+            true,
         )
         .expect("test terminal view")
     }

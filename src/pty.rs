@@ -104,7 +104,7 @@ impl PtySession {
         let (output_tx, output_rx) = unbounded();
 
         let reader_thread = thread::spawn(move || {
-            let mut buffer = [0; 8192];
+            let mut buffer = [0; 65536];
 
             loop {
                 match reader.read(&mut buffer) {
