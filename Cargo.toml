@@ -10,7 +10,7 @@ anyhow = "1.0.100"
 arboard = { version = "3", features = ["wayland-data-control"] }
 crossbeam-channel = "0.5.15"
 fontdue = "0.9.3"
-libghostty-vt = "0.1.1"
+libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", features = ["link-static"] }
 nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
 portable-pty = "0.9.0"
 serde = { version = "1.0.228", features = ["derive"] }
