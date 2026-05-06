@@ -437,6 +437,15 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
+        let copy_requested = !event.repeat
+            && key
+                .map(|key| copy_requested(key, self.modifiers))
+                .unwrap_or(false);
+        if copy_requested {
+            self.dirty |= self.panes[self.active_pane].copy_selection_to_clipboard();
+            return Ok(());
+        }
+
         let keyboard_scrolled = forward_keyboard_viewport_scroll(
             &pressed_keys,
             self.modifiers,
@@ -515,11 +524,72 @@ impl WinitGhosttyApp {
 
         let is_down = state == ElementState::Pressed;
         let just_pressed = is_down && !self.left_mouse_down;
+        let just_released = !is_down && self.left_mouse_down;
         self.left_mouse_down = is_down;
 
         if just_pressed {
+            self.dirty |= self.start_mouse_selection();
             self.dirty |= self.forward_reference_click();
         }
+
+        if just_released {
+            self.dirty |= self.finalize_mouse_selection();
+        }
+    }
+
+    fn start_mouse_selection(&mut self) -> bool {
+        let Some((x, y)) = self.cursor_position else {
+            return false;
+        };
+        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+            return false;
+        };
+
+        let pane_changed = self.active_pane != pane_index;
+        self.active_pane = pane_index;
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            if index != pane_index {
+                pane.clear_selection();
+            }
+        }
+
+        let metrics = self.panes[pane_index].metrics();
+        let row = (y - rect.y) / metrics.cell_height;
+        let column = (x - rect.x) / metrics.cell_width;
+        let selection_changed = self.panes[pane_index].begin_selection(row, column);
+
+        pane_changed || selection_changed
+    }
+
+    fn update_mouse_selection(&mut self) -> bool {
+        if !self.left_mouse_down {
+            return false;
+        }
+
+        let Some((x, y)) = self.cursor_position else {
+            return false;
+        };
+        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+            return false;
+        };
+
+        if pane_index != self.active_pane {
+            return false;
+        }
+
+        let metrics = self.panes[pane_index].metrics();
+        let row = (y - rect.y) / metrics.cell_height;
+        let column = (x - rect.x) / metrics.cell_width;
+
+        self.panes[pane_index].update_selection(row, column)
+    }
+
+    fn finalize_mouse_selection(&mut self) -> bool {
+        if self.panes.is_empty() || self.active_pane >= self.panes.len() {
+            return false;
+        }
+
+        self.panes[self.active_pane].copy_selection_to_clipboard()
     }
 
     fn forward_reference_click(&mut self) -> bool {
@@ -529,6 +599,7 @@ impl WinitGhosttyApp {
         let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
             return false;
         };
+
         let pane_changed = self.active_pane != pane_index;
         self.active_pane = pane_index;
 
@@ -853,6 +924,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position =
                     Some((position.x.max(0.0) as usize, position.y.max(0.0) as usize));
+                self.dirty |= self.update_mouse_selection();
                 Ok(())
             }
             WindowEvent::CursorLeft { .. } => {
@@ -927,6 +999,10 @@ fn is_double_click(
 fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
     (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
         || (key == Key::Insert && (modifiers.shift || modifiers.super_key))
+}
+
+fn copy_requested(key: Key, modifiers: Modifiers) -> bool {
+    key == Key::C && modifiers.super_key
 }
 
 fn nvim_args(config: &Config) -> Vec<OsString> {
@@ -1044,7 +1120,8 @@ mod tests {
     use config::ghostty_config_entry;
     use layout::PaneRect;
     use links::{
-        LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks, reference_target_from_row,
+        LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks,
+        reference_target_from_row,
     };
 
     #[test]
@@ -1541,7 +1618,11 @@ mod tests {
             column: 12,
         };
 
-        assert!(is_double_click(Some(&first), &second, Duration::from_millis(300)));
+        assert!(is_double_click(
+            Some(&first),
+            &second,
+            Duration::from_millis(300)
+        ));
     }
 
     #[test]
@@ -1581,7 +1662,10 @@ mod tests {
     fn row_reference_parsing_returns_symbol_target() {
         let target = reference_target_from_row("see Foo::bar here", 5, Path::new("/repo"));
 
-        assert_eq!(target, Some(ReferenceTarget::Symbol("Foo::bar".to_string())));
+        assert_eq!(
+            target,
+            Some(ReferenceTarget::Symbol("Foo::bar".to_string()))
+        );
     }
 
     fn test_terminal_size() -> TerminalSize {

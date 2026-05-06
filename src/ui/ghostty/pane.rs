@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
-use libghostty_vt::terminal::ScrollViewport;
+use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 
 use tracing::{debug, warn};
@@ -15,8 +15,10 @@ use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri};
-use super::render::{DamageRect, draw_pane_border, draw_screen};
+use super::links::{
+    Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri,
+};
+use super::render::{DamageRect, SelectionRange, draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
 const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
@@ -106,7 +108,24 @@ impl TerminalPane {
             return;
         }
 
+        self.view.clear_selection();
         self.view.scroll_viewport(delta);
+    }
+
+    pub(super) fn begin_selection(&mut self, row: usize, column: usize) -> bool {
+        self.view.begin_selection(row, column)
+    }
+
+    pub(super) fn update_selection(&mut self, row: usize, column: usize) -> bool {
+        self.view.update_selection(row, column)
+    }
+
+    pub(super) fn copy_selection_to_clipboard(&self) -> bool {
+        self.view.copy_selection_to_clipboard()
+    }
+
+    pub(super) fn clear_selection(&mut self) -> bool {
+        self.view.clear_selection()
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
@@ -184,12 +203,19 @@ struct TerminalView {
     cells: CellIterator<'static>,
     hyperlink_tracker: Osc8Tracker,
     osc8_enabled: bool,
+    selection_anchor: Option<(usize, usize)>,
+    selection_focus: Option<(usize, usize)>,
     size: TerminalSize,
     metrics: TerminalMetrics,
 }
 
 impl TerminalView {
-    pub(super) fn new(width: usize, height: usize, metrics: TerminalMetrics, osc8_enabled: bool) -> Result<Self> {
+    pub(super) fn new(
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+        osc8_enabled: bool,
+    ) -> Result<Self> {
         let size = terminal_size_for_window(width, height, metrics);
         let terminal = Terminal::new(TerminalOptions {
             cols: size.cols,
@@ -208,6 +234,8 @@ impl TerminalView {
             cells,
             hyperlink_tracker: Osc8Tracker::new(size),
             osc8_enabled,
+            selection_anchor: None,
+            selection_focus: None,
             size,
             metrics,
         })
@@ -248,6 +276,122 @@ impl TerminalView {
         }
     }
 
+    fn begin_selection(&mut self, row: usize, column: usize) -> bool {
+        let row = row.min(self.size.rows.saturating_sub(1) as usize);
+        let column = column.min(self.size.cols.saturating_sub(1) as usize);
+        let point = (row, column);
+        let changed = self.selection_anchor != Some(point) || self.selection_focus != Some(point);
+        self.selection_anchor = Some(point);
+        self.selection_focus = Some(point);
+        changed
+    }
+
+    fn update_selection(&mut self, row: usize, column: usize) -> bool {
+        let Some(anchor) = self.selection_anchor else {
+            return false;
+        };
+
+        let row = row.min(self.size.rows.saturating_sub(1) as usize);
+        let column = column.min(self.size.cols.saturating_sub(1) as usize);
+        let focus = (row, column);
+        let changed = self.selection_focus != Some(focus) || self.selection_anchor != Some(anchor);
+        self.selection_focus = Some(focus);
+        changed
+    }
+
+    fn clear_selection(&mut self) -> bool {
+        let had_selection = self.selection_anchor.is_some() || self.selection_focus.is_some();
+        self.selection_anchor = None;
+        self.selection_focus = None;
+        had_selection
+    }
+
+    fn selection_range(&self) -> Option<SelectionRange> {
+        let (start, end) = self.selection_bounds()?;
+        Some(SelectionRange {
+            start_row: start.0,
+            start_col: start.1,
+            end_row: end.0,
+            end_col: end.1,
+        })
+    }
+
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.selection_anchor?;
+        let focus = self.selection_focus?;
+
+        if anchor <= focus {
+            Some((anchor, focus))
+        } else {
+            Some((focus, anchor))
+        }
+    }
+
+    fn copy_selection_to_clipboard(&self) -> bool {
+        let Some(text) = self.selection_text() else {
+            return false;
+        };
+        if text.trim().is_empty() {
+            return false;
+        }
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(clipboard) => clipboard,
+            Err(error) => {
+                warn!(%error, "clipboard open failed");
+                return false;
+            }
+        };
+        if let Err(error) = clipboard.set_text(text) {
+            warn!(%error, "clipboard write failed");
+            return false;
+        }
+
+        true
+    }
+
+    fn selection_text(&self) -> Option<String> {
+        let ((start_row, start_col), (end_row, end_col)) = self.selection_bounds()?;
+        if start_row == end_row && start_col == end_col {
+            return None;
+        }
+
+        let last_column = self.size.cols.saturating_sub(1) as usize;
+        let mut text = String::new();
+
+        for row in start_row..=end_row {
+            let row_start = if row == start_row { start_col } else { 0 };
+            let row_end = if row == end_row { end_col } else { last_column };
+            let mut row_text = String::new();
+
+            for col in row_start..=row_end {
+                let point = Point::Viewport(PointCoordinate {
+                    x: col as u16,
+                    y: row as u32,
+                });
+                let grid_ref = self.terminal.grid_ref(point).ok()?;
+                let cell = grid_ref.cell().ok()?;
+                let ch = if cell.has_text().ok()? {
+                    cell.codepoint()
+                        .ok()
+                        .and_then(char::from_u32)
+                        .filter(|ch| *ch != '\0')
+                        .unwrap_or(' ')
+                } else {
+                    ' '
+                };
+                row_text.push(ch);
+            }
+
+            text.push_str(row_text.trim_end_matches(' '));
+            if row < end_row {
+                text.push('\n');
+            }
+        }
+
+        Some(text)
+    }
+
     fn is_viewport_at_bottom(&self) -> bool {
         self.terminal
             .scrollbar()
@@ -266,6 +410,7 @@ impl TerminalView {
         force_redraw: bool,
         damage: &mut Vec<DamageRect>,
     ) -> bool {
+        let selection = self.selection_range();
         draw_screen(
             &self.terminal,
             &mut self.render_state,
@@ -278,6 +423,7 @@ impl TerminalView {
             origin_x,
             origin_y,
             self.metrics,
+            selection,
             force_redraw,
             damage,
         )

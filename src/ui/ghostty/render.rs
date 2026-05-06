@@ -11,6 +11,8 @@ use super::layout::PaneRect;
 
 const ACTIVE_BORDER: u32 = 0x83a598;
 const INACTIVE_BORDER: u32 = 0x3c3836;
+const SELECTION_BACKGROUND: u32 = 0x4f6480;
+const SELECTION_FOREGROUND: u32 = 0xfbf1c7;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DamageRect {
@@ -18,6 +20,14 @@ pub(super) struct DamageRect {
     pub(super) y: usize,
     pub(super) width: usize,
     pub(super) height: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SelectionRange {
+    pub(super) start_row: usize,
+    pub(super) start_col: usize,
+    pub(super) end_row: usize,
+    pub(super) end_col: usize,
 }
 
 pub(super) fn draw_pane_border(
@@ -73,6 +83,7 @@ pub(super) fn draw_screen(
     origin_x: usize,
     origin_y: usize,
     metrics: TerminalMetrics,
+    selection: Option<SelectionRange>,
     force_redraw: bool,
     damage: &mut Vec<DamageRect>,
 ) -> bool {
@@ -143,6 +154,7 @@ pub(super) fn draw_screen(
                     x,
                     y,
                     metrics,
+                    is_selected_cell(row, col as usize, selection),
                 );
             }
             col += 1;
@@ -210,10 +222,7 @@ fn coalesce_damage(damage: &mut Vec<DamageRect>) {
     for read in 1..damage.len() {
         let prev = &damage[write];
         let curr = &damage[read];
-        if curr.x == prev.x
-            && curr.width == prev.width
-            && curr.y == prev.y + prev.height
-        {
+        if curr.x == prev.x && curr.width == prev.width && curr.y == prev.y + prev.height {
             // extend previous
             damage[write].height += curr.height;
         } else {
@@ -273,6 +282,7 @@ fn draw_cell(
     x: usize,
     y: usize,
     metrics: TerminalMetrics,
+    selected: bool,
 ) -> Option<char> {
     let Ok(raw_cell) = cell.raw_cell() else {
         return None;
@@ -286,7 +296,7 @@ fn draw_cell(
         return None;
     }
 
-    let (fg, bg) = cell_colors(cell, &font_renderer.theme);
+    let (mut fg, mut bg) = cell_colors(cell, &font_renderer.theme);
     let cell_width = if raw_cell
         .wide()
         .map(|wide| matches!(wide, CellWide::Wide | CellWide::SpacerHead))
@@ -297,7 +307,12 @@ fn draw_cell(
         metrics.cell_width
     };
 
-    if bg != font_renderer.theme.background {
+    if selected {
+        fg = SELECTION_FOREGROUND;
+        bg = SELECTION_BACKGROUND;
+    }
+
+    if bg != font_renderer.theme.background || selected {
         draw_rect(
             buffer,
             width,
@@ -695,6 +710,32 @@ pub(super) fn blend_pixel(
     let b = ((color & 0xff) * alpha + (dst & 0xff) * inv_alpha) / 255;
 
     buffer[index] = (r << 16) | (g << 8) | b;
+}
+
+fn is_selected_cell(row: usize, col: usize, selection: Option<SelectionRange>) -> bool {
+    let Some(selection) = selection else {
+        return false;
+    };
+
+    if row < selection.start_row || row > selection.end_row {
+        return false;
+    }
+
+    if selection.start_row == selection.end_row {
+        return row == selection.start_row
+            && col >= selection.start_col
+            && col <= selection.end_col;
+    }
+
+    if row == selection.start_row {
+        return col >= selection.start_col;
+    }
+
+    if row == selection.end_row {
+        return col <= selection.end_col;
+    }
+
+    true
 }
 
 fn cell_colors(cell: &CellIteration<'static, '_>, theme: &TerminalTheme) -> (u32, u32) {
