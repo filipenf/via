@@ -43,6 +43,7 @@ const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
 const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(20);
+const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 pub struct GhosttyUi {
     config: Config,
@@ -131,6 +132,7 @@ struct WinitGhosttyApp {
     arrow_repeat_redraw_deferred: bool,
     skip_background_drain_once: bool,
     last_arrow_repeat_at: Option<Instant>,
+    next_theme_poll_at: Instant,
     error: Option<anyhow::Error>,
 }
 
@@ -179,6 +181,7 @@ impl WinitGhosttyApp {
             arrow_repeat_redraw_deferred: false,
             skip_background_drain_once: false,
             last_arrow_repeat_at: None,
+            next_theme_poll_at: Instant::now(),
             error: None,
         })
     }
@@ -547,9 +550,29 @@ impl WinitGhosttyApp {
         for pane in &mut self.panes {
             self.dirty |= pane.drain_output();
         }
+        self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.flush_pending_agent_write()?;
         Ok(())
+    }
+
+    fn reload_theme_if_needed(&mut self) -> Result<bool> {
+        let now = Instant::now();
+        if now < self.next_theme_poll_at {
+            return Ok(false);
+        }
+        self.next_theme_poll_at = now + THEME_POLL_INTERVAL;
+
+        let loaded_config = TerminalConfig::load();
+        if loaded_config.theme == self.terminal_config.theme {
+            return Ok(false);
+        }
+
+        self.terminal_config.theme = loaded_config.theme.clone();
+        self.font_renderer.theme = loaded_config.theme;
+        self.force_redraw = true;
+        info!("terminal theme changed; reloaded Ghostty colors");
+        Ok(true)
     }
 
     fn render(&mut self) -> Result<()> {

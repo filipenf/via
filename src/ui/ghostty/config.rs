@@ -34,7 +34,7 @@ pub(super) struct TerminalMetrics {
     pub(super) baseline: isize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct TerminalTheme {
     pub(super) background: u32,
     pub(super) foreground: u32,
