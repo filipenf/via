@@ -7,9 +7,12 @@ use nvim_rs::rpc::handler::Dummy;
 use tokio::io::WriteHalf;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, warn};
+
 
 type NvimWriter = Compat<WriteHalf<UnixStream>>;
+
+const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
+const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
 
 pub async fn open_file(socket_path: &Path, working_directory: &Path, target: FileTarget) -> Result<()> {
     if !socket_path.exists() {
@@ -81,15 +84,16 @@ pub struct FileTarget {
 
 impl FileTarget {
     pub fn parse(input: &str, working_directory: &Path) -> Self {
-        match parse_location(input) {
-            Some((path, line)) => Self {
+        if let Some((path, line)) = parse_location(input) {
+            Self {
                 path: resolve_path(path, working_directory),
                 line: Some(line),
-            },
-            None => Self {
+            }
+        } else {
+            Self {
                 path: resolve_path(input, working_directory),
                 line: None,
-            },
+            }
         }
     }
 }
@@ -152,18 +156,26 @@ fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
         .line
         .map(|line| line.to_string())
         .unwrap_or_else(|| "nil".to_string());
+    let replacements: [(&str, &str); 2] = [("__PATH__", path.as_str()), ("__LINE__", line.as_str())];
 
-    format!(
-        "lua local path={path}; local line={line}; local prev=vim.fn.win_getid(vim.fn.winnr('#')); local cur=vim.api.nvim_get_current_win(); local buf=vim.api.nvim_win_get_buf(cur); local bt=vim.api.nvim_get_option_value('buftype',{{buf=buf}}); if bt~='' and prev~=0 and vim.api.nvim_win_is_valid(prev) then vim.api.nvim_set_current_win(prev) end; local escaped=vim.fn.fnameescape(path); if line then vim.cmd('drop +'..line..' '..escaped) else vim.cmd('drop '..escaped) end"
-    )
+    lua_command(OPEN_FILE_LUA_TEMPLATE, replacements.as_slice())
 }
 
 fn symbol_open_command(symbol: &str) -> String {
     let symbol = lua_string_literal(symbol);
+    let replacements: [(&str, &str); 1] = [("__SYMBOL__", symbol.as_str())];
 
-    format!(
-        "lua local s={symbol}; local ok,builtin=pcall(require,'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then builtin.lsp_workspace_symbols({{query=s}}) else vim.lsp.buf.workspace_symbol(s) end"
-    )
+    lua_command(OPEN_SYMBOL_LUA_TEMPLATE, replacements.as_slice())
+}
+
+fn lua_command(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut command = template.trim().to_string();
+
+    for (needle, value) in replacements {
+        command = command.replace(needle, value);
+    }
+
+    format!("lua {command}")
 }
 
 fn lua_string_literal(input: &str) -> String {
@@ -184,13 +196,7 @@ fn lua_string_literal(input: &str) -> String {
     quoted
 }
 
-pub fn log_socket_warning(socket_path: &Path) {
-    if !socket_path.exists() {
-        warn!(socket = %socket_path.display(), "Neovim RPC socket does not exist yet");
-    } else {
-        debug!(socket = %socket_path.display(), "Neovim RPC socket is present");
-    }
-}
+pub fn log_socket_warning(_socket_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -285,7 +291,7 @@ mod tests {
                 },
                 Path::new("/repo"),
             ),
-            "lua local path=\"src/main.rs\"; local line=42; local prev=vim.fn.win_getid(vim.fn.winnr('#')); local cur=vim.api.nvim_get_current_win(); local buf=vim.api.nvim_win_get_buf(cur); local bt=vim.api.nvim_get_option_value('buftype',{buf=buf}); if bt~='' and prev~=0 and vim.api.nvim_win_is_valid(prev) then vim.api.nvim_set_current_win(prev) end; local escaped=vim.fn.fnameescape(path); if line then vim.cmd('drop +'..line..' '..escaped) else vim.cmd('drop '..escaped) end"
+            "lua local path = \"src/main.rs\"; local line = 42;\nlocal prev = vim.fn.win_getid(vim.fn.winnr('#'));\nlocal cur = vim.api.nvim_get_current_win();\nlocal buf = vim.api.nvim_win_get_buf(cur);\nlocal bt = vim.api\n    .nvim_get_option_value(\n      'buftype',\n      { buf = buf });\nif bt ~= '' and prev ~= 0 and vim.api.nvim_win_is_valid(prev) then\n  vim.api.nvim_set_current_win(prev)\nend;\nlocal escaped = vim.fn.fnameescape(path);\n\nif line then\n  vim.cmd('drop +' .. line .. ' ' .. escaped)\nelse\n  vim.cmd('drop ' .. escaped)\nend"
         );
     }
 
@@ -293,7 +299,7 @@ mod tests {
     fn builds_symbol_open_command_with_telescope_fallback() {
         assert_eq!(
             symbol_open_command("Foo::bar"),
-            "lua local s=\"Foo::bar\"; local ok,builtin=pcall(require,'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then builtin.lsp_workspace_symbols({query=s}) else vim.lsp.buf.workspace_symbol(s) end"
+            "lua local s = \"Foo::bar\"; local ok, builtin = pcall(require, 'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then\n  builtin.lsp_workspace_symbols({ query = s })\nelse\n  vim.lsp.buf.workspace_symbol(s)\nend"
         );
     }
 
