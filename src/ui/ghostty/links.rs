@@ -622,4 +622,39 @@ mod tests {
 
         assert_eq!(target, ReferenceTarget::Symbol("Foo::bar".to_string()));
     }
+
+    #[test]
+    fn ignores_non_file_and_non_symbol_uri() {
+        assert!(reference_target_from_uri("https://example.com/Foo::bar", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn rejects_invalid_symbol_uri() {
+        assert!(reference_target_from_uri("symbol://123bad", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn trims_wrapped_symbol_reference_from_row() {
+        let target = reference_target_from_row("call (`Foo::bar`)", 8, Path::new("/repo")).unwrap();
+
+        assert_eq!(target, ReferenceTarget::Symbol("Foo::bar".to_string()));
+    }
+
+    #[test]
+    fn ignores_invalid_symbol_like_token_in_row() {
+        assert!(reference_target_from_row("see 123Foo::bar", 6, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn parses_file_reference_with_trailing_punctuation() {
+        let target = reference_target_from_row("open src/main.rs:42,", 8, Path::new("/repo")).unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            })
+        );
+    }
 }

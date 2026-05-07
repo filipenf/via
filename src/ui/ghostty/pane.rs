@@ -395,7 +395,10 @@ fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetric
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+    use crate::nvim::FileTarget;
 
     #[test]
     fn output_keeps_viewport_at_bottom_when_following() {
@@ -419,10 +422,44 @@ mod tests {
         assert!(!view.is_viewport_at_bottom());
     }
 
+    #[test]
+    fn reference_lookup_prefers_osc8_target_over_row_parsing() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(
+            b"\x1b]8;;symbol://Foo%3A%3Abar\x1b\\src/main.rs:42\x1b]8;;\x1b\\",
+            true,
+        );
+
+        assert_eq!(
+            view.reference_at(0, 2, Path::new("/repo")),
+            Some(ReferenceTarget::Symbol("Foo::bar".to_string()))
+        );
+    }
+
+    #[test]
+    fn reference_lookup_falls_back_to_row_parsing_without_osc8() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(b"open src/lib.rs:9", true);
+
+        assert_eq!(
+            view.reference_at(0, 6, Path::new("/repo")),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/lib.rs"),
+                line: Some(9),
+            }))
+        );
+    }
+
     fn test_view() -> TerminalView {
+        test_view_with_size(10, 3)
+    }
+
+    fn test_view_with_size(width: usize, height: usize) -> TerminalView {
         TerminalView::new(
-            10,
-            3,
+            width,
+            height,
             TerminalMetrics {
                 cell_width: 1,
                 cell_height: 1,

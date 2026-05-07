@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 type NvimWriter = Compat<WriteHalf<UnixStream>>;
 
-pub async fn open_file(socket_path: &Path, target: FileTarget) -> Result<()> {
+pub async fn open_file(socket_path: &Path, working_directory: &Path, target: FileTarget) -> Result<()> {
     if !socket_path.exists() {
         bail!(
             "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before using --open.",
@@ -20,7 +20,7 @@ pub async fn open_file(socket_path: &Path, target: FileTarget) -> Result<()> {
     }
 
     let (nvim, io_handle) = connect(socket_path).await?;
-    let command = target.drop_command();
+    let command = file_open_command(&target, working_directory);
 
     nvim.command(&command)
         .await
@@ -92,32 +92,47 @@ impl FileTarget {
             },
         }
     }
-
-    fn drop_command(&self) -> String {
-        let path = escape_fname(&self.path);
-
-        match self.line {
-            Some(line) => format!("drop +{line} {path}"),
-            None => format!("drop {path}"),
-        }
-    }
 }
 
 fn parse_location(input: &str) -> Option<(&str, u32)> {
     let input = input.trim_end_matches(':');
     let (path, last) = input.rsplit_once(':')?;
-    let last = last.parse::<u32>().ok()?;
 
-    if let Some((path, maybe_line)) = path.rsplit_once(':') {
-        if let Ok(line) = maybe_line.parse::<u32>() {
-            return Some((path, line));
+    if let Ok(last_line) = last.parse::<u32>() {
+        if let Some((path, maybe_line)) = path.rsplit_once(':') {
+            if let Some(line) = parse_line_start(maybe_line) {
+                return Some((path, line));
+            }
         }
+
+        return Some((path, last_line));
     }
 
-    Some((path, last))
+    parse_line_range_start(last).map(|line| (path, line))
+}
+
+fn parse_line_start(segment: &str) -> Option<u32> {
+    segment
+        .parse::<u32>()
+        .ok()
+        .or_else(|| parse_line_range_start(segment))
+}
+
+fn parse_line_range_start(segment: &str) -> Option<u32> {
+    let (start, end) = segment.split_once('-')?;
+    let start = start.parse::<u32>().ok()?;
+    let end = end.parse::<u32>().ok()?;
+
+    (start <= end).then_some(start)
 }
 
 fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
+    if let Some(path) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(path);
+        }
+    }
+
     let path = PathBuf::from(path);
 
     if path.is_absolute() {
@@ -127,12 +142,20 @@ fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
     }
 }
 
-fn escape_fname(path: &Path) -> String {
-    let escaped = path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace(' ', "\\ ");
-    escaped
+fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
+    let path = target
+        .path
+        .strip_prefix(working_directory)
+        .unwrap_or(&target.path);
+    let path = lua_string_literal(&path.to_string_lossy());
+    let line = target
+        .line
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "nil".to_string());
+
+    format!(
+        "lua local path={path}; local line={line}; local prev=vim.fn.win_getid(vim.fn.winnr('#')); local cur=vim.api.nvim_get_current_win(); local buf=vim.api.nvim_win_get_buf(cur); local bt=vim.api.nvim_get_option_value('buftype',{{buf=buf}}); if bt~='' and prev~=0 and vim.api.nvim_win_is_valid(prev) then vim.api.nvim_set_current_win(prev) end; local escaped=vim.fn.fnameescape(path); if line then vim.cmd('drop +'..line..' '..escaped) else vim.cmd('drop '..escaped) end"
+    )
 }
 
 fn symbol_open_command(symbol: &str) -> String {
@@ -196,11 +219,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_path_with_line_range() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:3-8", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_path_with_line_range_and_column() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:3-8:5", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(3),
+            }
+        );
+    }
+
+    #[test]
     fn parses_path_with_trailing_colon_after_location() {
         assert_eq!(
             FileTarget::parse("src/main.rs:42:7:", Path::new("/repo")),
             FileTarget {
                 path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn expands_tilde_home_paths() {
+        let home = std::env::var_os("HOME").expect("HOME should be set in test environment");
+
+        assert_eq!(
+            FileTarget::parse("~/.worktrees/project/src/main.rs:42", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from(home).join(".worktrees/project/src/main.rs"),
                 line: Some(42),
             }
         );
@@ -218,14 +276,16 @@ mod tests {
     }
 
     #[test]
-    fn builds_drop_command() {
+    fn builds_file_open_command_with_window_fallback() {
         assert_eq!(
-            FileTarget {
-                path: PathBuf::from("src/main.rs"),
-                line: Some(42),
-            }
-            .drop_command(),
-            "drop +42 src/main.rs"
+            file_open_command(
+                &FileTarget {
+                    path: PathBuf::from("/repo/src/main.rs"),
+                    line: Some(42),
+                },
+                Path::new("/repo"),
+            ),
+            "lua local path=\"src/main.rs\"; local line=42; local prev=vim.fn.win_getid(vim.fn.winnr('#')); local cur=vim.api.nvim_get_current_win(); local buf=vim.api.nvim_win_get_buf(cur); local bt=vim.api.nvim_get_option_value('buftype',{buf=buf}); if bt~='' and prev~=0 and vim.api.nvim_win_is_valid(prev) then vim.api.nvim_set_current_win(prev) end; local escaped=vim.fn.fnameescape(path); if line then vim.cmd('drop +'..line..' '..escaped) else vim.cmd('drop '..escaped) end"
         );
     }
 
