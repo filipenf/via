@@ -30,6 +30,25 @@ pub async fn open_file(socket_path: &Path, target: FileTarget) -> Result<()> {
     Ok(())
 }
 
+pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
+    if !socket_path.exists() {
+        bail!(
+            "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before opening symbols.",
+            socket_path.display()
+        );
+    }
+
+    let (nvim, io_handle) = connect(socket_path).await?;
+    let command = symbol_open_command(symbol);
+
+    nvim.command(&command)
+        .await
+        .with_context(|| format!("failed to send Neovim command `{command}`"))?;
+
+    io_handle.abort();
+    Ok(())
+}
+
 async fn connect(
     socket_path: &Path,
 ) -> Result<(
@@ -116,6 +135,32 @@ fn escape_fname(path: &Path) -> String {
     escaped
 }
 
+fn symbol_open_command(symbol: &str) -> String {
+    let symbol = lua_string_literal(symbol);
+
+    format!(
+        "lua local s={symbol}; local ok,builtin=pcall(require,'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then builtin.lsp_workspace_symbols({{query=s}}) else vim.lsp.buf.workspace_symbol(s) end"
+    )
+}
+
+fn lua_string_literal(input: &str) -> String {
+    let mut quoted = String::from("\"");
+
+    for ch in input.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(ch),
+        }
+    }
+
+    quoted.push('"');
+    quoted
+}
+
 pub fn log_socket_warning(socket_path: &Path) {
     if !socket_path.exists() {
         warn!(socket = %socket_path.display(), "Neovim RPC socket does not exist yet");
@@ -181,6 +226,22 @@ mod tests {
             }
             .drop_command(),
             "drop +42 src/main.rs"
+        );
+    }
+
+    #[test]
+    fn builds_symbol_open_command_with_telescope_fallback() {
+        assert_eq!(
+            symbol_open_command("Foo::bar"),
+            "lua local s=\"Foo::bar\"; local ok,builtin=pcall(require,'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then builtin.lsp_workspace_symbols({query=s}) else vim.lsp.buf.workspace_symbol(s) end"
+        );
+    }
+
+    #[test]
+    fn escapes_symbol_for_lua_literal() {
+        assert_eq!(
+            lua_string_literal("Foo\"\\\n\t"),
+            "\"Foo\\\"\\\\\\n\\t\""
         );
     }
 }

@@ -4,6 +4,134 @@ use crate::nvim::FileTarget;
 use crate::pty::TerminalSize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ReferenceTarget {
+    File(FileTarget),
+    Symbol(String),
+}
+
+pub(super) fn reference_target_from_row(
+    row: &str,
+    column: usize,
+    working_directory: &Path,
+) -> Option<ReferenceTarget> {
+    let spans = file_reference_spans(row, working_directory);
+
+    if let Some(span) = spans
+        .into_iter()
+        .find(|span| column >= span.start && column < span.end)
+    {
+        return Some(ReferenceTarget::File(span.target));
+    }
+
+    let spans = symbol_reference_spans(row);
+    spans
+        .into_iter()
+        .find(|span| column >= span.start && column < span.end)
+        .map(|span| ReferenceTarget::Symbol(span.symbol))
+}
+
+fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        while index < chars.len() && !is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        let start = index;
+
+        while index < chars.len() && is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        if start == index {
+            continue;
+        }
+
+        let Some((token_start, token_end, token)) = trim_file_reference(&chars[start..index]) else {
+            continue;
+        };
+
+        if !looks_like_file_reference(&token) {
+            continue;
+        }
+
+        let target = FileTarget::parse(&token, working_directory);
+
+        spans.push(FileReferenceSpan {
+            start: start + token_start,
+            end: start + token_end,
+            target,
+        });
+    }
+
+    spans
+}
+
+#[derive(Debug)]
+struct FileReferenceSpan {
+    start: usize,
+    end: usize,
+    target: FileTarget,
+}
+
+fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        while index < chars.len() && !is_symbol_char(chars[index]) {
+            index += 1;
+        }
+
+        let start = index;
+
+        while index < chars.len() && is_symbol_char(chars[index]) {
+            index += 1;
+        }
+
+        if start == index {
+            continue;
+        }
+
+        let token: String = chars[start..index].iter().collect();
+        let token = trim_symbol_token(&token);
+
+        if !looks_like_symbol(&token) {
+            continue;
+        }
+
+        let leading_trim = chars[start..index]
+            .iter()
+            .take_while(|ch| is_symbol_wrapper(**ch))
+            .count();
+        let trailing_trim = chars[start..index]
+            .iter()
+            .rev()
+            .take_while(|ch| is_symbol_wrapper(**ch))
+            .count();
+
+        spans.push(SymbolReferenceSpan {
+            start: start + leading_trim,
+            end: index.saturating_sub(trailing_trim),
+            symbol: token,
+        });
+    }
+
+    spans
+}
+
+#[derive(Debug)]
+struct SymbolReferenceSpan {
+    start: usize,
+    end: usize,
+    symbol: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LinkSpan {
     pub(super) start: usize,
     pub(super) end: usize,
@@ -303,6 +431,17 @@ fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
     (numbers[0], numbers[1])
 }
 
+pub(super) fn reference_target_from_uri(
+    uri: &str,
+    working_directory: &Path,
+) -> Option<ReferenceTarget> {
+    if let Some(target) = file_target_from_uri(uri, working_directory) {
+        return Some(ReferenceTarget::File(target));
+    }
+
+    symbol_target_from_uri(uri).map(ReferenceTarget::Symbol)
+}
+
 pub(super) fn file_target_from_uri(uri: &str, working_directory: &Path) -> Option<FileTarget> {
     let path = uri
         .strip_prefix("file://")
@@ -317,6 +456,19 @@ pub(super) fn file_target_from_uri(uri: &str, working_directory: &Path) -> Optio
         })?;
 
     Some(FileTarget::parse(&path, working_directory))
+}
+
+fn symbol_target_from_uri(uri: &str) -> Option<String> {
+    uri.strip_prefix("symbol://")
+        .or_else(|| uri.strip_prefix("symbol:"))
+        .map(percent_decode)
+        .and_then(|symbol| {
+            if looks_like_symbol(&symbol) {
+                Some(symbol)
+            } else {
+                None
+            }
+        })
 }
 
 fn percent_decode(input: &str) -> String {
@@ -340,4 +492,134 @@ fn percent_decode(input: &str) -> String {
     }
 
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn trim_file_reference(chars: &[char]) -> Option<(usize, usize, String)> {
+    let mut start = 0;
+    let mut end = chars.len();
+
+    while start < end && matches!(chars[start], '"' | '\'' | '`' | '(' | '[' | '{' | '<') {
+        start += 1;
+    }
+
+    while end > start
+        && matches!(
+            chars[end - 1],
+            '"' | '\'' | '`' | ')' | ']' | '}' | '>' | ',' | ';' | '.' | ':'
+        )
+    {
+        end -= 1;
+    }
+
+    if start == end {
+        return None;
+    }
+
+    Some((start, end, chars[start..end].iter().collect()))
+}
+
+fn looks_like_file_reference(token: &str) -> bool {
+    token.contains('/')
+        || token.contains('\\')
+        || token.contains('.')
+        || token
+            .rsplit_once(':')
+            .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+}
+
+fn is_file_reference_char(ch: char) -> bool {
+    ch.is_alphanumeric()
+        || matches!(
+            ch,
+            '/' | '\\'
+                | '.'
+                | '_'
+                | '-'
+                | ':'
+                | '~'
+                | '@'
+                | '+'
+                | '"'
+                | '\''
+                | '`'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '<'
+                | '>'
+                | ','
+                | ';'
+        )
+}
+
+fn trim_symbol_token(token: &str) -> String {
+    token
+        .trim_matches(is_symbol_wrapper)
+        .trim_matches('.')
+        .to_string()
+}
+
+fn looks_like_symbol(token: &str) -> bool {
+    if token.is_empty() {
+        return false;
+    }
+
+    let starts_like_symbol = token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+
+    starts_like_symbol
+        && token.chars().all(|ch| {
+            ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '-' | '#')
+        })
+}
+
+fn is_symbol_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '_' | ':' | '.' | '-' | '#' | '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}'
+        )
+}
+
+fn is_symbol_wrapper(ch: char) -> bool {
+    matches!(ch, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}')
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn resolves_file_reference_from_row() {
+        let target = reference_target_from_row("open src/main.rs:42", 8, Path::new("/repo")).unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_symbol_reference_from_row() {
+        let target = reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
+
+        assert_eq!(target, ReferenceTarget::Symbol("Foo::bar_baz".to_string()));
+    }
+
+    #[test]
+    fn resolves_symbol_reference_from_uri() {
+        let target = reference_target_from_uri("symbol://Foo%3A%3Abar", Path::new("/repo")).unwrap();
+
+        assert_eq!(target, ReferenceTarget::Symbol("Foo::bar".to_string()));
+    }
 }

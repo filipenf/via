@@ -4,19 +4,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
-use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, TerminalOptions};
 
 use tracing::{debug, warn};
 
-use crate::nvim::FileTarget;
 use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{Osc8Tracker, file_target_from_uri};
+use super::links::{Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri};
 use super::render::{DamageRect, draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
@@ -159,13 +158,13 @@ impl TerminalPane {
         redrawn
     }
 
-    pub(super) fn file_reference_at(
-        &self,
+    pub(super) fn reference_at(
+        &mut self,
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
-        self.view.file_reference_at(row, column, working_directory)
+    ) -> Option<ReferenceTarget> {
+        self.view.reference_at(row, column, working_directory)
     }
 
     pub(super) fn metrics(&self) -> TerminalMetrics {
@@ -284,16 +283,18 @@ impl TerminalView {
         )
     }
 
-    pub(super) fn file_reference_at(
-        &self,
+    pub(super) fn reference_at(
+        &mut self,
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
+    ) -> Option<ReferenceTarget> {
         if let Some(target) = self.hyperlink_target_at(row, column, working_directory) {
             return Some(target);
         }
-        None
+
+        let row_text = self.row_text(row)?;
+        reference_target_from_row(&row_text, column, working_directory)
     }
 
     fn hyperlink_target_at(
@@ -301,13 +302,46 @@ impl TerminalView {
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
+    ) -> Option<ReferenceTarget> {
         self.hyperlink_tracker
             .links()
             .get(row)?
             .iter()
             .find(|span| column >= span.start && column < span.end)
-            .and_then(|span| file_target_from_uri(&span.uri, working_directory))
+            .and_then(|span| reference_target_from_uri(&span.uri, working_directory))
+    }
+
+    fn row_text(&mut self, row: usize) -> Option<String> {
+        let snapshot = self.render_state.update(&self.terminal).ok()?;
+        let cols = snapshot.cols().ok()? as usize;
+        let mut row_iter = self.rows.update(&snapshot).ok()?;
+
+        let mut row_ref = None;
+        for _ in 0..=row {
+            row_ref = row_iter.next();
+            if row_ref.is_none() {
+                return None;
+            }
+        }
+
+        let mut cell_iter = self.cells.update(row_ref?).ok()?;
+        let mut text = String::with_capacity(cols);
+        let mut col = 0usize;
+
+        while let Some(cell_ref) = cell_iter.next() {
+            if col >= cols {
+                break;
+            }
+
+            text.push(first_grapheme(&cell_ref).unwrap_or(' '));
+            col += 1;
+        }
+
+        if col < cols {
+            text.extend(std::iter::repeat_n(' ', cols - col));
+        }
+
+        Some(text)
     }
 }
 
@@ -335,6 +369,16 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool
     }
 
     had_output
+}
+
+fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
+    if cell.graphemes_len().ok()? == 0 {
+        return None;
+    }
+
+    let mut graphemes = ['\0'];
+    cell.graphemes_buf(&mut graphemes).ok()?;
+    Some(graphemes[0])
 }
 
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {

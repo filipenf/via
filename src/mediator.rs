@@ -92,6 +92,11 @@ impl Mediator {
                         error!(%error, "failed to open file in Neovim");
                     }
                 }
+                Event::Ui(UiEvent::SymbolOpenRequested { symbol }) => {
+                    if let Err(error) = nvim::open_symbol(&self.config.nvim_socket_path, &symbol).await {
+                        error!(%error, symbol, "failed to open symbol in Neovim");
+                    }
+                }
                 Event::Editor(event) => self.apply_editor_event(event),
                 event => debug!(?event, "mediator event received"),
             }
