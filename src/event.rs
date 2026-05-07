@@ -13,6 +13,7 @@ pub enum Event {
 #[derive(Debug, Clone)]
 pub enum UiEvent {
     OpenRequested { path: PathBuf, line: Option<u32> },
+    SymbolOpenRequested { symbol: String },
     Resize { columns: u16, rows: u16 },
 }
 

@@ -4,19 +4,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
-use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
+use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{Terminal, TerminalOptions};
 
 use tracing::{debug, warn};
 
-use crate::nvim::FileTarget;
 use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
-use super::links::{Osc8Tracker, file_target_from_uri};
+use super::links::{Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri};
 use super::render::{DamageRect, draw_pane_border, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
@@ -159,13 +158,13 @@ impl TerminalPane {
         redrawn
     }
 
-    pub(super) fn file_reference_at(
-        &self,
+    pub(super) fn reference_at(
+        &mut self,
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
-        self.view.file_reference_at(row, column, working_directory)
+    ) -> Option<ReferenceTarget> {
+        self.view.reference_at(row, column, working_directory)
     }
 
     pub(super) fn metrics(&self) -> TerminalMetrics {
@@ -284,16 +283,18 @@ impl TerminalView {
         )
     }
 
-    pub(super) fn file_reference_at(
-        &self,
+    pub(super) fn reference_at(
+        &mut self,
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
+    ) -> Option<ReferenceTarget> {
         if let Some(target) = self.hyperlink_target_at(row, column, working_directory) {
             return Some(target);
         }
-        None
+
+        let row_text = self.row_text(row)?;
+        reference_target_from_row(&row_text, column, working_directory)
     }
 
     fn hyperlink_target_at(
@@ -301,13 +302,46 @@ impl TerminalView {
         row: usize,
         column: usize,
         working_directory: &Path,
-    ) -> Option<FileTarget> {
+    ) -> Option<ReferenceTarget> {
         self.hyperlink_tracker
             .links()
             .get(row)?
             .iter()
             .find(|span| column >= span.start && column < span.end)
-            .and_then(|span| file_target_from_uri(&span.uri, working_directory))
+            .and_then(|span| reference_target_from_uri(&span.uri, working_directory))
+    }
+
+    fn row_text(&mut self, row: usize) -> Option<String> {
+        let snapshot = self.render_state.update(&self.terminal).ok()?;
+        let cols = snapshot.cols().ok()? as usize;
+        let mut row_iter = self.rows.update(&snapshot).ok()?;
+
+        let mut row_ref = None;
+        for _ in 0..=row {
+            row_ref = row_iter.next();
+            if row_ref.is_none() {
+                return None;
+            }
+        }
+
+        let mut cell_iter = self.cells.update(row_ref?).ok()?;
+        let mut text = String::with_capacity(cols);
+        let mut col = 0usize;
+
+        while let Some(cell_ref) = cell_iter.next() {
+            if col >= cols {
+                break;
+            }
+
+            text.push(first_grapheme(&cell_ref).unwrap_or(' '));
+            col += 1;
+        }
+
+        if col < cols {
+            text.extend(std::iter::repeat_n(' ', cols - col));
+        }
+
+        Some(text)
     }
 }
 
@@ -337,6 +371,16 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool
     had_output
 }
 
+fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
+    if cell.graphemes_len().ok()? == 0 {
+        return None;
+    }
+
+    let mut graphemes = ['\0'];
+    cell.graphemes_buf(&mut graphemes).ok()?;
+    Some(graphemes[0])
+}
+
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {
     let cols = (width / metrics.cell_width).max(1).min(u16::MAX as usize) as u16;
     let rows = (height / metrics.cell_height).max(1).min(u16::MAX as usize) as u16;
@@ -351,7 +395,10 @@ fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetric
 
 #[cfg(test)]
 mod tests {
+    use std::path::{Path, PathBuf};
+
     use super::*;
+    use crate::nvim::FileTarget;
 
     #[test]
     fn output_keeps_viewport_at_bottom_when_following() {
@@ -375,10 +422,44 @@ mod tests {
         assert!(!view.is_viewport_at_bottom());
     }
 
+    #[test]
+    fn reference_lookup_prefers_osc8_target_over_row_parsing() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(
+            b"\x1b]8;;symbol://Foo%3A%3Abar\x1b\\src/main.rs:42\x1b]8;;\x1b\\",
+            true,
+        );
+
+        assert_eq!(
+            view.reference_at(0, 2, Path::new("/repo")),
+            Some(ReferenceTarget::Symbol("Foo::bar".to_string()))
+        );
+    }
+
+    #[test]
+    fn reference_lookup_falls_back_to_row_parsing_without_osc8() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(b"open src/lib.rs:9", true);
+
+        assert_eq!(
+            view.reference_at(0, 6, Path::new("/repo")),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/lib.rs"),
+                line: Some(9),
+            }))
+        );
+    }
+
     fn test_view() -> TerminalView {
+        test_view_with_size(10, 3)
+    }
+
+    fn test_view_with_size(width: usize, height: usize) -> TerminalView {
         TerminalView::new(
-            10,
-            3,
+            width,
+            height,
             TerminalMetrics {
                 cell_width: 1,
                 cell_height: 1,

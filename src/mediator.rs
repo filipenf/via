@@ -14,6 +14,7 @@ pub struct Mediator {
     events: mpsc::Receiver<Event>,
     ui_commands: mpsc::Sender<UiCommand>,
     editor_state: EditorState,
+    in_flight_symbol_open: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -38,6 +39,7 @@ impl Mediator {
             events: events_rx,
             ui_commands: ui_commands_tx,
             editor_state: EditorState::default(),
+            in_flight_symbol_open: None,
         }
     }
 
@@ -81,16 +83,36 @@ impl Mediator {
         while let Some(event) = self.events.recv().await {
             match event {
                 Event::Shutdown => {
+                    if let Some(task) = self.in_flight_symbol_open.take() {
+                        task.abort();
+                    }
                     info!("mediator received shutdown");
                     break;
                 }
                 Event::Ui(UiEvent::OpenRequested { path, line }) => {
                     let target = FileTarget { path, line };
 
-                    if let Err(error) = nvim::open_file(&self.config.nvim_socket_path, target).await
+                    if let Err(error) = nvim::open_file(
+                        &self.config.nvim_socket_path,
+                        &self.config.working_directory,
+                        target,
+                    )
+                    .await
                     {
                         error!(%error, "failed to open file in Neovim");
                     }
+                }
+                Event::Ui(UiEvent::SymbolOpenRequested { symbol }) => {
+                    if let Some(task) = self.in_flight_symbol_open.take() {
+                        task.abort();
+                    }
+
+                    let socket_path = self.config.nvim_socket_path.clone();
+                    self.in_flight_symbol_open = Some(tokio::spawn(async move {
+                        if let Err(error) = nvim::open_symbol(&socket_path, &symbol).await {
+                            error!(%error, symbol, "failed to open symbol in Neovim");
+                        }
+                    }));
                 }
                 Event::Editor(event) => self.apply_editor_event(event),
                 event => debug!(?event, "mediator event received"),

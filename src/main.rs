@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
 
     if let Some(target) = cli_open_target(&config) {
         nvim::log_socket_warning(&config.nvim_socket_path);
-        nvim::open_file(&config.nvim_socket_path, target).await?;
+        nvim::open_file(&config.nvim_socket_path, &config.working_directory, target).await?;
         return Ok(());
     }
 

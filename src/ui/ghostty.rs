@@ -34,6 +34,7 @@ use input::{
     forward_text_input, try_clipboard_paste,
 };
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
+use links::ReferenceTarget;
 use pane::TerminalPane;
 use render::{DamageRect, softbuffer_rects};
 
@@ -44,6 +45,7 @@ const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
 const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(20);
 const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 
 pub struct GhosttyUi {
     config: Config,
@@ -55,6 +57,14 @@ pub struct GhosttyUi {
 struct PendingAgentWrite {
     ready_at: Instant,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReferenceClick {
+    at: Instant,
+    pane_index: usize,
+    row: usize,
+    column: usize,
 }
 
 impl GhosttyUi {
@@ -126,6 +136,7 @@ struct WinitGhosttyApp {
     modifiers: Modifiers,
     cursor_position: Option<(usize, usize)>,
     left_mouse_down: bool,
+    last_reference_click: Option<ReferenceClick>,
     dirty: bool,
     force_redraw: bool,
     next_redraw_at: Instant,
@@ -175,6 +186,7 @@ impl WinitGhosttyApp {
             modifiers: Modifiers::default(),
             cursor_position: None,
             left_mouse_down: false,
+            last_reference_click: None,
             dirty: true,
             force_redraw: true,
             next_redraw_at: Instant::now(),
@@ -506,11 +518,11 @@ impl WinitGhosttyApp {
         self.left_mouse_down = is_down;
 
         if just_pressed {
-            self.dirty |= self.forward_file_reference_click();
+            self.dirty |= self.forward_reference_click();
         }
     }
 
-    fn forward_file_reference_click(&mut self) -> bool {
+    fn forward_reference_click(&mut self) -> bool {
         let Some((x, y)) = self.cursor_position else {
             return false;
         };
@@ -523,23 +535,53 @@ impl WinitGhosttyApp {
         let metrics = self.panes[pane_index].metrics();
         let row = (y - rect.y) / metrics.cell_height;
         let column = (x - rect.x) / metrics.cell_width;
+        let click = ReferenceClick {
+            at: Instant::now(),
+            pane_index,
+            row,
+            column,
+        };
+        let is_double_click = is_double_click(
+            self.last_reference_click.as_ref(),
+            &click,
+            DOUBLE_CLICK_THRESHOLD,
+        );
+        self.last_reference_click = Some(click);
+
         let Some(target) =
-            self.panes[pane_index].file_reference_at(row, column, &self.config.working_directory)
+            self.panes[pane_index].reference_at(row, column, &self.config.working_directory)
         else {
             return pane_changed;
         };
 
-        info!(
-            path = %target.path.display(),
-            line = ?target.line,
-            "file reference clicked"
-        );
-        self.events.try_send(Event::Ui(UiEvent::OpenRequested {
-            path: target.path,
-            line: target.line,
-        }));
+        match target {
+            ReferenceTarget::File(target) => {
+                if !is_double_click {
+                    return pane_changed;
+                }
 
-        true
+                info!(
+                    path = %target.path.display(),
+                    line = ?target.line,
+                    "file reference double clicked"
+                );
+                self.events.try_send(Event::Ui(UiEvent::OpenRequested {
+                    path: target.path,
+                    line: target.line,
+                }));
+                true
+            }
+            ReferenceTarget::Symbol(symbol) => {
+                if is_double_click {
+                    return pane_changed;
+                }
+
+                info!(symbol = %symbol, "symbol reference clicked");
+                self.events
+                    .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
+                true
+            }
+        }
     }
 
     fn drain_background_work(&mut self) -> Result<()> {
@@ -869,6 +911,19 @@ fn pane_count(config: &Config) -> usize {
     if config.agent_command.is_some() { 2 } else { 1 }
 }
 
+fn is_double_click(
+    previous: Option<&ReferenceClick>,
+    current: &ReferenceClick,
+    threshold: Duration,
+) -> bool {
+    previous.is_some_and(|previous| {
+        previous.pane_index == current.pane_index
+            && previous.row == current.row
+            && previous.column == current.column
+            && current.at.saturating_duration_since(previous.at) <= threshold
+    })
+}
+
 fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
     (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
         || (key == Key::Insert && (modifiers.shift || modifiers.super_key))
@@ -988,7 +1043,9 @@ mod tests {
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
-    use links::{LinkSpan, file_target_from_uri, parse_vt_hyperlinks};
+    use links::{
+        LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks, reference_target_from_row,
+    };
 
     #[test]
     fn parses_ghostty_config_entries() {
@@ -1467,6 +1524,64 @@ mod tests {
         assert!(
             file_target_from_uri("https://example.com/src/main.rs", Path::new("/repo")).is_none()
         );
+    }
+
+    #[test]
+    fn classifies_double_click_when_same_cell_within_threshold() {
+        let first = ReferenceClick {
+            at: Instant::now(),
+            pane_index: 1,
+            row: 3,
+            column: 12,
+        };
+        let second = ReferenceClick {
+            at: first.at + Duration::from_millis(120),
+            pane_index: 1,
+            row: 3,
+            column: 12,
+        };
+
+        assert!(is_double_click(Some(&first), &second, Duration::from_millis(300)));
+    }
+
+    #[test]
+    fn rejects_double_click_when_cell_or_pane_differs() {
+        let first = ReferenceClick {
+            at: Instant::now(),
+            pane_index: 1,
+            row: 3,
+            column: 12,
+        };
+        let different_cell = ReferenceClick {
+            at: first.at + Duration::from_millis(120),
+            pane_index: 1,
+            row: 4,
+            column: 12,
+        };
+        let different_pane = ReferenceClick {
+            at: first.at + Duration::from_millis(120),
+            pane_index: 0,
+            row: 3,
+            column: 12,
+        };
+
+        assert!(!is_double_click(
+            Some(&first),
+            &different_cell,
+            Duration::from_millis(300)
+        ));
+        assert!(!is_double_click(
+            Some(&first),
+            &different_pane,
+            Duration::from_millis(300)
+        ));
+    }
+
+    #[test]
+    fn row_reference_parsing_returns_symbol_target() {
+        let target = reference_target_from_row("see Foo::bar here", 5, Path::new("/repo"));
+
+        assert_eq!(target, Some(ReferenceTarget::Symbol("Foo::bar".to_string())));
     }
 
     fn test_terminal_size() -> TerminalSize {

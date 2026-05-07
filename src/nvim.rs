@@ -7,11 +7,14 @@ use nvim_rs::rpc::handler::Dummy;
 use tokio::io::WriteHalf;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
-use tracing::{debug, warn};
+
 
 type NvimWriter = Compat<WriteHalf<UnixStream>>;
 
-pub async fn open_file(socket_path: &Path, target: FileTarget) -> Result<()> {
+const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
+const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
+
+pub async fn open_file(socket_path: &Path, working_directory: &Path, target: FileTarget) -> Result<()> {
     if !socket_path.exists() {
         bail!(
             "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before using --open.",
@@ -20,7 +23,26 @@ pub async fn open_file(socket_path: &Path, target: FileTarget) -> Result<()> {
     }
 
     let (nvim, io_handle) = connect(socket_path).await?;
-    let command = target.drop_command();
+    let command = file_open_command(&target, working_directory);
+
+    nvim.command(&command)
+        .await
+        .with_context(|| format!("failed to send Neovim command `{command}`"))?;
+
+    io_handle.abort();
+    Ok(())
+}
+
+pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
+    if !socket_path.exists() {
+        bail!(
+            "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before opening symbols.",
+            socket_path.display()
+        );
+    }
+
+    let (nvim, io_handle) = connect(socket_path).await?;
+    let command = symbol_open_command(symbol);
 
     nvim.command(&command)
         .await
@@ -62,24 +84,16 @@ pub struct FileTarget {
 
 impl FileTarget {
     pub fn parse(input: &str, working_directory: &Path) -> Self {
-        match parse_location(input) {
-            Some((path, line)) => Self {
+        if let Some((path, line)) = parse_location(input) {
+            Self {
                 path: resolve_path(path, working_directory),
                 line: Some(line),
-            },
-            None => Self {
+            }
+        } else {
+            Self {
                 path: resolve_path(input, working_directory),
                 line: None,
-            },
-        }
-    }
-
-    fn drop_command(&self) -> String {
-        let path = escape_fname(&self.path);
-
-        match self.line {
-            Some(line) => format!("drop +{line} {path}"),
-            None => format!("drop {path}"),
+            }
         }
     }
 }
@@ -87,18 +101,42 @@ impl FileTarget {
 fn parse_location(input: &str) -> Option<(&str, u32)> {
     let input = input.trim_end_matches(':');
     let (path, last) = input.rsplit_once(':')?;
-    let last = last.parse::<u32>().ok()?;
 
-    if let Some((path, maybe_line)) = path.rsplit_once(':') {
-        if let Ok(line) = maybe_line.parse::<u32>() {
-            return Some((path, line));
+    if let Ok(last_line) = last.parse::<u32>() {
+        if let Some((path, maybe_line)) = path.rsplit_once(':') {
+            if let Some(line) = parse_line_start(maybe_line) {
+                return Some((path, line));
+            }
         }
+
+        return Some((path, last_line));
     }
 
-    Some((path, last))
+    parse_line_range_start(last).map(|line| (path, line))
+}
+
+fn parse_line_start(segment: &str) -> Option<u32> {
+    segment
+        .parse::<u32>()
+        .ok()
+        .or_else(|| parse_line_range_start(segment))
+}
+
+fn parse_line_range_start(segment: &str) -> Option<u32> {
+    let (start, end) = segment.split_once('-')?;
+    let start = start.parse::<u32>().ok()?;
+    let end = end.parse::<u32>().ok()?;
+
+    (start <= end).then_some(start)
 }
 
 fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
+    if let Some(path) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(path);
+        }
+    }
+
     let path = PathBuf::from(path);
 
     if path.is_absolute() {
@@ -108,21 +146,57 @@ fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
     }
 }
 
-fn escape_fname(path: &Path) -> String {
-    let escaped = path
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace(' ', "\\ ");
-    escaped
+fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
+    let path = target
+        .path
+        .strip_prefix(working_directory)
+        .unwrap_or(&target.path);
+    let path = lua_string_literal(&path.to_string_lossy());
+    let line = target
+        .line
+        .map(|line| line.to_string())
+        .unwrap_or_else(|| "nil".to_string());
+    let replacements: [(&str, &str); 2] = [("__PATH__", path.as_str()), ("__LINE__", line.as_str())];
+
+    lua_command(OPEN_FILE_LUA_TEMPLATE, replacements.as_slice())
 }
 
-pub fn log_socket_warning(socket_path: &Path) {
-    if !socket_path.exists() {
-        warn!(socket = %socket_path.display(), "Neovim RPC socket does not exist yet");
-    } else {
-        debug!(socket = %socket_path.display(), "Neovim RPC socket is present");
-    }
+fn symbol_open_command(symbol: &str) -> String {
+    let symbol = lua_string_literal(symbol);
+    let replacements: [(&str, &str); 1] = [("__SYMBOL__", symbol.as_str())];
+
+    lua_command(OPEN_SYMBOL_LUA_TEMPLATE, replacements.as_slice())
 }
+
+fn lua_command(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut command = template.trim().to_string();
+
+    for (needle, value) in replacements {
+        command = command.replace(needle, value);
+    }
+
+    format!("lua {command}")
+}
+
+fn lua_string_literal(input: &str) -> String {
+    let mut quoted = String::from("\"");
+
+    for ch in input.chars() {
+        match ch {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            _ => quoted.push(ch),
+        }
+    }
+
+    quoted.push('"');
+    quoted
+}
+
+pub fn log_socket_warning(_socket_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
@@ -151,11 +225,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_path_with_line_range() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:3-8", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(3),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_path_with_line_range_and_column() {
+        assert_eq!(
+            FileTarget::parse("src/main.rs:3-8:5", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(3),
+            }
+        );
+    }
+
+    #[test]
     fn parses_path_with_trailing_colon_after_location() {
         assert_eq!(
             FileTarget::parse("src/main.rs:42:7:", Path::new("/repo")),
             FileTarget {
                 path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            }
+        );
+    }
+
+    #[test]
+    fn expands_tilde_home_paths() {
+        let home = std::env::var_os("HOME").expect("HOME should be set in test environment");
+
+        assert_eq!(
+            FileTarget::parse("~/.worktrees/project/src/main.rs:42", Path::new("/repo")),
+            FileTarget {
+                path: PathBuf::from(home).join(".worktrees/project/src/main.rs"),
                 line: Some(42),
             }
         );
@@ -173,14 +282,32 @@ mod tests {
     }
 
     #[test]
-    fn builds_drop_command() {
+    fn builds_file_open_command_with_window_fallback() {
         assert_eq!(
-            FileTarget {
-                path: PathBuf::from("src/main.rs"),
-                line: Some(42),
-            }
-            .drop_command(),
-            "drop +42 src/main.rs"
+            file_open_command(
+                &FileTarget {
+                    path: PathBuf::from("/repo/src/main.rs"),
+                    line: Some(42),
+                },
+                Path::new("/repo"),
+            ),
+            "lua local path = \"src/main.rs\"; local line = 42;\nlocal prev = vim.fn.win_getid(vim.fn.winnr('#'));\nlocal cur = vim.api.nvim_get_current_win();\nlocal buf = vim.api.nvim_win_get_buf(cur);\nlocal bt = vim.api\n    .nvim_get_option_value(\n      'buftype',\n      { buf = buf });\nif bt ~= '' and prev ~= 0 and vim.api.nvim_win_is_valid(prev) then\n  vim.api.nvim_set_current_win(prev)\nend;\nlocal escaped = vim.fn.fnameescape(path);\n\nif line then\n  vim.cmd('drop +' .. line .. ' ' .. escaped)\nelse\n  vim.cmd('drop ' .. escaped)\nend"
+        );
+    }
+
+    #[test]
+    fn builds_symbol_open_command_with_telescope_fallback() {
+        assert_eq!(
+            symbol_open_command("Foo::bar"),
+            "lua local s = \"Foo::bar\"; local ok, builtin = pcall(require, 'telescope.builtin'); if ok and builtin.lsp_workspace_symbols then\n  builtin.lsp_workspace_symbols({ query = s })\nelse\n  vim.lsp.buf.workspace_symbol(s)\nend"
+        );
+    }
+
+    #[test]
+    fn escapes_symbol_for_lua_literal() {
+        assert_eq!(
+            lua_string_literal("Foo\"\\\n\t"),
+            "\"Foo\\\"\\\\\\n\\t\""
         );
     }
 }
