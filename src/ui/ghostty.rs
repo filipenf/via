@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info, warn};
+
+use crate::lsp_bridge::LspClientInfo;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -660,8 +662,24 @@ impl WinitGhosttyApp {
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
         // rather than being silently swallowed.
         self.output_notifier.clear();
-        for pane in &mut self.panes {
-            self.dirty |= pane.drain_output();
+        let is_agent_pane = self.panes.len() == 2;
+        for (idx, pane) in self.panes.iter_mut().enumerate() {
+            if is_agent_pane && idx == 1 {
+                let chunks = pane.drain_output_chunks();
+                if !chunks.is_empty() {
+                    info!(target: "spectre::agent", "agent produced output");
+                }
+                for chunk in &chunks {
+                    if let Ok(text) = std::str::from_utf8(chunk) {
+                        self.events
+                            .try_send(Event::Agent(crate::event::AgentEvent::OutputChunk(text.to_string())));
+                    }
+                }
+                self.dirty |= !chunks.is_empty();
+            } else {
+                let had_output = pane.drain_output();
+                self.dirty |= had_output;
+            }
         }
         self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
@@ -798,6 +816,23 @@ impl WinitGhosttyApp {
                         ready_at: Instant::now() + Duration::from_millis(30),
                         bytes: update.into_bytes(),
                     });
+                }
+                UiCommand::LspClientsChanged { clients } => {
+                    let Some(agent_pane) = self.panes.get_mut(1) else {
+                        continue;
+                    };
+                    let update = format_lsp_clients_update(&clients);
+                    info!(count = clients.len(), "forwarding lsp clients to agent");
+                    agent_pane.write_all(update.as_bytes())?;
+                    self.pending_agent_write = None;
+                }
+                UiCommand::AgentInput { payload } => {
+                    let Some(agent_pane) = self.panes.get_mut(1) else {
+                        continue;
+                    };
+                    info!("forwarding tool response to agent");
+                    agent_pane.write_all(payload.as_bytes())?;
+                    self.pending_agent_write = None;
                 }
             }
         }
@@ -1014,6 +1049,11 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
             "lua vim.g.spectre_editor_socket = {}",
             lua_string_literal(&config.editor_socket_path)
         )),
+        OsString::from("--cmd"),
+        OsString::from(format!(
+            "lua vim.g.spectre_lsp_bridge_socket = {}",
+            lua_string_literal(&config.lsp_bridge_socket_path)
+        )),
         OsString::from("-c"),
         OsString::from(format!(
             "luafile {}",
@@ -1042,6 +1082,13 @@ fn format_selection_update(
     let display_path = path.strip_prefix(working_directory).unwrap_or(path);
 
     format!("@{}:{start_line}-{end_line}", display_path.display())
+}
+
+fn format_lsp_clients_update(clients: &[LspClientInfo]) -> String {
+    match serde_json::to_string(clients) {
+        Ok(payload) => format!("@lsp_clients {payload}\n"),
+        Err(_) => "@lsp_clients []\n".to_string(),
+    }
 }
 
 fn lua_string_literal(path: &Path) -> String {
@@ -1493,6 +1540,7 @@ mod tests {
             nvim_socket_path: PathBuf::from("/tmp/spectre-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/spectre-editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/spectre-lsp-bridge.sock"),
             working_directory: PathBuf::from("/repo"),
         };
         let args = nvim_args(&config);
@@ -1504,9 +1552,14 @@ mod tests {
             args[3],
             OsString::from(r#"lua vim.g.spectre_editor_socket = "/tmp/spectre-editor.sock""#)
         );
-        assert_eq!(args[4], OsString::from("-c"));
+        assert_eq!(args[4], OsString::from("--cmd"));
         assert_eq!(
             args[5],
+            OsString::from(r#"lua vim.g.spectre_lsp_bridge_socket = "/tmp/spectre-lsp-bridge.sock""#)
+        );
+        assert_eq!(args[6], OsString::from("-c"));
+        assert_eq!(
+            args[7],
             OsString::from("luafile /repo/nvim/context\\ bridge.lua")
         );
     }
@@ -1524,6 +1577,27 @@ mod tests {
         assert_eq!(
             format_selection_update(Path::new("/repo/src/main.rs"), 3, 8, Path::new("/repo")),
             "@src/main.rs:3-8"
+        );
+    }
+
+    #[test]
+    fn lsp_clients_update_serializes_payload() {
+        let payload = format_lsp_clients_update(&[LspClientInfo {
+            id: 1,
+            name: "rust-analyzer".to_string(),
+            root: "/repo".to_string(),
+            languages: vec!["rust".to_string()],
+            capabilities_summary: crate::lsp_bridge::CapabilitiesSummary {
+                definition: true,
+                references: true,
+                hover: true,
+                document_symbol: true,
+            },
+        }]);
+
+        assert_eq!(
+            payload,
+            "@lsp_clients [{\"id\":1,\"name\":\"rust-analyzer\",\"root\":\"/repo\",\"languages\":[\"rust\"],\"capabilities_summary\":{\"definition\":true,\"references\":true,\"hover\":true,\"documentSymbol\":true}}]\n"
         );
     }
 

@@ -83,12 +83,16 @@ impl TerminalPane {
     }
 
     pub(super) fn drain_output(&mut self) -> bool {
+        !self.drain_output_chunks().is_empty()
+    }
+
+    pub(super) fn drain_output_chunks(&mut self) -> Vec<Vec<u8>> {
         if let Some(pty) = &self.pty {
             let output = pty.output().clone();
             return drain_pty_output(&output, &mut self.view);
         }
 
-        false
+        Vec::new()
     }
 
     pub(super) fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
@@ -491,30 +495,28 @@ impl TerminalView {
     }
 }
 
-fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> bool {
+fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> Vec<Vec<u8>> {
     let started_at = Instant::now();
     let follow_output = view.is_viewport_at_bottom();
-    let mut had_output = false;
-    let mut chunks = 0usize;
+    let mut drained_chunks = Vec::new();
     let mut bytes = 0usize;
 
     while let Ok(chunk) = output.try_recv() {
-        had_output = true;
-        chunks += 1;
         bytes += chunk.len();
         view.process(&chunk, false);
+        drained_chunks.push(chunk);
     }
 
-    if had_output && follow_output {
+    if !drained_chunks.is_empty() && follow_output {
         view.terminal.scroll_viewport(ScrollViewport::Bottom);
     }
 
     let elapsed = started_at.elapsed();
     if elapsed > PTY_DRAIN_WARN_THRESHOLD {
-        warn!(?elapsed, chunks, bytes, "slow PTY drain");
+        warn!(?elapsed, chunks = drained_chunks.len(), bytes, "slow PTY drain");
     }
 
-    had_output
+    drained_chunks
 }
 
 fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {

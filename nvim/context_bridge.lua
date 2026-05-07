@@ -1,7 +1,12 @@
 local socket = vim.g.spectre_editor_socket
+local lsp_bridge_socket = vim.g.spectre_lsp_bridge_socket
 local uv = vim.uv or vim.loop
 local pending_active_update = false
 local pending_selection_update = false
+local lsp_pipe = nil
+local clients = {}
+local next_request_id = 0
+local pending_requests = {}
 
 local function encode(payload)
   if vim.json and vim.json.encode then
@@ -31,6 +36,50 @@ local function notify(payload)
       pipe:close()
     end)
   end)
+end
+
+local function ensure_lsp_pipe()
+  if lsp_pipe then
+    return lsp_pipe
+  end
+  if not lsp_bridge_socket or lsp_bridge_socket == "" or not uv then
+    return nil
+  end
+  local pipe = uv.new_pipe(false)
+  if not pipe then
+    return nil
+  end
+  pipe:connect(lsp_bridge_socket, function(err)
+    if err then
+      pipe:close()
+      lsp_pipe = nil
+      return
+    end
+    lsp_pipe = pipe
+    pipe:read_start(function(read_err, chunk)
+      if read_err or not chunk then
+        if pipe then pipe:close() end
+        lsp_pipe = nil
+        return
+      end
+      for line in chunk:gmatch("[^\n]+") do
+        local decode = vim.json and vim.json.decode or vim.fn.json_decode
+        local ok, msg = pcall(decode, line)
+        if ok and msg and msg.type == "lsp_request" then
+          handle_lsp_request(msg)
+        end
+      end
+    end)
+  end)
+  return pipe
+end
+
+local function lsp_notify(payload)
+  local pipe = ensure_lsp_pipe()
+  if not pipe then
+    return
+  end
+  pipe:write(encode(payload) .. "\n")
 end
 
 local function current_file_path()
@@ -144,6 +193,60 @@ local function schedule_visual_selection()
   end, 25)
 end
 
+local function get_client_info(client)
+  if not client then return nil end
+  local caps = client.server_capabilities or {}
+  return {
+    id = client.id,
+    name = client.name,
+    root = client.config and client.config.root_dir or "",
+    languages = client.config and client.config.filetypes or {},
+    capabilities_summary = {
+      definition = caps.definitionProvider or false,
+      references = caps.referencesProvider or false,
+      hover = caps.hoverProvider or false,
+      documentSymbol = caps.documentSymbolProvider or false,
+    },
+  }
+end
+
+local function send_clients()
+  local list = {}
+  for id, info in pairs(clients) do
+    table.insert(list, info)
+  end
+  lsp_notify({ type = "lsp_clients", clients = list })
+end
+
+local function handle_lsp_request(msg)
+  local req_id = msg.request_id
+  local method = msg.method
+  local params = msg.params or {}
+  local client_id = msg.client_id
+  local client = client_id and vim.lsp.get_client_by_id(client_id) or nil
+  if not client then
+    for _, c in ipairs(vim.lsp.get_clients({ bufnr = 0 })) do
+      client = c
+      break
+    end
+  end
+  if not client then
+    lsp_notify({ type = "lsp_response", request_id = req_id, error = "no lsp client" })
+    return
+  end
+  local handler = function(err, result, _ctx, _config)
+    if err then
+      lsp_notify({ type = "lsp_response", request_id = req_id, error = tostring(err) })
+    else
+      lsp_notify({ type = "lsp_response", request_id = req_id, result = result })
+    end
+  end
+  local ok, req_err = pcall(client.request, client, method, params, handler, 0)
+  if not ok then
+    lsp_notify({ type = "lsp_response", request_id = req_id, error = tostring(req_err) })
+  end
+end
+
 local group = vim.api.nvim_create_augroup("SpectreContextSync", { clear = true })
 
 vim.api.nvim_create_autocmd({ "BufEnter", "BufFilePost", "CursorMoved", "CursorMovedI" }, {
@@ -161,8 +264,31 @@ vim.api.nvim_create_autocmd({ "CursorMoved", "ModeChanged" }, {
   callback = schedule_visual_selection,
 })
 
+vim.api.nvim_create_autocmd("LspAttach", {
+  group = group,
+  callback = function(event)
+    local client = vim.lsp.get_client_by_id(event.data.client_id)
+    if client then
+      clients[client.id] = get_client_info(client)
+      send_clients()
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("LspDetach", {
+  group = group,
+  callback = function(event)
+    clients[event.data.client_id] = nil
+    send_clients()
+  end,
+})
+
 vim.schedule(function()
   send_active_buffer()
   send_diagnostics()
   send_visual_selection()
+  for _, client in ipairs(vim.lsp.get_clients()) do
+    clients[client.id] = get_client_info(client)
+  end
+  send_clients()
 end)

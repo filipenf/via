@@ -2,6 +2,7 @@ mod config;
 mod editor;
 mod event;
 mod logging;
+mod lsp_bridge;
 mod mediator;
 mod nvim;
 mod pty;
