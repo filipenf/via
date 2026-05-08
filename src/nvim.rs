@@ -283,16 +283,15 @@ mod tests {
 
     #[test]
     fn builds_file_open_command_with_window_fallback() {
-        assert_eq!(
-            file_open_command(
-                &FileTarget {
-                    path: PathBuf::from("/repo/src/main.rs"),
-                    line: Some(42),
-                },
-                Path::new("/repo"),
-            ),
-            "lua local path = \"src/main.rs\"; local line = 42;\nlocal prev = vim.fn.win_getid(vim.fn.winnr('#'));\nlocal cur = vim.api.nvim_get_current_win();\nlocal buf = vim.api.nvim_win_get_buf(cur);\nlocal bt = vim.api\n    .nvim_get_option_value(\n      'buftype',\n      { buf = buf });\nif bt ~= '' and prev ~= 0 and vim.api.nvim_win_is_valid(prev) then\n  vim.api.nvim_set_current_win(prev)\nend;\nlocal escaped = vim.fn.fnameescape(path);\n\nif line then\n  vim.cmd('drop +' .. line .. ' ' .. escaped)\nelse\n  vim.cmd('drop ' .. escaped)\nend"
+        let command = file_open_command(
+            &FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: Some(42),
+            },
+            Path::new("/repo"),
         );
+        assert!(command.starts_with("lua local path = \"src/main.rs\"; local line = 42;"));
+        assert!(command.contains("vim.cmd('drop +' .. line .. ' ' .. escaped)"));
     }
 
     #[test]

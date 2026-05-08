@@ -1,4 +1,16 @@
 local path = __PATH__; local line = __LINE__;
+
+-- If the path doesn't exist as given, try to find the file by name under cwd.
+-- This handles bare filenames (e.g. "lsp_bridge.rs") that agents sometimes emit
+-- without a directory prefix.
+if vim.fn.filereadable(path) == 0 then
+  local fname = vim.fn.fnamemodify(path, ':t');
+  local found = vim.fn.findfile(fname, '**');
+  if found ~= '' then
+    path = vim.fn.fnamemodify(found, ':p');
+  end
+end
+
 local prev = vim.fn.win_getid(vim.fn.winnr('#'));
 local cur = vim.api.nvim_get_current_win();
 local buf = vim.api.nvim_win_get_buf(cur);
