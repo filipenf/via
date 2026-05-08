@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
+use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 
@@ -12,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 
-use super::config::TerminalMetrics;
+use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 use super::links::{
@@ -35,10 +36,13 @@ impl TerminalPane {
         width: usize,
         height: usize,
         metrics: TerminalMetrics,
+        theme: &TerminalTheme,
     ) -> Result<Self> {
+        let mut view = TerminalView::new(width, height, metrics, title == "agent")?;
+        view.apply_theme(theme);
         Ok(Self {
             title,
-            view: TerminalView::new(width, height, metrics, title == "agent")?,
+            view,
             pty: None,
         })
     }
@@ -194,6 +198,10 @@ impl TerminalPane {
         self.view.metrics
     }
 
+    pub(super) fn apply_theme(&mut self, theme: &TerminalTheme) {
+        self.view.apply_theme(theme);
+    }
+
     /// Visible terminal rows in the current pane (for page-scroll step size).
     pub(super) fn viewport_rows(&self) -> usize {
         self.view.size.rows as usize
@@ -214,6 +222,21 @@ struct TerminalView {
 }
 
 impl TerminalView {
+    fn apply_theme(&mut self, theme: &TerminalTheme) {
+        let _ = self
+            .terminal
+            .set_default_fg_color(Some(rgb_from_u32(theme.foreground)));
+        let _ = self
+            .terminal
+            .set_default_bg_color(Some(rgb_from_u32(theme.background)));
+        let _ = self
+            .terminal
+            .set_default_cursor_color(Some(rgb_from_u32(theme.cursor)));
+        let _ = self
+            .terminal
+            .set_default_color_palette(Some(theme.palette.map(rgb_from_u32)));
+    }
+
     pub(super) fn new(
         width: usize,
         height: usize,
@@ -527,6 +550,14 @@ fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
     let mut graphemes = ['\0'];
     cell.graphemes_buf(&mut graphemes).ok()?;
     Some(graphemes[0])
+}
+
+fn rgb_from_u32(color: u32) -> RgbColor {
+    RgbColor {
+        r: ((color >> 16) & 0xff) as u8,
+        g: ((color >> 8) & 0xff) as u8,
+        b: (color & 0xff) as u8,
+    }
 }
 
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {

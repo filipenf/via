@@ -96,6 +96,15 @@ pub(super) fn draw_screen(
     }
 
     let cols = snapshot.cols().unwrap_or(0);
+    let colors = snapshot.colors().ok();
+    let default_fg = colors
+        .as_ref()
+        .map(|colors| rgb_color(colors.foreground))
+        .unwrap_or(font_renderer.theme.foreground);
+    let default_bg = colors
+        .as_ref()
+        .map(|colors| rgb_color(colors.background))
+        .unwrap_or(font_renderer.theme.background);
     let mut row_iter = match rows.update(&snapshot) {
         Ok(iter) => iter,
         Err(_) => return false,
@@ -119,7 +128,7 @@ pub(super) fn draw_screen(
                 row_y,
                 row_width,
                 metrics.cell_height,
-                font_renderer.theme.background,
+                default_bg,
             );
             push_damage(
                 damage,
@@ -155,6 +164,8 @@ pub(super) fn draw_screen(
                     y,
                     metrics,
                     is_selected_cell(row, col as usize, selection),
+                    default_fg,
+                    default_bg,
                 );
             }
             col += 1;
@@ -283,6 +294,8 @@ fn draw_cell(
     y: usize,
     metrics: TerminalMetrics,
     selected: bool,
+    default_fg: u32,
+    default_bg: u32,
 ) -> Option<char> {
     let Ok(raw_cell) = cell.raw_cell() else {
         return None;
@@ -296,7 +309,7 @@ fn draw_cell(
         return None;
     }
 
-    let (mut fg, mut bg) = cell_colors(cell, &font_renderer.theme);
+    let (mut fg, mut bg) = cell_colors(cell, &font_renderer.theme, default_fg, default_bg);
     let cell_width = if raw_cell
         .wide()
         .map(|wide| matches!(wide, CellWide::Wide | CellWide::SpacerHead))
@@ -312,7 +325,7 @@ fn draw_cell(
         bg = SELECTION_BACKGROUND;
     }
 
-    if bg != font_renderer.theme.background || selected {
+    if bg != default_bg || selected {
         draw_rect(
             buffer,
             width,
@@ -738,28 +751,33 @@ fn is_selected_cell(row: usize, col: usize, selection: Option<SelectionRange>) -
     true
 }
 
-fn cell_colors(cell: &CellIteration<'static, '_>, theme: &TerminalTheme) -> (u32, u32) {
+fn cell_colors(
+    cell: &CellIteration<'static, '_>,
+    theme: &TerminalTheme,
+    default_fg: u32,
+    default_bg: u32,
+) -> (u32, u32) {
     let style = cell.style().unwrap_or_default();
-    let mut fg = match style.fg_color {
-        StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(theme.foreground),
-        StyleColor::Rgb(color) => rgb_color(color),
-        StyleColor::None => cell
-            .fg_color()
-            .ok()
-            .flatten()
-            .map(rgb_color)
-            .unwrap_or(theme.foreground),
-    };
-    let mut bg = match style.bg_color {
-        StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(theme.background),
-        StyleColor::Rgb(color) => rgb_color(color),
-        StyleColor::None => cell
-            .bg_color()
-            .ok()
-            .flatten()
-            .map(rgb_color)
-            .unwrap_or(theme.background),
-    };
+    let mut fg = cell
+        .fg_color()
+        .ok()
+        .flatten()
+        .map(rgb_color)
+        .unwrap_or_else(|| match style.fg_color {
+            StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(default_fg),
+            StyleColor::Rgb(color) => rgb_color(color),
+            StyleColor::None => default_fg,
+        });
+    let mut bg = cell
+        .bg_color()
+        .ok()
+        .flatten()
+        .map(rgb_color)
+        .unwrap_or_else(|| match style.bg_color {
+            StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(default_bg),
+            StyleColor::Rgb(color) => rgb_color(color),
+            StyleColor::None => default_bg,
+        });
 
     if style.inverse {
         std::mem::swap(&mut fg, &mut bg);

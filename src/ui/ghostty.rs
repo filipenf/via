@@ -268,6 +268,7 @@ impl WinitGhosttyApp {
             layout.pane(0).width,
             layout.pane(0).height,
             metrics,
+            &self.terminal_config.theme,
         )?];
 
         if let Some(agent_command) = self.config.agent_command.as_deref() {
@@ -276,6 +277,7 @@ impl WinitGhosttyApp {
                 layout.pane(1).width,
                 layout.pane(1).height,
                 metrics,
+                &self.terminal_config.theme,
             )?;
             pane.spawn_shell_command(
                 agent_command,
@@ -697,6 +699,9 @@ impl WinitGhosttyApp {
 
         self.terminal_config.theme = loaded_config.theme.clone();
         self.font_renderer.theme = loaded_config.theme;
+        for pane in &mut self.panes {
+            pane.apply_theme(&self.terminal_config.theme);
+        }
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
         Ok(true)
