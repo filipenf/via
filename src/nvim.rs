@@ -17,7 +17,7 @@ const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
 pub async fn open_file(socket_path: &Path, working_directory: &Path, target: FileTarget) -> Result<()> {
     if !socket_path.exists() {
         bail!(
-            "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before using --open.",
+            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before using --open.",
             socket_path.display()
         );
     }
@@ -36,7 +36,7 @@ pub async fn open_file(socket_path: &Path, working_directory: &Path, target: Fil
 pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
     if !socket_path.exists() {
         bail!(
-            "Neovim RPC socket does not exist at {}. Start Spectre with the same SPECTRE_NVIM_SOCKET before opening symbols.",
+            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before opening symbols.",
             socket_path.display()
         );
     }

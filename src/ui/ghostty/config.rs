@@ -145,7 +145,7 @@ impl Default for TerminalConfig {
     fn default() -> Self {
         Self {
             font_family: None,
-            font_path: std::env::var_os("SPECTRE_FONT_PATH").map(PathBuf::from),
+            font_path: std::env::var_os("VIA_FONT_PATH").map(PathBuf::from),
             font_size: DEFAULT_FONT_SIZE_POINTS,
             font_pixels: DEFAULT_FONT_PIXEL_SIZE,
             metrics: TerminalMetrics::default(),

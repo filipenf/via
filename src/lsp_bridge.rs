@@ -302,7 +302,7 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_definition_request() {
-        let socket_path = std::env::temp_dir().join(format!("spectre-lsp-test-{}.sock", std::process::id()));
+        let socket_path = std::env::temp_dir().join(format!("via-lsp-test-{}.sock", std::process::id()));
         let socket_path_for_sim = socket_path.clone();
 
         let (handle, _listener, _state, _updates) =

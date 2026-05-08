@@ -1,4 +1,4 @@
-# Spectre
+# via
 
 A Rust terminal application that bridges Neovim and AI agents via libghostty's VT engine.
 
@@ -21,7 +21,7 @@ Otherwise install Zig 0.15.2 manually and put it on your `PATH`.
 
 ```sh
 cargo build --release
-./target/release/spectre
+./target/release/via
 ```
 
 `libghostty-vt` is statically linked into the binary, so no runtime library

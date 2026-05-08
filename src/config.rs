@@ -14,18 +14,18 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Self {
-        let nvim_command = env::var("SPECTRE_NVIM").unwrap_or_else(|_| "nvim".to_owned());
-        let agent_command = env::var("SPECTRE_AGENT").ok();
-        let nvim_socket_path = env::var_os("SPECTRE_NVIM_SOCKET")
+        let nvim_command = env::var("VIA_NVIM").unwrap_or_else(|_| "nvim".to_owned());
+        let agent_command = env::var("VIA_AGENT").ok();
+        let nvim_socket_path = env::var_os("VIA_NVIM_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_socket_path);
-        let editor_socket_path = env::var_os("SPECTRE_EDITOR_SOCKET")
+        let editor_socket_path = env::var_os("VIA_EDITOR_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_editor_socket_path);
-        let nvim_context_bridge_path = env::var_os("SPECTRE_NVIM_CONTEXT_BRIDGE")
+        let nvim_context_bridge_path = env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_context_bridge_path);
-        let lsp_bridge_socket_path = env::var_os("SPECTRE_LSP_BRIDGE_SOCKET")
+        let lsp_bridge_socket_path = env::var_os("VIA_LSP_BRIDGE_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_lsp_bridge_socket_path);
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -43,11 +43,11 @@ impl Config {
 }
 
 fn default_nvim_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("spectre-nvim-{}.sock", std::process::id()))
+    env::temp_dir().join(format!("via-nvim-{}.sock", std::process::id()))
 }
 
 fn default_editor_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("spectre-editor-{}.sock", std::process::id()))
+    env::temp_dir().join(format!("via-editor-{}.sock", std::process::id()))
 }
 
 fn default_nvim_context_bridge_path() -> PathBuf {
@@ -55,7 +55,7 @@ fn default_nvim_context_bridge_path() -> PathBuf {
 }
 
 fn default_lsp_bridge_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("spectre-lsp-bridge-{}.sock", std::process::id()))
+    env::temp_dir().join(format!("via-lsp-bridge-{}.sock", std::process::id()))
 }
 
 #[cfg(test)]
@@ -66,14 +66,14 @@ mod tests {
     fn default_socket_path_is_process_scoped() {
         let path = default_nvim_socket_path();
 
-        assert!(path.ends_with(format!("spectre-nvim-{}.sock", std::process::id())));
+        assert!(path.ends_with(format!("via-nvim-{}.sock", std::process::id())));
     }
 
     #[test]
     fn default_editor_socket_path_is_process_scoped() {
         let path = default_editor_socket_path();
 
-        assert!(path.ends_with(format!("spectre-editor-{}.sock", std::process::id())));
+        assert!(path.ends_with(format!("via-editor-{}.sock", std::process::id())));
     }
 
     #[test]
@@ -87,6 +87,6 @@ mod tests {
     fn default_lsp_bridge_socket_path_is_process_scoped() {
         let path = default_lsp_bridge_socket_path();
 
-        assert!(path.ends_with(format!("spectre-lsp-bridge-{}.sock", std::process::id())));
+        assert!(path.ends_with(format!("via-lsp-bridge-{}.sock", std::process::id())));
     }
 }

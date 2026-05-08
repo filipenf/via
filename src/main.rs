@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     logging::init();
 
     let config = Config::from_env();
-    info!(?config, "starting spectre");
+    info!(?config, "starting via");
 
     if let Some(target) = cli_open_target(&config) {
         nvim::log_socket_warning(&config.nvim_socket_path);

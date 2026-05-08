@@ -1,5 +1,5 @@
-local socket = vim.g.spectre_editor_socket
-local lsp_bridge_socket = vim.g.spectre_lsp_bridge_socket
+local socket = vim.g.via_editor_socket
+local lsp_bridge_socket = vim.g.via_lsp_bridge_socket
 local uv = vim.uv or vim.loop
 local pending_active_update = false
 local pending_selection_update = false
@@ -247,7 +247,7 @@ local function handle_lsp_request(msg)
   end
 end
 
-local group = vim.api.nvim_create_augroup("SpectreContextSync", { clear = true })
+local group = vim.api.nvim_create_augroup("viaContextSync", { clear = true })
 
 vim.api.nvim_create_autocmd({ "BufEnter", "BufFilePost", "CursorMoved", "CursorMovedI" }, {
   group = group,

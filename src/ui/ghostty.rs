@@ -205,7 +205,7 @@ impl WinitGhosttyApp {
         }
 
         let attributes = WindowAttributes::default()
-            .with_title("Spectre")
+            .with_title("via")
             .with_resizable(true)
             .with_inner_size(PhysicalSize::new(
                 INITIAL_WIDTH as u32,
@@ -1033,12 +1033,12 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
         config.nvim_socket_path.clone().into_os_string(),
         OsString::from("--cmd"),
         OsString::from(format!(
-            "lua vim.g.spectre_editor_socket = {}",
+            "lua vim.g.via_editor_socket = {}",
             lua_string_literal(&config.editor_socket_path)
         )),
         OsString::from("--cmd"),
         OsString::from(format!(
-            "lua vim.g.spectre_lsp_bridge_socket = {}",
+            "lua vim.g.via_lsp_bridge_socket = {}",
             lua_string_literal(&config.lsp_bridge_socket_path)
         )),
         OsString::from("-c"),
@@ -1517,25 +1517,25 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: None,
-            nvim_socket_path: PathBuf::from("/tmp/spectre-nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/spectre-editor.sock"),
+            nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/spectre-lsp-bridge.sock"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
             working_directory: PathBuf::from("/repo"),
         };
         let args = nvim_args(&config);
 
         assert_eq!(args[0], OsString::from("--listen"));
-        assert_eq!(args[1], OsString::from("/tmp/spectre-nvim.sock"));
+        assert_eq!(args[1], OsString::from("/tmp/via-nvim.sock"));
         assert_eq!(args[2], OsString::from("--cmd"));
         assert_eq!(
             args[3],
-            OsString::from(r#"lua vim.g.spectre_editor_socket = "/tmp/spectre-editor.sock""#)
+            OsString::from(r#"lua vim.g.via_editor_socket = "/tmp/via-editor.sock""#)
         );
         assert_eq!(args[4], OsString::from("--cmd"));
         assert_eq!(
             args[5],
-            OsString::from(r#"lua vim.g.spectre_lsp_bridge_socket = "/tmp/spectre-lsp-bridge.sock""#)
+            OsString::from(r#"lua vim.g.via_lsp_bridge_socket = "/tmp/via-lsp-bridge.sock""#)
         );
         assert_eq!(args[6], OsString::from("-c"));
         assert_eq!(

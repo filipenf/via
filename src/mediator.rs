@@ -181,7 +181,7 @@ impl Mediator {
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
                     // Log agent output so we can observe communication during development
                     if !chunk.trim().is_empty() {
-                        info!(target: "spectre::agent", "{}", chunk.trim_end());
+                        info!(target: "via::agent", "{}", chunk.trim_end());
                     }
                     self.handle_agent_output(chunk).await;
                 }

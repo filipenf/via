@@ -1,6 +1,6 @@
 This project brief outlines a lightweight, high-performance coordination layer that bridges **Neovim** and **AI Agents** using a custom terminal wrapper.
 
-## Project Name: **Spectre**
+## Project Name: **via**
 
 **Core Concept:** A Rust-based terminal application wrapping libghostty that acts as a semantic mediator between Neovim (the editor) and AI Agents (the logic) via the **Agent Communication Protocol (ACP)**.
 
