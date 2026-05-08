@@ -26,3 +26,7 @@ cargo build --release
 
 `libghostty-vt` is statically linked into the binary, so no runtime library
 search path setup is needed.
+
+Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
+bridge is written to a temp file when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
+if you want to load a custom script from disk during development.

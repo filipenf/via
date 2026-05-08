@@ -1,5 +1,10 @@
 use std::env;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+/// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
+/// to a temp path once so Neovim can `luafile` it — same pattern as socket paths under `/tmp`.
+static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -51,7 +56,21 @@ fn default_editor_socket_path() -> PathBuf {
 }
 
 fn default_nvim_context_bridge_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nvim/context_bridge.lua")
+    EMBEDDED_CONTEXT_BRIDGE_PATH
+        .get_or_init(|| {
+            let path = env::temp_dir().join(format!(
+                "via-context-bridge-{}.lua",
+                std::process::id()
+            ));
+            std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(|err| {
+                panic!(
+                    "failed to write embedded nvim/context_bridge.lua to {}: {err}",
+                    path.display()
+                );
+            });
+            path
+        })
+        .clone()
 }
 
 fn default_lsp_bridge_socket_path() -> PathBuf {
@@ -77,10 +96,19 @@ mod tests {
     }
 
     #[test]
-    fn default_nvim_context_bridge_path_points_to_repo_lua_file() {
+    fn default_nvim_context_bridge_path_materializes_embedded_lua() {
         let path = default_nvim_context_bridge_path();
 
-        assert!(path.ends_with("nvim/context_bridge.lua"));
+        assert!(
+            path.ends_with(format!("via-context-bridge-{}.lua", std::process::id())),
+            "unexpected path: {}",
+            path.display()
+        );
+        let contents = std::fs::read_to_string(&path).expect("read context bridge");
+        assert!(
+            contents.contains("vim.g.via_editor_socket"),
+            "expected embedded bridge lua on disk"
+        );
     }
 
     #[test]
