@@ -9,7 +9,7 @@ anyhow = "1.0.100"
 # clipboard when copying from native Wayland apps; this enables the wl-clipboard protocol instead.
 arboard = { version = "3", features = ["wayland-data-control"] }
 crossbeam-channel = "0.5.15"
-fontdue = "0.9.3"
+cosmic-text = "0.19.0"
 libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", features = ["link-static"] }
 nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
 portable-pty = "0.9.0"

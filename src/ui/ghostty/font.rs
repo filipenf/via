@@ -1,19 +1,25 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
-use fontdue::{Font, FontSettings, Metrics};
+use anyhow::Result;
+use cosmic_text::{
+    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
+    fontdb,
+};
 use tracing::info;
 
 use super::config::{TerminalConfig, TerminalTheme};
 
+const GLYPH_COVERAGE_BOOST_NUMERATOR: u32 = 1;
+const GLYPH_COVERAGE_BOOST_DENOMINATOR: u32 = 5;
+
 pub(super) struct FontRenderer {
-    font: Font,
-    bold_font: Option<Font>,
-    italic_font: Option<Font>,
-    bold_italic_font: Option<Font>,
+    font_system: FontSystem,
+    swash_cache: SwashCache,
+    font_family: Option<String>,
     font_size: f32,
-    baseline: isize,
+    cell_width: f32,
+    line_height: f32,
+    baseline: f32,
     pub(super) theme: TerminalTheme,
     cache: HashMap<GlyphKey, GlyphBitmap>,
 }
@@ -26,36 +32,34 @@ struct GlyphKey {
 }
 
 struct GlyphBitmap {
-    metrics: Metrics,
+    left: i32,
+    top: i32,
+    width: usize,
+    height: usize,
     bitmap: Vec<u8>,
 }
 
 impl FontRenderer {
     pub(super) fn new(config: &TerminalConfig) -> Result<Self> {
-        let font_path = font_path(config).context("failed to find a terminal font")?;
-        let font = load_font(&font_path)?;
-        let bold_font = font_variant_path(config, FontVariant::Bold)
-            .filter(|path| path != &font_path)
-            .map(|path| load_font(&path))
-            .transpose()?;
-        let italic_font = font_variant_path(config, FontVariant::Italic)
-            .filter(|path| path != &font_path)
-            .map(|path| load_font(&path))
-            .transpose()?;
-        let bold_italic_font = font_variant_path(config, FontVariant::BoldItalic)
-            .filter(|path| path != &font_path)
-            .map(|path| load_font(&path))
-            .transpose()?;
+        let font_sources = config.font_path.clone().map(fontdb::Source::File);
+        let font_system = FontSystem::new_with_fonts(font_sources);
 
-        info!(font = %font_path.display(), "loaded terminal font");
+        if let Some(font_family) = &config.font_family {
+            info!(font_family, "using configured terminal font family");
+        } else if let Some(font_path) = &config.font_path {
+            info!(font = %font_path.display(), "using configured terminal font file");
+        } else {
+            info!("using system monospace terminal font");
+        }
 
         Ok(Self {
-            font,
-            bold_font,
-            italic_font,
-            bold_italic_font,
+            font_system,
+            swash_cache: SwashCache::new(),
+            font_family: config.font_family.clone(),
             font_size: config.font_pixels,
-            baseline: config.metrics.baseline,
+            cell_width: config.metrics.cell_width as f32,
+            line_height: config.metrics.cell_height as f32,
+            baseline: config.metrics.baseline as f32,
             theme: config.theme.clone(),
             cache: HashMap::new(),
         })
@@ -73,26 +77,25 @@ impl FontRenderer {
         bold: bool,
         italic: bool,
     ) {
-        let baseline = y as isize + self.baseline;
         let glyph = self.glyph(ch, bold, italic);
-        let draw_x = x as isize + glyph.metrics.xmin as isize;
-        let draw_y = baseline - glyph.metrics.ymin as isize - glyph.metrics.height as isize;
+        let draw_x = x as i32 + glyph.left;
+        let draw_y = y as i32 + glyph.top;
         let start_x = draw_x.max(0) as usize;
         let start_y = draw_y.max(0) as usize;
-        let end_x = (draw_x + glyph.metrics.width as isize).clamp(0, width as isize) as usize;
-        let end_y = (draw_y + glyph.metrics.height as isize).clamp(0, height as isize) as usize;
+        let end_x = (draw_x + glyph.width as i32).clamp(0, width as i32) as usize;
+        let end_y = (draw_y + glyph.height as i32).clamp(0, height as i32) as usize;
 
         if start_x >= end_x || start_y >= end_y {
             return;
         }
 
         for screen_y in start_y..end_y {
-            let glyph_y = (screen_y as isize - draw_y) as usize;
-            let glyph_row = glyph_y * glyph.metrics.width;
+            let glyph_y = (screen_y as i32 - draw_y) as usize;
+            let glyph_row = glyph_y * glyph.width;
             let buffer_row = screen_y * width;
 
             for screen_x in start_x..end_x {
-                let glyph_x = (screen_x as isize - draw_x) as usize;
+                let glyph_x = (screen_x as i32 - draw_x) as usize;
                 let alpha = glyph.bitmap[glyph_row + glyph_x];
 
                 if alpha == 0 {
@@ -120,8 +123,8 @@ impl FontRenderer {
         let key = GlyphKey { ch, bold, italic };
 
         if !self.cache.contains_key(&key) {
-            let (metrics, bitmap) = self.styled_font(bold, italic).rasterize(ch, self.font_size);
-            self.cache.insert(key, GlyphBitmap { metrics, bitmap });
+            let glyph = self.render_glyph(ch, bold, italic);
+            self.cache.insert(key, glyph);
         }
 
         self.cache
@@ -129,123 +132,76 @@ impl FontRenderer {
             .expect("glyph cache should contain key")
     }
 
-    fn styled_font(&self, bold: bool, italic: bool) -> &Font {
-        match (bold, italic) {
-            (true, true) => self
-                .bold_italic_font
-                .as_ref()
-                .or(self.bold_font.as_ref())
-                .or(self.italic_font.as_ref())
-                .unwrap_or(&self.font),
-            (true, false) => self.bold_font.as_ref().unwrap_or(&self.font),
-            (false, true) => self.italic_font.as_ref().unwrap_or(&self.font),
-            (false, false) => &self.font,
+    fn render_glyph(&mut self, ch: char, bold: bool, italic: bool) -> GlyphBitmap {
+        let metrics = Metrics::new(self.font_size, self.line_height);
+        let font_family = self.font_family.clone();
+        let attrs = attrs(font_family.as_deref(), bold, italic);
+        let text = ch.to_string();
+        let mut buffer = Buffer::new(&mut self.font_system, metrics);
+        let mut buffer = buffer.borrow_with(&mut self.font_system);
+        buffer.set_size(Some(self.cell_width), Some(self.line_height));
+        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+
+        for run in buffer.layout_runs() {
+            let Some(glyph) = run.glyphs.first() else {
+                break;
+            };
+            let physical = glyph.physical((0.0, self.baseline), 1.0);
+            let Some(image) = self
+                .swash_cache
+                .get_image_uncached(&mut self.font_system, physical.cache_key)
+            else {
+                break;
+            };
+
+            let width = image.placement.width as usize;
+            let height = image.placement.height as usize;
+            let mut bitmap: Vec<u8> = match image.content {
+                SwashContent::Mask => image.data,
+                SwashContent::Color => image.data.chunks_exact(4).map(|rgba| rgba[3]).collect(),
+                SwashContent::SubpixelMask => {
+                    image.data.chunks_exact(3).map(|rgb| rgb[1]).collect()
+                }
+            };
+            boost_glyph_coverage(&mut bitmap);
+
+            return GlyphBitmap {
+                left: physical.x + image.placement.left,
+                top: physical.y - image.placement.top,
+                width,
+                height,
+                bitmap,
+            };
+        }
+
+        GlyphBitmap {
+            left: 0,
+            top: 0,
+            width: 0,
+            height: 0,
+            bitmap: Vec::new(),
         }
     }
 }
 
-fn load_font(path: &Path) -> Result<Font> {
-    let font_bytes =
-        std::fs::read(path).with_context(|| format!("failed to read font {}", path.display()))?;
-    Font::from_bytes(font_bytes, FontSettings::default())
-        .map_err(|error| anyhow::anyhow!("failed to load font {}: {error}", path.display()))
+fn attrs(font_family: Option<&str>, bold: bool, italic: bool) -> Attrs<'_> {
+    let family = font_family.map(Family::Name).unwrap_or(Family::Monospace);
+
+    Attrs::new()
+        .family(family)
+        .weight(if bold { Weight::BOLD } else { Weight::NORMAL })
+        .style(if italic { Style::Italic } else { Style::Normal })
 }
 
-#[derive(Clone, Copy)]
-enum FontVariant {
-    Regular,
-    Bold,
-    Italic,
-    BoldItalic,
-}
+fn boost_glyph_coverage(bitmap: &mut [u8]) {
+    for alpha in bitmap {
+        if *alpha == 0 || *alpha == 255 {
+            continue;
+        }
 
-fn font_path(config: &TerminalConfig) -> Option<PathBuf> {
-    if let Some(path) = config.font_path.clone() {
-        return Some(path);
-    }
-
-    if let Some(path) = config
-        .font_family
-        .as_deref()
-        .and_then(|family| font_path_for_family(family, FontVariant::Regular))
-    {
-        return Some(path);
-    }
-
-    [
-        "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    ]
-    .into_iter()
-    .map(Path::new)
-    .find(|path| path.exists())
-    .map(Path::to_path_buf)
-}
-
-fn font_variant_path(config: &TerminalConfig, variant: FontVariant) -> Option<PathBuf> {
-    config
-        .font_family
-        .as_deref()
-        .and_then(|family| font_path_for_family(family, variant))
-}
-
-fn font_path_for_family(family: &str, variant: FontVariant) -> Option<PathBuf> {
-    let family = family.to_ascii_lowercase().replace([' ', '-'], "");
-
-    let paths = if family.contains("jetbrainsmononerdfont") || family.contains("jetbrainsmono") {
-        jetbrains_mono_paths(variant)
-    } else if family.contains("caskaydiamono") || family.contains("cascadiamono") {
-        caskaydia_mono_paths(variant)
-    } else {
-        return None;
-    };
-
-    if let Some(path) = paths.into_iter().map(Path::new).find(|path| path.exists()) {
-        return Some(path.to_path_buf());
-    }
-
-    None
-}
-
-fn jetbrains_mono_paths(variant: FontVariant) -> [&'static str; 2] {
-    match variant {
-        FontVariant::Regular => [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-Regular.ttf",
-        ],
-        FontVariant::Bold => [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-Bold.ttf",
-        ],
-        FontVariant::Italic => [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Italic.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-Italic.ttf",
-        ],
-        FontVariant::BoldItalic => [
-            "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-BoldItalic.ttf",
-            "/usr/share/fonts/TTF/JetBrainsMono-BoldItalic.ttf",
-        ],
-    }
-}
-
-fn caskaydia_mono_paths(variant: FontVariant) -> [&'static str; 2] {
-    match variant {
-        FontVariant::Regular => [
-            "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Regular.ttf",
-            "/usr/share/fonts/TTF/CascadiaMono-Regular.ttf",
-        ],
-        FontVariant::Bold => [
-            "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Bold.ttf",
-            "/usr/share/fonts/TTF/CascadiaMono-Bold.ttf",
-        ],
-        FontVariant::Italic => [
-            "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-Italic.ttf",
-            "/usr/share/fonts/TTF/CascadiaMono-Italic.ttf",
-        ],
-        FontVariant::BoldItalic => [
-            "/usr/share/fonts/TTF/CaskaydiaMonoNerdFont-BoldItalic.ttf",
-            "/usr/share/fonts/TTF/CascadiaMono-BoldItalic.ttf",
-        ],
+        let alpha_u32 = *alpha as u32;
+        let boost = alpha_u32 * (255 - alpha_u32) * GLYPH_COVERAGE_BOOST_NUMERATOR
+            / (255 * GLYPH_COVERAGE_BOOST_DENOMINATOR);
+        *alpha = (alpha_u32 + boost).min(255) as u8;
     }
 }
