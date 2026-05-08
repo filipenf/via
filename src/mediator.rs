@@ -179,10 +179,6 @@ impl Mediator {
                 }
                 Event::Editor(event) => self.apply_editor_event(event),
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
-                    // Log agent output so we can observe communication during development
-                    if !chunk.trim().is_empty() {
-                        info!(target: "via::agent", "{}", chunk.trim_end());
-                    }
                     self.handle_agent_output(chunk).await;
                 }
                 Event::Agent(event) => debug!(?event, "agent event received"),
