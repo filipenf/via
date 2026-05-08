@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use libghostty_vt::style::PaletteIndex;
 use tracing::debug;
 
 pub(super) const DEFAULT_CELL_WIDTH: usize = 10;
@@ -166,7 +165,7 @@ impl Default for TerminalMetrics {
 
 impl Default for TerminalTheme {
     fn default() -> Self {
-        let mut palette = [0; 256];
+        let mut palette = default_ansi_256_palette();
         let defaults = [
             BLACK, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, WHITE, 0x928374,
             0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
@@ -183,6 +182,35 @@ impl Default for TerminalTheme {
             palette,
         }
     }
+}
+
+fn default_ansi_256_palette() -> [u32; 256] {
+    let mut palette = [0u32; 256];
+    let xterm_16 = [
+        0x000000, 0x800000, 0x008000, 0x808000, 0x000080, 0x800080, 0x008080, 0xc0c0c0, 0x808080,
+        0xff0000, 0x00ff00, 0xffff00, 0x0000ff, 0xff00ff, 0x00ffff, 0xffffff,
+    ];
+    for (index, color) in xterm_16.into_iter().enumerate() {
+        palette[index] = color;
+    }
+
+    let levels = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    let mut index = 16usize;
+    for &r in &levels {
+        for &g in &levels {
+            for &b in &levels {
+                palette[index] = ((r as u32) << 16) | ((g as u32) << 8) | b as u32;
+                index += 1;
+            }
+        }
+    }
+
+    for gray in 0..24u32 {
+        let value = 8 + gray * 10;
+        palette[232 + gray as usize] = (value << 16) | (value << 8) | value;
+    }
+
+    palette
 }
 
 fn points_to_pixels(points: f32, dpi: f32) -> f32 {
@@ -259,8 +287,4 @@ fn parse_hex_color(value: &str) -> Option<u32> {
     }
 
     u32::from_str_radix(value, 16).ok()
-}
-
-pub(super) fn color_from_palette(index: PaletteIndex, theme: &TerminalTheme) -> Option<u32> {
-    theme.palette.get(index.0 as usize).copied()
 }

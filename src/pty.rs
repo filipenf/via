@@ -85,7 +85,9 @@ impl PtySession {
             command.arg(arg);
         }
         command.cwd(cwd);
-        command.env("TERM", "xterm-256color");
+        command.env("TERM", "xterm-ghostty");
+        command.env("TERM_PROGRAM", "ghostty");
+        command.env("COLORTERM", "truecolor");
 
         let child = pair
             .slave

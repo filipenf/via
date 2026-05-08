@@ -58,16 +58,16 @@ fn default_editor_socket_path() -> PathBuf {
 fn default_nvim_context_bridge_path() -> PathBuf {
     EMBEDDED_CONTEXT_BRIDGE_PATH
         .get_or_init(|| {
-            let path = env::temp_dir().join(format!(
-                "via-context-bridge-{}.lua",
-                std::process::id()
-            ));
-            std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(|err| {
-                panic!(
-                    "failed to write embedded nvim/context_bridge.lua to {}: {err}",
-                    path.display()
-                );
-            });
+            let path =
+                env::temp_dir().join(format!("via-context-bridge-{}.lua", std::process::id()));
+            std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
+                |err| {
+                    panic!(
+                        "failed to write embedded nvim/context_bridge.lua to {}: {err}",
+                        path.display()
+                    );
+                },
+            );
             path
         })
         .clone()

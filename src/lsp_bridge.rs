@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
@@ -77,12 +77,18 @@ pub struct LspBridgeHandle {
 
 #[allow(dead_code)]
 impl LspBridgeHandle {
-    pub async fn definition(&self, uri: &str, line: u32, character: u32) -> Result<serde_json::Value> {
+    pub async fn definition(
+        &self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<serde_json::Value> {
         let params = serde_json::json!({
             "textDocument": { "uri": uri },
             "position": { "line": line, "character": character }
         });
-        self.send_request("textDocument/definition", params, None).await
+        self.send_request("textDocument/definition", params, None)
+            .await
     }
 
     /// Returns the currently known LSP clients attached in Neovim.
@@ -177,18 +183,26 @@ async fn run_listener(
 ) -> Result<()> {
     if socket_path.exists() {
         std::fs::remove_file(&socket_path).with_context(|| {
-            format!("failed to remove stale lsp bridge socket {}", socket_path.display())
+            format!(
+                "failed to remove stale lsp bridge socket {}",
+                socket_path.display()
+            )
         })?;
     }
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind lsp bridge socket {}", socket_path.display()))?;
-    let _socket_file = SocketFile { path: socket_path.clone() };
+    let _socket_file = SocketFile {
+        path: socket_path.clone(),
+    };
 
     info!(socket = %socket_path.display(), "lsp bridge listener ready");
 
     // Accept the first connection (Lua shim). For MVP we support one active bridge.
-    let (stream, _) = listener.accept().await.context("failed to accept lsp bridge connection")?;
+    let (stream, _) = listener
+        .accept()
+        .await
+        .context("failed to accept lsp bridge connection")?;
     let (reader, writer) = stream.into_split();
 
     // Spawn reader task (handles incoming lsp_clients and lsp_response)
@@ -219,7 +233,11 @@ async fn reader_loop(
 ) -> Result<()> {
     let mut lines = BufReader::new(reader).lines();
 
-    while let Some(line) = lines.next_line().await.context("failed to read lsp bridge message")? {
+    while let Some(line) = lines
+        .next_line()
+        .await
+        .context("failed to read lsp bridge message")?
+    {
         if line.trim().is_empty() {
             continue;
         }
@@ -232,7 +250,11 @@ async fn reader_loop(
                     debug!("dropping lsp client update");
                 }
             }
-            Ok(LspBridgeMessage::LspResponse { request_id, result, error }) => {
+            Ok(LspBridgeMessage::LspResponse {
+                request_id,
+                result,
+                error,
+            }) => {
                 let mut pend = pending.lock().await;
                 if let Some(sender) = pend.remove(&request_id) {
                     let _ = if let Some(err) = error {
@@ -302,7 +324,8 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_definition_request() {
-        let socket_path = std::env::temp_dir().join(format!("via-lsp-test-{}.sock", std::process::id()));
+        let socket_path =
+            std::env::temp_dir().join(format!("via-lsp-test-{}.sock", std::process::id()));
         let socket_path_for_sim = socket_path.clone();
 
         let (handle, _listener, _state, _updates) =
@@ -313,7 +336,9 @@ mod tests {
             // Give listener time to start accepting
             tokio::time::sleep(Duration::from_millis(50)).await;
 
-            let stream = UnixStream::connect(&socket_path_for_sim).await.expect("shim connect");
+            let stream = UnixStream::connect(&socket_path_for_sim)
+                .await
+                .expect("shim connect");
             let (reader, mut writer) = stream.into_split();
 
             // Announce a client that supports definition
@@ -332,12 +357,18 @@ mod tests {
                     }
                 }]
             });
-            writer.write_all((serde_json::to_string(&clients_msg).unwrap() + "\n").as_bytes()).await.unwrap();
+            writer
+                .write_all((serde_json::to_string(&clients_msg).unwrap() + "\n").as_bytes())
+                .await
+                .unwrap();
 
             // Read requests and reply to definition ones
             let mut lines = BufReader::new(reader).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if let Ok(LspBridgeMessage::LspRequest { request_id, method, .. }) = serde_json::from_str::<LspBridgeMessage>(&line) {
+                if let Ok(LspBridgeMessage::LspRequest {
+                    request_id, method, ..
+                }) = serde_json::from_str::<LspBridgeMessage>(&line)
+                {
                     if method == "textDocument/definition" {
                         let resp = LspBridgeMessage::LspResponse {
                             request_id,
@@ -355,7 +386,11 @@ mod tests {
         });
 
         // Now call from the Rust side
-        let result = timeout(Duration::from_secs(2), handle.definition("file:///tmp/test.rs", 10, 5)).await;
+        let result = timeout(
+            Duration::from_secs(2),
+            handle.definition("file:///tmp/test.rs", 10, 5),
+        )
+        .await;
 
         assert!(result.is_ok(), "definition call timed out");
         let value = result.unwrap().expect("definition failed");

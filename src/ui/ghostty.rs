@@ -670,7 +670,9 @@ impl WinitGhosttyApp {
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
                         self.events
-                            .try_send(Event::Agent(crate::event::AgentEvent::OutputChunk(text.to_string())));
+                            .try_send(Event::Agent(crate::event::AgentEvent::OutputChunk(
+                                text.to_string(),
+                            )));
                     }
                 }
                 self.dirty |= !chunks.is_empty();

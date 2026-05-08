@@ -8,13 +8,16 @@ use tokio::io::WriteHalf;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
 
-
 type NvimWriter = Compat<WriteHalf<UnixStream>>;
 
 const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
 const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
 
-pub async fn open_file(socket_path: &Path, working_directory: &Path, target: FileTarget) -> Result<()> {
+pub async fn open_file(
+    socket_path: &Path,
+    working_directory: &Path,
+    target: FileTarget,
+) -> Result<()> {
     if !socket_path.exists() {
         bail!(
             "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before using --open.",
@@ -156,7 +159,8 @@ fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
         .line
         .map(|line| line.to_string())
         .unwrap_or_else(|| "nil".to_string());
-    let replacements: [(&str, &str); 2] = [("__PATH__", path.as_str()), ("__LINE__", line.as_str())];
+    let replacements: [(&str, &str); 2] =
+        [("__PATH__", path.as_str()), ("__LINE__", line.as_str())];
 
     lua_command(OPEN_FILE_LUA_TEMPLATE, replacements.as_slice())
 }
@@ -304,9 +308,6 @@ mod tests {
 
     #[test]
     fn escapes_symbol_for_lua_literal() {
-        assert_eq!(
-            lua_string_literal("Foo\"\\\n\t"),
-            "\"Foo\\\"\\\\\\n\\t\""
-        );
+        assert_eq!(lua_string_literal("Foo\"\\\n\t"), "\"Foo\\\"\\\\\\n\\t\"");
     }
 }

@@ -3,9 +3,9 @@ use std::num::NonZeroU32;
 use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
-use libghostty_vt::style::{RgbColor, StyleColor};
+use libghostty_vt::style::RgbColor;
 
-use super::config::{TerminalMetrics, TerminalTheme, color_from_palette};
+use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 
@@ -309,7 +309,15 @@ fn draw_cell(
         return None;
     }
 
-    let (mut fg, mut bg) = cell_colors(cell, &font_renderer.theme, default_fg, default_bg);
+    let style = cell.style().unwrap_or_default();
+    let explicit_bg = cell.bg_color().ok().flatten().map(rgb_color);
+    let mut fg = cell
+        .fg_color()
+        .ok()
+        .flatten()
+        .map(rgb_color)
+        .unwrap_or(default_fg);
+    let mut bg = explicit_bg.unwrap_or(default_bg);
     let cell_width = if raw_cell
         .wide()
         .map(|wide| matches!(wide, CellWide::Wide | CellWide::SpacerHead))
@@ -320,12 +328,20 @@ fn draw_cell(
         metrics.cell_width
     };
 
+    if style.inverse {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+
+    if style.faint {
+        fg = dim_toward(fg, bg);
+    }
+
     if selected {
         fg = SELECTION_FOREGROUND;
         bg = SELECTION_BACKGROUND;
     }
 
-    if bg != default_bg || selected {
+    if explicit_bg.is_some() || selected || style.inverse {
         draw_rect(
             buffer,
             width,
@@ -348,6 +364,10 @@ fn draw_cell(
         return Some(ch);
     }
 
+    if style.invisible {
+        return Some(ch);
+    }
+
     if !try_draw_block_char(
         buffer,
         width,
@@ -359,7 +379,17 @@ fn draw_cell(
         ch,
         fg,
     ) {
-        font_renderer.draw_char(buffer, width, height, x, y, ch, fg);
+        font_renderer.draw_char(
+            buffer,
+            width,
+            height,
+            x,
+            y,
+            ch,
+            fg,
+            style.bold,
+            style.italic,
+        );
     }
     Some(ch)
 }
@@ -751,49 +781,6 @@ fn is_selected_cell(row: usize, col: usize, selection: Option<SelectionRange>) -
     true
 }
 
-fn cell_colors(
-    cell: &CellIteration<'static, '_>,
-    theme: &TerminalTheme,
-    default_fg: u32,
-    default_bg: u32,
-) -> (u32, u32) {
-    let style = cell.style().unwrap_or_default();
-    let mut fg = cell
-        .fg_color()
-        .ok()
-        .flatten()
-        .map(rgb_color)
-        .unwrap_or_else(|| match style.fg_color {
-            StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(default_fg),
-            StyleColor::Rgb(color) => rgb_color(color),
-            StyleColor::None => default_fg,
-        });
-    let mut bg = cell
-        .bg_color()
-        .ok()
-        .flatten()
-        .map(rgb_color)
-        .unwrap_or_else(|| match style.bg_color {
-            StyleColor::Palette(index) => color_from_palette(index, theme).unwrap_or(default_bg),
-            StyleColor::Rgb(color) => rgb_color(color),
-            StyleColor::None => default_bg,
-        });
-
-    if style.inverse {
-        std::mem::swap(&mut fg, &mut bg);
-    }
-
-    if style.bold {
-        fg = brighten(fg);
-    }
-
-    if style.faint {
-        fg = dim(fg);
-    }
-
-    (fg, bg)
-}
-
 fn rgb_color(color: RgbColor) -> u32 {
     rgb(color.r, color.g, color.b)
 }
@@ -802,18 +789,10 @@ fn rgb(r: u8, g: u8, b: u8) -> u32 {
     ((r as u32) << 16) | ((g as u32) << 8) | b as u32
 }
 
-fn brighten(color: u32) -> u32 {
-    let r = (((color >> 16) & 0xff) + 40).min(255);
-    let g = (((color >> 8) & 0xff) + 40).min(255);
-    let b = ((color & 0xff) + 40).min(255);
-
-    (r << 16) | (g << 8) | b
-}
-
-fn dim(color: u32) -> u32 {
-    let r = ((color >> 16) & 0xff) / 2;
-    let g = ((color >> 8) & 0xff) / 2;
-    let b = (color & 0xff) / 2;
+fn dim_toward(color: u32, background: u32) -> u32 {
+    let r = ((((color >> 16) & 0xff) + ((background >> 16) & 0xff)) / 2) & 0xff;
+    let g = ((((color >> 8) & 0xff) + ((background >> 8) & 0xff)) / 2) & 0xff;
+    let b = (((color & 0xff) + (background & 0xff)) / 2) & 0xff;
 
     (r << 16) | (g << 8) | b
 }

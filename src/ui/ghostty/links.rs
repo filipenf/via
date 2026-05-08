@@ -53,20 +53,21 @@ fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenc
         let raw_slice = &chars[start..index];
         let raw_collected: String = raw_slice.iter().collect();
 
-        let (token_start, token_end, token) =
-            if let Some((n_start, n_end, narrowed)) = narrow_call_wrapped_file_path(&raw_collected) {
-                if looks_like_file_reference(&narrowed) {
-                    (n_start, n_end, narrowed)
-                } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
-                    (ts, te, t)
-                } else {
-                    continue;
-                }
+        let (token_start, token_end, token) = if let Some((n_start, n_end, narrowed)) =
+            narrow_call_wrapped_file_path(&raw_collected)
+        {
+            if looks_like_file_reference(&narrowed) {
+                (n_start, n_end, narrowed)
             } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
                 (ts, te, t)
             } else {
                 continue;
-            };
+            }
+        } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
+            (ts, te, t)
+        } else {
+            continue;
+        };
 
         if !looks_like_file_reference(&token) {
             continue;
@@ -619,9 +620,9 @@ fn looks_like_symbol(token: &str) -> bool {
         .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
 
     starts_like_symbol
-        && token.chars().all(|ch| {
-            ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '-' | '#')
-        })
+        && token
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '-' | '#'))
 }
 
 fn is_symbol_char(ch: char) -> bool {
@@ -644,7 +645,8 @@ mod tests {
 
     #[test]
     fn resolves_file_reference_from_row() {
-        let target = reference_target_from_row("open src/main.rs:42", 8, Path::new("/repo")).unwrap();
+        let target =
+            reference_target_from_row("open src/main.rs:42", 8, Path::new("/repo")).unwrap();
 
         assert_eq!(
             target,
@@ -657,21 +659,25 @@ mod tests {
 
     #[test]
     fn resolves_symbol_reference_from_row() {
-        let target = reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
+        let target =
+            reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
 
         assert_eq!(target, ReferenceTarget::Symbol("Foo::bar_baz".to_string()));
     }
 
     #[test]
     fn resolves_symbol_reference_from_uri() {
-        let target = reference_target_from_uri("symbol://Foo%3A%3Abar", Path::new("/repo")).unwrap();
+        let target =
+            reference_target_from_uri("symbol://Foo%3A%3Abar", Path::new("/repo")).unwrap();
 
         assert_eq!(target, ReferenceTarget::Symbol("Foo::bar".to_string()));
     }
 
     #[test]
     fn ignores_non_file_and_non_symbol_uri() {
-        assert!(reference_target_from_uri("https://example.com/Foo::bar", Path::new("/repo")).is_none());
+        assert!(
+            reference_target_from_uri("https://example.com/Foo::bar", Path::new("/repo")).is_none()
+        );
     }
 
     #[test]
@@ -693,7 +699,8 @@ mod tests {
 
     #[test]
     fn parses_file_reference_with_trailing_punctuation() {
-        let target = reference_target_from_row("open src/main.rs:42,", 8, Path::new("/repo")).unwrap();
+        let target =
+            reference_target_from_row("open src/main.rs:42,", 8, Path::new("/repo")).unwrap();
 
         assert_eq!(
             target,

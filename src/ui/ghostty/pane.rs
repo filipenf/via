@@ -1,12 +1,14 @@
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::path::Path;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::RgbColor;
-use libghostty_vt::terminal::{Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions};
 
 use tracing::{debug, warn};
@@ -27,7 +29,7 @@ const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 pub(super) struct TerminalPane {
     pub(super) title: &'static str,
     view: TerminalView,
-    pty: Option<PtySession>,
+    pty: Option<Rc<RefCell<PtySession>>>,
 }
 
 impl TerminalPane {
@@ -59,13 +61,15 @@ impl TerminalPane {
         S: AsRef<std::ffi::OsStr>,
         N: OutputNotifier,
     {
-        self.pty = Some(PtySession::spawn_with_args(
+        let pty = Rc::new(RefCell::new(PtySession::spawn_with_args(
             command,
             args,
             cwd,
             self.view.size,
             output_notifier,
-        )?);
+        )?));
+        self.view.set_pty_response_writer(pty.clone())?;
+        self.pty = Some(pty);
         Ok(())
     }
 
@@ -92,7 +96,7 @@ impl TerminalPane {
 
     pub(super) fn drain_output_chunks(&mut self) -> Vec<Vec<u8>> {
         if let Some(pty) = &self.pty {
-            let output = pty.output().clone();
+            let output = pty.borrow().output().clone();
             return drain_pty_output(&output, &mut self.view);
         }
 
@@ -102,8 +106,8 @@ impl TerminalPane {
     pub(super) fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
         let size = self.view.resize(width, height)?;
 
-        if let Some(pty) = &mut self.pty {
-            if let Err(error) = pty.resize(size) {
+        if let Some(pty) = &self.pty {
+            if let Err(error) = pty.borrow_mut().resize(size) {
                 debug!(pane = self.title, %error, "failed to resize PTY");
             }
         }
@@ -137,8 +141,8 @@ impl TerminalPane {
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        let result = match &mut self.pty {
-            Some(pty) => pty.write_all(bytes),
+        let result = match &self.pty {
+            Some(pty) => pty.borrow_mut().write_all(bytes),
             None => Ok(()),
         };
 
@@ -149,6 +153,7 @@ impl TerminalPane {
                 "terminal pane rejected input; dropping PTY session"
             );
             self.pty = None;
+            self.view.clear_pty_response_writer()?;
         }
 
         Ok(())
@@ -235,6 +240,12 @@ impl TerminalView {
         let _ = self
             .terminal
             .set_default_color_palette(Some(theme.palette.map(rgb_from_u32)));
+        let scheme = if is_light_background(theme.background) {
+            ColorScheme::Light
+        } else {
+            ColorScheme::Dark
+        };
+        let _ = self.terminal.on_color_scheme(move |_term| Some(scheme));
     }
 
     pub(super) fn new(
@@ -291,6 +302,18 @@ impl TerminalView {
 
     fn scroll_viewport(&mut self, delta: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+    }
+
+    fn set_pty_response_writer(&mut self, pty: Rc<RefCell<PtySession>>) -> Result<()> {
+        self.terminal.on_pty_write(move |_term, data| {
+            let _ = pty.borrow_mut().write_all(data);
+        })?;
+        Ok(())
+    }
+
+    fn clear_pty_response_writer(&mut self) -> Result<()> {
+        self.terminal.on_pty_write(|_term, _data| {})?;
+        Ok(())
     }
 
     fn process(&mut self, bytes: &[u8], follow_output: bool) {
@@ -536,7 +559,12 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> Vec<
 
     let elapsed = started_at.elapsed();
     if elapsed > PTY_DRAIN_WARN_THRESHOLD {
-        warn!(?elapsed, chunks = drained_chunks.len(), bytes, "slow PTY drain");
+        warn!(
+            ?elapsed,
+            chunks = drained_chunks.len(),
+            bytes,
+            "slow PTY drain"
+        );
     }
 
     drained_chunks
@@ -558,6 +586,14 @@ fn rgb_from_u32(color: u32) -> RgbColor {
         g: ((color >> 8) & 0xff) as u8,
         b: (color & 0xff) as u8,
     }
+}
+
+fn is_light_background(color: u32) -> bool {
+    let r = (color >> 16) & 0xff;
+    let g = (color >> 8) & 0xff;
+    let b = color & 0xff;
+
+    r * 299 + g * 587 + b * 114 > 127_500
 }
 
 fn terminal_size_for_window(width: usize, height: usize, metrics: TerminalMetrics) -> TerminalSize {

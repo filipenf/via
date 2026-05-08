@@ -112,7 +112,10 @@ impl Mediator {
 
         let lsp_clients_forwarder = tokio::spawn(async move {
             while let Some(clients) = lsp_clients_updates.recv().await {
-                debug!(count = clients.len(), "lsp clients updated (not forwarding to agent stdin)");
+                debug!(
+                    count = clients.len(),
+                    "lsp clients updated (not forwarding to agent stdin)"
+                );
                 drop(clients);
             }
         });
@@ -290,7 +293,9 @@ impl Mediator {
                 AgentToolResponse {
                     id,
                     ok: true,
-                    result: Some(serde_json::to_value(clients).unwrap_or(serde_json::Value::Array(vec![]))),
+                    result: Some(
+                        serde_json::to_value(clients).unwrap_or(serde_json::Value::Array(vec![])),
+                    ),
                     error: None,
                 }
             }
@@ -319,7 +324,10 @@ impl Mediator {
                     }
                 };
 
-                match handle.definition(&args.uri, args.line, args.character).await {
+                match handle
+                    .definition(&args.uri, args.line, args.character)
+                    .await
+                {
                     Ok(result) => AgentToolResponse {
                         id,
                         ok: true,
@@ -446,9 +454,11 @@ mod tests {
         let value = parse_tool_result(&response);
         assert_eq!(value["id"], "2");
         assert_eq!(value["ok"], false);
-        assert!(value["error"]
-            .as_str()
-            .expect("error string")
-            .contains("unsupported tool method"));
+        assert!(
+            value["error"]
+                .as_str()
+                .expect("error string")
+                .contains("unsupported tool method")
+        );
     }
 }
