@@ -50,9 +50,23 @@ fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenc
             continue;
         }
 
-        let Some((token_start, token_end, token)) = trim_file_reference(&chars[start..index]) else {
-            continue;
-        };
+        let raw_slice = &chars[start..index];
+        let raw_collected: String = raw_slice.iter().collect();
+
+        let (token_start, token_end, token) =
+            if let Some((n_start, n_end, narrowed)) = narrow_call_wrapped_file_path(&raw_collected) {
+                if looks_like_file_reference(&narrowed) {
+                    (n_start, n_end, narrowed)
+                } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
+                    (ts, te, t)
+                } else {
+                    continue;
+                }
+            } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
+                (ts, te, t)
+            } else {
+                continue;
+            };
 
         if !looks_like_file_reference(&token) {
             continue;
@@ -518,6 +532,38 @@ fn trim_file_reference(chars: &[char]) -> Option<(usize, usize, String)> {
     Some((start, end, chars[start..end].iter().collect()))
 }
 
+/// If the token looks like `Something(path-like)`, return character offsets and the inner path
+/// string so clicks resolve to the file (e.g. agent output `● Update(src/lsp_bridge.rs)`).
+fn narrow_call_wrapped_file_path(token: &str) -> Option<(usize, usize, String)> {
+    let chars: Vec<char> = token.chars().collect();
+    let open_idx = chars.iter().position(|&c| c == '(')?;
+    let mut depth = 0usize;
+    let mut close_idx: Option<usize> = None;
+
+    for i in open_idx..chars.len() {
+        match chars[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close_idx = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let close_idx = close_idx?;
+    let inner_start = open_idx + 1;
+    if inner_start >= close_idx {
+        return None;
+    }
+
+    let (rel_start, rel_end, path) = trim_file_reference(&chars[inner_start..close_idx])?;
+    Some((inner_start + rel_start, inner_start + rel_end, path))
+}
+
 fn looks_like_file_reference(token: &str) -> bool {
     token.contains('/')
         || token.contains('\\')
@@ -654,6 +700,48 @@ mod tests {
             ReferenceTarget::File(FileTarget {
                 path: PathBuf::from("/repo/src/main.rs"),
                 line: Some(42),
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_file_inside_agent_style_call_wrapped_path() {
+        let row = "● Update(src/lsp_bridge.rs)";
+        let s_col = row
+            .chars()
+            .enumerate()
+            .find(|(_, c)| *c == 's')
+            .map(|(i, _)| i)
+            .expect("path segment");
+
+        let target = reference_target_from_row(row, s_col, Path::new("/repo")).unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/lsp_bridge.rs"),
+                line: None,
+            })
+        );
+    }
+
+    #[test]
+    fn resolves_file_inside_call_wrapped_path_with_line() {
+        let row = "Update(src/lsp_bridge.rs:10)";
+        let s_col = row
+            .chars()
+            .enumerate()
+            .find(|(_, c)| *c == 's')
+            .map(|(i, _)| i)
+            .expect("path segment");
+
+        let target = reference_target_from_row(row, s_col, Path::new("/repo")).unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/lsp_bridge.rs"),
+                line: Some(10),
             })
         );
     }

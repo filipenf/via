@@ -2,7 +2,6 @@
 
 use std::path::PathBuf;
 
-use crate::lsp_bridge;
 
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -30,9 +29,6 @@ pub enum UiCommand {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
-    },
-    LspClientsChanged {
-        clients: Vec<lsp_bridge::LspClientInfo>,
     },
     AgentInput {
         payload: String,

@@ -110,16 +110,10 @@ impl Mediator {
             );
         self.lsp_handle = Some(lsp_handle.clone());
 
-        let ui_commands_for_lsp = self.ui_commands.clone();
         let lsp_clients_forwarder = tokio::spawn(async move {
             while let Some(clients) = lsp_clients_updates.recv().await {
-                if ui_commands_for_lsp
-                    .send(UiCommand::LspClientsChanged { clients })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                debug!(count = clients.len(), "lsp clients updated (not forwarding to agent stdin)");
+                drop(clients);
             }
         });
 

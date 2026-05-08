@@ -8,7 +8,6 @@ use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, info, warn};
 
-use crate::lsp_bridge::LspClientInfo;
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -666,9 +665,6 @@ impl WinitGhosttyApp {
         for (idx, pane) in self.panes.iter_mut().enumerate() {
             if is_agent_pane && idx == 1 {
                 let chunks = pane.drain_output_chunks();
-                if !chunks.is_empty() {
-                    info!(target: "spectre::agent", "agent produced output");
-                }
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
                         self.events
@@ -791,7 +787,7 @@ impl WinitGhosttyApp {
                     let update =
                         format_context_update(&path, line, column, &self.config.working_directory);
 
-                    info!(path = %path.display(), line, column, "forwarding editor context to agent");
+                    debug!(path = %path.display(), line, column, "forwarding editor context to agent");
                     agent_pane.write_all(update.as_bytes())?;
                     self.pending_agent_write = None;
                 }
@@ -810,27 +806,18 @@ impl WinitGhosttyApp {
                         &self.config.working_directory,
                     );
 
-                    info!(path = %path.display(), start_line, end_line, "forwarding visual selection to agent");
+                    debug!(path = %path.display(), start_line, end_line, "forwarding visual selection to agent");
                     agent_pane.write_all(b"\x15")?;
                     self.pending_agent_write = Some(PendingAgentWrite {
                         ready_at: Instant::now() + Duration::from_millis(30),
                         bytes: update.into_bytes(),
                     });
                 }
-                UiCommand::LspClientsChanged { clients } => {
-                    let Some(agent_pane) = self.panes.get_mut(1) else {
-                        continue;
-                    };
-                    let update = format_lsp_clients_update(&clients);
-                    info!(count = clients.len(), "forwarding lsp clients to agent");
-                    agent_pane.write_all(update.as_bytes())?;
-                    self.pending_agent_write = None;
-                }
                 UiCommand::AgentInput { payload } => {
                     let Some(agent_pane) = self.panes.get_mut(1) else {
                         continue;
                     };
-                    info!("forwarding tool response to agent");
+                    debug!("forwarding tool response to agent");
                     agent_pane.write_all(payload.as_bytes())?;
                     self.pending_agent_write = None;
                 }
@@ -1082,13 +1069,6 @@ fn format_selection_update(
     let display_path = path.strip_prefix(working_directory).unwrap_or(path);
 
     format!("@{}:{start_line}-{end_line}", display_path.display())
-}
-
-fn format_lsp_clients_update(clients: &[LspClientInfo]) -> String {
-    match serde_json::to_string(clients) {
-        Ok(payload) => format!("@lsp_clients {payload}\n"),
-        Err(_) => "@lsp_clients []\n".to_string(),
-    }
 }
 
 fn lua_string_literal(path: &Path) -> String {
@@ -1577,27 +1557,6 @@ mod tests {
         assert_eq!(
             format_selection_update(Path::new("/repo/src/main.rs"), 3, 8, Path::new("/repo")),
             "@src/main.rs:3-8"
-        );
-    }
-
-    #[test]
-    fn lsp_clients_update_serializes_payload() {
-        let payload = format_lsp_clients_update(&[LspClientInfo {
-            id: 1,
-            name: "rust-analyzer".to_string(),
-            root: "/repo".to_string(),
-            languages: vec!["rust".to_string()],
-            capabilities_summary: crate::lsp_bridge::CapabilitiesSummary {
-                definition: true,
-                references: true,
-                hover: true,
-                document_symbol: true,
-            },
-        }]);
-
-        assert_eq!(
-            payload,
-            "@lsp_clients [{\"id\":1,\"name\":\"rust-analyzer\",\"root\":\"/repo\",\"languages\":[\"rust\"],\"capabilities_summary\":{\"definition\":true,\"references\":true,\"hover\":true,\"documentSymbol\":true}}]\n"
         );
     }
 

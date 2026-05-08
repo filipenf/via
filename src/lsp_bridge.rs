@@ -136,7 +136,7 @@ pub fn spawn_listener(
     mpsc::Receiver<Vec<LspClientInfo>>,
 ) {
     let (out_tx, out_rx) = mpsc::channel::<OutgoingRequest>(32);
-    let (client_updates_tx, client_updates_rx) = mpsc::channel::<Vec<LspClientInfo>>(8);
+    let (client_updates_tx, client_updates_rx) = mpsc::channel::<Vec<LspClientInfo>>(16);
     let state = Arc::new(Mutex::new(LspBridgeState::default()));
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU64::new(1));
