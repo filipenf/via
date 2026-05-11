@@ -1,5 +1,3 @@
-use std::num::NonZeroU32;
-
 use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
@@ -244,20 +242,6 @@ fn coalesce_damage(damage: &mut Vec<DamageRect>) {
         }
     }
     damage.truncate(write + 1);
-}
-
-pub(super) fn softbuffer_rects(damage: &[DamageRect]) -> Vec<softbuffer::Rect> {
-    damage
-        .iter()
-        .filter_map(|rect| {
-            Some(softbuffer::Rect {
-                x: rect.x.try_into().ok()?,
-                y: rect.y.try_into().ok()?,
-                width: NonZeroU32::new(rect.width.try_into().ok()?)?,
-                height: NonZeroU32::new(rect.height.try_into().ok()?)?,
-            })
-        })
-        .collect()
 }
 
 fn push_damage(

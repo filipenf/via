@@ -37,7 +37,7 @@ use input::{
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use links::ReferenceTarget;
 use pane::TerminalPane;
-use render::{DamageRect, softbuffer_rects};
+use render::DamageRect;
 
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
@@ -331,7 +331,7 @@ impl WinitGhosttyApp {
         }
 
         self.font_renderer = FontRenderer::new(&self.terminal_config)?;
-        self.relayout();
+        self.resize_panes();
         self.dirty = true;
         self.force_redraw = true;
         Ok(())
@@ -371,6 +371,11 @@ impl WinitGhosttyApp {
         self.layout = new_layout;
         self.dirty = true;
         self.force_redraw = true;
+        self.resize_panes();
+    }
+
+    fn resize_panes(&mut self) {
+        let metrics = self.terminal_config.metrics;
 
         for (index, pane) in self.panes.iter_mut().enumerate() {
             let rect = self.layout.pane(index);
@@ -378,7 +383,7 @@ impl WinitGhosttyApp {
                 continue;
             }
 
-            if let Some(size) = pane.resize(rect.width, rect.height) {
+            if let Some(size) = pane.resize_with_metrics(rect.width, rect.height, metrics) {
                 debug!(pane = pane.title, ?size, "resized terminal pane");
             }
         }
@@ -756,16 +761,9 @@ impl WinitGhosttyApp {
             &self.damage,
         );
         window.pre_present_notify();
-        if self.force_redraw {
-            surface_buffer
-                .present()
-                .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
-        } else {
-            let rects = softbuffer_rects(&self.damage);
-            surface_buffer
-                .present_with_damage(&rects)
-                .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
-        }
+        surface_buffer
+            .present()
+            .map_err(|error| anyhow!("failed to present softbuffer frame: {error:?}"))?;
         let render_elapsed = render_started_at.elapsed();
         if render_elapsed > RENDER_WARN_THRESHOLD {
             warn!(
@@ -1127,22 +1125,15 @@ fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: 
 fn copy_damage_to_surface(
     buffer: &[u32],
     surface_buffer: &mut [u32],
-    width: usize,
-    force_redraw: bool,
-    damage: &[DamageRect],
+    _width: usize,
+    _force_redraw: bool,
+    _damage: &[DamageRect],
 ) {
-    if force_redraw || damage.is_empty() {
-        surface_buffer.copy_from_slice(buffer);
-        return;
-    }
-
-    for rect in damage {
-        for y in rect.y..rect.y + rect.height {
-            let start = y * width + rect.x;
-            let end = start + rect.width;
-            surface_buffer[start..end].copy_from_slice(&buffer[start..end]);
-        }
-    }
+    // Softbuffer uses a rotating chain of buffers (double/triple buffering) on Wayland.
+    // Copying only the damage rects leaves the rest of the buffer out-of-sync with
+    // the previous frames. Since we keep a full pristine frame in memory, we must
+    // copy the entire buffer to ensure the presented frame is fully consistent.
+    surface_buffer.copy_from_slice(buffer);
 }
 
 #[cfg(test)]

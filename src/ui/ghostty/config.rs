@@ -8,6 +8,7 @@ pub(super) const DEFAULT_CELL_HEIGHT: usize = 22;
 const DEFAULT_FONT_SIZE_POINTS: f32 = 12.0;
 const DEFAULT_FONT_DPI: f32 = 96.0;
 const DEFAULT_FONT_PIXEL_SIZE: f32 = DEFAULT_FONT_SIZE_POINTS * DEFAULT_FONT_DPI / 72.0;
+const DEFAULT_BASELINE_RATIO: f32 = 0.73;
 
 const BLACK: u32 = 0x0c0c0c;
 const WHITE: u32 = 0xd8d8d8;
@@ -126,18 +127,58 @@ impl TerminalConfig {
     }
 
     pub(super) fn finalize_metrics_for_scale(&mut self, scale_factor: f64) {
-        self.finalize_metrics_for_dpi(DEFAULT_FONT_DPI * scale_factor.max(0.5) as f32);
+        let scale_override = env_f64("VIA_FONT_SCALE");
+        let effective_scale_factor = scale_override.unwrap_or(scale_factor);
+        debug!(
+            reported_scale_factor = scale_factor,
+            scale_override, effective_scale_factor, "terminal font scale finalized"
+        );
+        self.finalize_metrics_for_dpi(DEFAULT_FONT_DPI * effective_scale_factor.max(0.5) as f32);
     }
 
     fn finalize_metrics_for_dpi(&mut self, dpi: f32) {
-        self.font_pixels = points_to_pixels(self.font_size, dpi);
+        let font_pixel_scale = env_f32("VIA_FONT_PIXEL_SCALE").unwrap_or(1.0).max(0.1);
+        let cell_width_scale = env_f32("VIA_CELL_WIDTH_SCALE").unwrap_or(1.0).max(0.1);
+        let cell_height_scale = env_f32("VIA_CELL_HEIGHT_SCALE").unwrap_or(1.0).max(0.1);
+        let baseline_ratio = env_f32("VIA_BASELINE_RATIO")
+            .unwrap_or(DEFAULT_BASELINE_RATIO)
+            .clamp(0.0, 1.0);
+
+        self.font_pixels = points_to_pixels(self.font_size, dpi) * font_pixel_scale;
         let scale = (self.font_pixels / DEFAULT_FONT_PIXEL_SIZE).max(0.5);
-        self.metrics.cell_width =
-            ((DEFAULT_CELL_WIDTH as f32 * scale).round() as usize).max(MIN_CELL_WIDTH);
+        self.metrics.cell_width = ((DEFAULT_CELL_WIDTH as f32 * scale * cell_width_scale).round()
+            as usize)
+            .max(MIN_CELL_WIDTH);
         self.metrics.cell_height =
-            ((DEFAULT_CELL_HEIGHT as f32 * scale).round() as usize).max(MIN_CELL_HEIGHT);
-        self.metrics.baseline = (self.metrics.cell_height as f32 * 0.73).round() as isize;
+            ((DEFAULT_CELL_HEIGHT as f32 * scale * cell_height_scale).round() as usize)
+                .max(MIN_CELL_HEIGHT);
+        self.metrics.baseline = (self.metrics.cell_height as f32 * baseline_ratio).round() as isize;
+
+        debug!(
+            font_points = self.font_size,
+            font_pixels = self.font_pixels,
+            cell_width = self.metrics.cell_width,
+            cell_height = self.metrics.cell_height,
+            baseline = self.metrics.baseline,
+            font_pixel_scale,
+            cell_width_scale,
+            cell_height_scale,
+            baseline_ratio,
+            "terminal font metrics finalized"
+        );
     }
+}
+
+fn env_f32(key: &str) -> Option<f32> {
+    let value = std::env::var(key).ok()?;
+    let parsed = value.parse::<f32>().ok()?;
+    parsed.is_finite().then_some(parsed)
+}
+
+fn env_f64(key: &str) -> Option<f64> {
+    let value = std::env::var(key).ok()?;
+    let parsed = value.parse::<f64>().ok()?;
+    parsed.is_finite().then_some(parsed)
 }
 
 impl Default for TerminalConfig {
