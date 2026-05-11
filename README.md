@@ -31,6 +31,15 @@ Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
 bridge is written to a temp file when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
 if you want to load a custom script from disk during development.
 
+## Detached mode
+
+On linux via detaches to avoid keeping the terminal waiting for it to finish.
+Logs, sockets, and temp files are stored in `/tmp/via-<pid>/`
+
+The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip
+detaching and keep the terminal attached (for example during development), set
+`VIA_FOREGROUND` to any value.
+
 ## Font Rendering Tweaks
 
 via follows the window scale factor reported by winit/Wayland when converting

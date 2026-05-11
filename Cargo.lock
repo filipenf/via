@@ -2480,6 +2480,7 @@ dependencies = [
  "arboard",
  "cosmic-text",
  "crossbeam-channel",
+ "libc",
  "libghostty-vt",
  "nvim-rs",
  "portable-pty",

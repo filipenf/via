@@ -20,3 +20,6 @@ tokio = { version = "1.48.0", features = ["macros", "net", "rt-multi-thread", "s
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
 winit = { version = "0.30", features = ["wayland", "x11"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

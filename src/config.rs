@@ -3,8 +3,18 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 /// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
-/// to a temp path once so Neovim can `luafile` it — same pattern as socket paths under `/tmp`.
+/// to a path under the via runtime directory (see `runtime_base_dir`) so Neovim can `luafile` it.
 static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
+/// Directory for sockets, the context bridge script, and other per-process files.
+///
+/// After a detached start this is `/tmp/via-<pid>/` from `VIA_RUNTIME_ROOT`. Otherwise it matches
+/// [`std::env::temp_dir`] unless overridden per-path via environment variables.
+pub fn runtime_base_dir() -> PathBuf {
+    env::var_os("VIA_RUNTIME_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+}
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -48,18 +58,18 @@ impl Config {
 }
 
 fn default_nvim_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("via-nvim-{}.sock", std::process::id()))
+    runtime_base_dir().join(format!("via-nvim-{}.sock", std::process::id()))
 }
 
 fn default_editor_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("via-editor-{}.sock", std::process::id()))
+    runtime_base_dir().join(format!("via-editor-{}.sock", std::process::id()))
 }
 
 fn default_nvim_context_bridge_path() -> PathBuf {
     EMBEDDED_CONTEXT_BRIDGE_PATH
         .get_or_init(|| {
             let path =
-                env::temp_dir().join(format!("via-context-bridge-{}.lua", std::process::id()));
+                runtime_base_dir().join(format!("via-context-bridge-{}.lua", std::process::id()));
             std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
                 |err| {
                     panic!(
@@ -74,7 +84,7 @@ fn default_nvim_context_bridge_path() -> PathBuf {
 }
 
 fn default_lsp_bridge_socket_path() -> PathBuf {
-    env::temp_dir().join(format!("via-lsp-bridge-{}.sock", std::process::id()))
+    runtime_base_dir().join(format!("via-lsp-bridge-{}.sock", std::process::id()))
 }
 
 #[cfg(test)]

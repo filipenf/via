@@ -9,7 +9,6 @@ use tracing::info;
 
 use super::config::{TerminalConfig, TerminalTheme};
 
-
 pub(super) struct FontRenderer {
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -229,5 +228,3 @@ fn boost_glyph_coverage(bitmap: &mut [u8], factor: f32) {
         *alpha = (alpha_f32 + boost).min(255.0) as u8;
     }
 }
-
-

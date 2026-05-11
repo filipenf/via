@@ -1,3 +1,4 @@
+mod bootstrap;
 mod config;
 mod editor;
 mod event;
@@ -16,8 +17,13 @@ use crate::mediator::Mediator;
 use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
+fn main() -> Result<()> {
+    bootstrap::maybe_detach()?;
+    async_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn async_main() -> Result<()> {
     logging::init();
 
     let config = Config::from_env();
