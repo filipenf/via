@@ -340,6 +340,11 @@ impl WinitGhosttyApp {
     fn resize_terminals(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;
+        self.pane_split_direction = PaneSplitDirection::adjust_for_window_resize(
+            self.pane_split_direction,
+            width,
+            height,
+        );
         if ensure_buffer_size(
             &mut self.buffer,
             width,
@@ -1289,6 +1294,67 @@ mod tests {
         );
         assert_eq!(
             PaneSplitDirection::for_window(100, 100),
+            PaneSplitDirection::Vertical
+        );
+        // Below 20% height excess: treat as square-ish, default to vertical split.
+        assert_eq!(
+            PaneSplitDirection::for_window(100, 119),
+            PaneSplitDirection::Vertical
+        );
+        assert_eq!(
+            PaneSplitDirection::for_window(100, 120),
+            PaneSplitDirection::Horizontal
+        );
+        assert_eq!(
+            PaneSplitDirection::for_window(119, 100),
+            PaneSplitDirection::Vertical
+        );
+        assert_eq!(
+            PaneSplitDirection::for_window(120, 100),
+            PaneSplitDirection::Vertical
+        );
+    }
+
+    #[test]
+    fn split_direction_hysteresis_keeps_mode_until_twenty_percent_margin() {
+        assert_eq!(
+            PaneSplitDirection::adjust_for_window_resize(
+                PaneSplitDirection::Vertical,
+                100,
+                119
+            ),
+            PaneSplitDirection::Vertical
+        );
+        assert_eq!(
+            PaneSplitDirection::adjust_for_window_resize(
+                PaneSplitDirection::Vertical,
+                100,
+                120
+            ),
+            PaneSplitDirection::Horizontal
+        );
+        assert_eq!(
+            PaneSplitDirection::adjust_for_window_resize(
+                PaneSplitDirection::Horizontal,
+                100,
+                120
+            ),
+            PaneSplitDirection::Horizontal
+        );
+        assert_eq!(
+            PaneSplitDirection::adjust_for_window_resize(
+                PaneSplitDirection::Horizontal,
+                100,
+                119
+            ),
+            PaneSplitDirection::Horizontal
+        );
+        assert_eq!(
+            PaneSplitDirection::adjust_for_window_resize(
+                PaneSplitDirection::Horizontal,
+                120,
+                100
+            ),
             PaneSplitDirection::Vertical
         );
     }

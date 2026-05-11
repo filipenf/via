@@ -2,6 +2,11 @@ use super::input::Key;
 
 const SPLIT_GAP: usize = 2;
 
+/// Require one dimension to be at least 20% larger than the other before treating the
+/// window as clearly tall (`height >= width * 6/5`) or clearly wide (`width >= height * 6/5`).
+const SPLIT_ASPECT_NUM: usize = 5;
+const SPLIT_ASPECT_DEN: usize = 6;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct PaneRect {
     pub(super) x: usize,
@@ -23,12 +28,50 @@ pub(super) enum PaneSplitDirection {
     Horizontal,
 }
 
+fn clearly_taller_than_wide(width: usize, height: usize) -> bool {
+    height.saturating_mul(SPLIT_ASPECT_NUM) >= width.saturating_mul(SPLIT_ASPECT_DEN)
+}
+
+fn clearly_wider_than_tall(width: usize, height: usize) -> bool {
+    width.saturating_mul(SPLIT_ASPECT_NUM) >= height.saturating_mul(SPLIT_ASPECT_DEN)
+}
+
 impl PaneSplitDirection {
+    /// Pick split direction for a new window from pixel size (no prior direction).
     pub(super) fn for_window(width: usize, height: usize) -> Self {
-        if height > width {
+        if width == 0 || height == 0 {
+            return Self::Vertical;
+        }
+        if clearly_taller_than_wide(width, height) {
             Self::Horizontal
+        } else if clearly_wider_than_tall(width, height) {
+            Self::Vertical
         } else {
             Self::Vertical
+        }
+    }
+
+    /// Update split direction after a resize, keeping the current mode until the window
+    /// is clearly tall or clearly wide by the same 20% margin.
+    pub(super) fn adjust_for_window_resize(self, width: usize, height: usize) -> Self {
+        if width == 0 || height == 0 {
+            return self;
+        }
+        match self {
+            Self::Horizontal => {
+                if clearly_wider_than_tall(width, height) {
+                    Self::Vertical
+                } else {
+                    Self::Horizontal
+                }
+            }
+            Self::Vertical => {
+                if clearly_taller_than_wide(width, height) {
+                    Self::Horizontal
+                } else {
+                    Self::Vertical
+                }
+            }
         }
     }
 
