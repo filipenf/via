@@ -2,15 +2,13 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use cosmic_text::{
-    Attrs, Buffer, Family, FontSystem, Metrics, Shaping, Style, SwashCache, SwashContent, Weight,
-    fontdb,
+    Attrs, Buffer, Family, FontSystem, Hinting, Metrics, Shaping, Style, SwashCache, SwashContent,
+    Weight, fontdb,
 };
 use tracing::info;
 
 use super::config::{TerminalConfig, TerminalTheme};
 
-const GLYPH_COVERAGE_BOOST_NUMERATOR: u32 = 1;
-const GLYPH_COVERAGE_BOOST_DENOMINATOR: u32 = 5;
 
 pub(super) struct FontRenderer {
     font_system: FontSystem,
@@ -20,6 +18,9 @@ pub(super) struct FontRenderer {
     cell_width: f32,
     line_height: f32,
     baseline: f32,
+    hinting: Hinting,
+    shaping: Shaping,
+    coverage_boost: f32,
     pub(super) theme: TerminalTheme,
     cache: HashMap<GlyphKey, GlyphBitmap>,
 }
@@ -52,6 +53,22 @@ impl FontRenderer {
             info!("using system monospace terminal font");
         }
 
+        let hinting = config.hinting;
+        let shaping = config.shaping;
+        let coverage_boost = config.glyph_coverage_boost;
+
+        info!(
+            font_size = config.font_size,
+            font_pixels = config.font_pixels,
+            cell_width = config.metrics.cell_width,
+            cell_height = config.metrics.cell_height,
+            baseline = config.metrics.baseline,
+            ?hinting,
+            ?shaping,
+            coverage_boost,
+            "terminal font renderer initialized"
+        );
+
         Ok(Self {
             font_system,
             swash_cache: SwashCache::new(),
@@ -60,6 +77,9 @@ impl FontRenderer {
             cell_width: config.metrics.cell_width as f32,
             line_height: config.metrics.cell_height as f32,
             baseline: config.metrics.baseline as f32,
+            hinting,
+            shaping,
+            coverage_boost,
             theme: config.theme.clone(),
             cache: HashMap::new(),
         })
@@ -139,14 +159,15 @@ impl FontRenderer {
         let text = ch.to_string();
         let mut buffer = Buffer::new(&mut self.font_system, metrics);
         let mut buffer = buffer.borrow_with(&mut self.font_system);
+        buffer.set_hinting(self.hinting);
         buffer.set_size(Some(self.cell_width), Some(self.line_height));
-        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
+        buffer.set_text(&text, &attrs, self.shaping, None);
 
         for run in buffer.layout_runs() {
             let Some(glyph) = run.glyphs.first() else {
                 break;
             };
-            let physical = glyph.physical((0.0, self.baseline), 1.0);
+            let physical = glyph.physical((0.0, self.baseline - glyph.y), 1.0);
             let Some(image) = self
                 .swash_cache
                 .get_image_uncached(&mut self.font_system, physical.cache_key)
@@ -160,10 +181,10 @@ impl FontRenderer {
                 SwashContent::Mask => image.data,
                 SwashContent::Color => image.data.chunks_exact(4).map(|rgba| rgba[3]).collect(),
                 SwashContent::SubpixelMask => {
-                    image.data.chunks_exact(3).map(|rgb| rgb[1]).collect()
+                    image.data.chunks_exact(4).map(|rgba| rgba[1]).collect()
                 }
             };
-            boost_glyph_coverage(&mut bitmap);
+            boost_glyph_coverage(&mut bitmap, self.coverage_boost);
 
             return GlyphBitmap {
                 left: physical.x + image.placement.left,
@@ -193,15 +214,20 @@ fn attrs(font_family: Option<&str>, bold: bool, italic: bool) -> Attrs<'_> {
         .style(if italic { Style::Italic } else { Style::Normal })
 }
 
-fn boost_glyph_coverage(bitmap: &mut [u8]) {
+fn boost_glyph_coverage(bitmap: &mut [u8], factor: f32) {
+    if factor <= 0.0 {
+        return;
+    }
+
     for alpha in bitmap {
         if *alpha == 0 || *alpha == 255 {
             continue;
         }
 
-        let alpha_u32 = *alpha as u32;
-        let boost = alpha_u32 * (255 - alpha_u32) * GLYPH_COVERAGE_BOOST_NUMERATOR
-            / (255 * GLYPH_COVERAGE_BOOST_DENOMINATOR);
-        *alpha = (alpha_u32 + boost).min(255) as u8;
+        let alpha_f32 = *alpha as f32;
+        let boost = alpha_f32 * (255.0 - alpha_f32) * factor / 255.0;
+        *alpha = (alpha_f32 + boost).min(255.0) as u8;
     }
 }
+
+

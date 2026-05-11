@@ -103,8 +103,13 @@ impl TerminalPane {
         Vec::new()
     }
 
-    pub(super) fn resize(&mut self, width: usize, height: usize) -> Option<TerminalSize> {
-        let size = self.view.resize(width, height)?;
+    pub(super) fn resize_with_metrics(
+        &mut self,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Option<TerminalSize> {
+        let size = self.view.resize_with_metrics(width, height, metrics)?;
 
         if let Some(pty) = &self.pty {
             if let Err(error) = pty.borrow_mut().resize(size) {
@@ -298,6 +303,16 @@ impl TerminalView {
         self.size = size;
         self.hyperlink_tracker.resize(size);
         Some(size)
+    }
+
+    fn resize_with_metrics(
+        &mut self,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Option<TerminalSize> {
+        self.metrics = metrics;
+        self.resize(width, height)
     }
 
     fn scroll_viewport(&mut self, delta: isize) {

@@ -30,3 +30,29 @@ search path setup is needed.
 Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
 bridge is written to a temp file when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
 if you want to load a custom script from disk during development.
+
+## Font Rendering Tweaks
+
+via follows the window scale factor reported by winit/Wayland when converting
+Ghostty's point-based `font-size` into physical pixels. On fractional-scale
+setups this can differ from the compositor scale you configured, so font output
+can change significantly between displays.
+
+Use these environment variables to test font rendering without code changes:
+
+```sh
+VIA_FONT_SCALE=1.6 cargo run
+VIA_FONT_HINTING=enabled cargo run
+VIA_FONT_COVERAGE_BOOST=0 cargo run
+```
+
+Possible tweaks:
+
+- `VIA_FONT_SCALE`: overrides the reported window scale used for font DPI, e.g. `1.33`, `1.6`, or `2.0`.
+- `VIA_FONT_PIXEL_SCALE`: multiplies the computed glyph pixel size after DPI conversion.
+- `VIA_CELL_WIDTH_SCALE`: multiplies the computed terminal cell width only.
+- `VIA_CELL_HEIGHT_SCALE`: multiplies the computed terminal cell height only.
+- `VIA_BASELINE_RATIO`: controls baseline placement inside each cell. Default: `0.73`.
+- `VIA_FONT_HINTING`: sets cosmic-text metrics hinting. Values: `enabled` or `disabled`.
+- `VIA_FONT_COVERAGE_BOOST`: controls via's glyph coverage boost. Default: `0.2`; use `0` to disable.
+- `VIA_FONT_SHAPING`: selects cosmic-text shaping. Values: `advanced` or `basic`.
