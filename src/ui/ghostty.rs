@@ -753,13 +753,7 @@ impl WinitGhosttyApp {
         let mut surface_buffer = surface
             .buffer_mut()
             .map_err(|error| anyhow!("failed to acquire softbuffer frame: {error:?}"))?;
-        copy_damage_to_surface(
-            &self.buffer,
-            &mut surface_buffer,
-            self.width,
-            self.force_redraw,
-            &self.damage,
-        );
+        copy_damage_to_surface(&self.buffer, &mut surface_buffer);
         window.pre_present_notify();
         surface_buffer
             .present()
@@ -1122,13 +1116,7 @@ fn ensure_buffer_size(buffer: &mut Vec<u32>, width: usize, height: usize, fill: 
     false
 }
 
-fn copy_damage_to_surface(
-    buffer: &[u32],
-    surface_buffer: &mut [u32],
-    _width: usize,
-    _force_redraw: bool,
-    _damage: &[DamageRect],
-) {
+fn copy_damage_to_surface(buffer: &[u32], surface_buffer: &mut [u32]) {
     // Softbuffer uses a rotating chain of buffers (double/triple buffering) on Wayland.
     // Copying only the damage rects leaves the rest of the buffer out-of-sync with
     // the previous frames. Since we keep a full pristine frame in memory, we must

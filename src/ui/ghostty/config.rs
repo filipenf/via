@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use cosmic_text::{Hinting, Shaping};
 use tracing::debug;
 
 pub(super) const DEFAULT_CELL_WIDTH: usize = 10;
@@ -9,6 +10,7 @@ const DEFAULT_FONT_SIZE_POINTS: f32 = 12.0;
 const DEFAULT_FONT_DPI: f32 = 96.0;
 const DEFAULT_FONT_PIXEL_SIZE: f32 = DEFAULT_FONT_SIZE_POINTS * DEFAULT_FONT_DPI / 72.0;
 const DEFAULT_BASELINE_RATIO: f32 = 0.73;
+const DEFAULT_GLYPH_COVERAGE_BOOST: f32 = 0.2;
 
 const BLACK: u32 = 0x0c0c0c;
 const WHITE: u32 = 0xd8d8d8;
@@ -24,6 +26,10 @@ pub(super) struct TerminalConfig {
     pub(super) font_size: f32,
     pub(super) font_pixels: f32,
     pub(super) metrics: TerminalMetrics,
+    pub(super) hinting: Hinting,
+    pub(super) shaping: Shaping,
+    /// Alpha curve tweak for glyph antialiasing; 0 disables.
+    pub(super) glyph_coverage_boost: f32,
     pub(super) theme: TerminalTheme,
 }
 
@@ -154,6 +160,12 @@ impl TerminalConfig {
                 .max(MIN_CELL_HEIGHT);
         self.metrics.baseline = (self.metrics.cell_height as f32 * baseline_ratio).round() as isize;
 
+        self.hinting = env_hinting().unwrap_or(Hinting::Disabled);
+        self.shaping = env_shaping().unwrap_or(Shaping::Advanced);
+        self.glyph_coverage_boost = env_f32("VIA_FONT_COVERAGE_BOOST")
+            .unwrap_or(DEFAULT_GLYPH_COVERAGE_BOOST)
+            .clamp(0.0, 2.0);
+
         debug!(
             font_points = self.font_size,
             font_pixels = self.font_pixels,
@@ -164,18 +176,37 @@ impl TerminalConfig {
             cell_width_scale,
             cell_height_scale,
             baseline_ratio,
+            ?self.hinting,
+            ?self.shaping,
+            glyph_coverage_boost = self.glyph_coverage_boost,
             "terminal font metrics finalized"
         );
     }
 }
 
-fn env_f32(key: &str) -> Option<f32> {
+fn env_hinting() -> Option<Hinting> {
+    match std::env::var("VIA_FONT_HINTING").ok()?.as_str() {
+        "1" | "true" | "on" | "enabled" => Some(Hinting::Enabled),
+        "0" | "false" | "off" | "disabled" => Some(Hinting::Disabled),
+        _ => None,
+    }
+}
+
+fn env_shaping() -> Option<Shaping> {
+    match std::env::var("VIA_FONT_SHAPING").ok()?.as_str() {
+        "advanced" => Some(Shaping::Advanced),
+        "basic" => Some(Shaping::Basic),
+        _ => None,
+    }
+}
+
+pub(super) fn env_f32(key: &str) -> Option<f32> {
     let value = std::env::var(key).ok()?;
     let parsed = value.parse::<f32>().ok()?;
     parsed.is_finite().then_some(parsed)
 }
 
-fn env_f64(key: &str) -> Option<f64> {
+pub(super) fn env_f64(key: &str) -> Option<f64> {
     let value = std::env::var(key).ok()?;
     let parsed = value.parse::<f64>().ok()?;
     parsed.is_finite().then_some(parsed)
@@ -189,6 +220,9 @@ impl Default for TerminalConfig {
             font_size: DEFAULT_FONT_SIZE_POINTS,
             font_pixels: DEFAULT_FONT_PIXEL_SIZE,
             metrics: TerminalMetrics::default(),
+            hinting: Hinting::Disabled,
+            shaping: Shaping::Advanced,
+            glyph_coverage_boost: DEFAULT_GLYPH_COVERAGE_BOOST,
             theme: TerminalTheme::default(),
         }
     }

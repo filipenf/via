@@ -9,7 +9,6 @@ use tracing::info;
 
 use super::config::{TerminalConfig, TerminalTheme};
 
-const DEFAULT_GLYPH_COVERAGE_BOOST: f32 = 0.2;
 
 pub(super) struct FontRenderer {
     font_system: FontSystem,
@@ -54,11 +53,9 @@ impl FontRenderer {
             info!("using system monospace terminal font");
         }
 
-        let hinting = env_hinting().unwrap_or(Hinting::Disabled);
-        let shaping = env_shaping().unwrap_or(Shaping::Advanced);
-        let coverage_boost = env_f32("VIA_FONT_COVERAGE_BOOST")
-            .unwrap_or(DEFAULT_GLYPH_COVERAGE_BOOST)
-            .clamp(0.0, 2.0);
+        let hinting = config.hinting;
+        let shaping = config.shaping;
+        let coverage_boost = config.glyph_coverage_boost;
 
         info!(
             font_size = config.font_size,
@@ -233,24 +230,4 @@ fn boost_glyph_coverage(bitmap: &mut [u8], factor: f32) {
     }
 }
 
-fn env_hinting() -> Option<Hinting> {
-    match std::env::var("VIA_FONT_HINTING").ok()?.as_str() {
-        "1" | "true" | "on" | "enabled" => Some(Hinting::Enabled),
-        "0" | "false" | "off" | "disabled" => Some(Hinting::Disabled),
-        _ => None,
-    }
-}
 
-fn env_shaping() -> Option<Shaping> {
-    match std::env::var("VIA_FONT_SHAPING").ok()?.as_str() {
-        "advanced" => Some(Shaping::Advanced),
-        "basic" => Some(Shaping::Basic),
-        _ => None,
-    }
-}
-
-fn env_f32(key: &str) -> Option<f32> {
-    let value = std::env::var(key).ok()?;
-    let parsed = value.parse::<f32>().ok()?;
-    parsed.is_finite().then_some(parsed)
-}
