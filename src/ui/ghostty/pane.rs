@@ -97,7 +97,11 @@ impl TerminalPane {
     pub(super) fn drain_output_chunks(&mut self) -> Vec<Vec<u8>> {
         if let Some(pty) = &self.pty {
             let output = pty.borrow().output().clone();
-            return drain_pty_output(&output, &mut self.view);
+            return drain_pty_output(&output, &mut self.view, |response| {
+                if let Err(error) = pty.borrow_mut().write_all(response) {
+                    debug!(%error, "failed to write OSC color query response");
+                }
+            });
         }
 
         Vec::new()
@@ -224,11 +228,13 @@ struct TerminalView {
     rows: RowIterator<'static>,
     cells: CellIterator<'static>,
     hyperlink_tracker: Osc8Tracker,
+    color_query_responder: OscColorQueryResponder,
     osc8_enabled: bool,
     selection_anchor: Option<(usize, usize)>,
     selection_focus: Option<(usize, usize)>,
     size: TerminalSize,
     metrics: TerminalMetrics,
+    theme: TerminalTheme,
 }
 
 impl TerminalView {
@@ -251,6 +257,7 @@ impl TerminalView {
             ColorScheme::Dark
         };
         let _ = self.terminal.on_color_scheme(move |_term| Some(scheme));
+        self.theme = theme.clone();
     }
 
     pub(super) fn new(
@@ -276,11 +283,13 @@ impl TerminalView {
             rows,
             cells,
             hyperlink_tracker: Osc8Tracker::new(size),
+            color_query_responder: OscColorQueryResponder::default(),
             osc8_enabled,
             selection_anchor: None,
             selection_focus: None,
             size,
             metrics,
+            theme: TerminalTheme::default(),
         })
     }
 
@@ -556,7 +565,11 @@ impl TerminalView {
     }
 }
 
-fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> Vec<Vec<u8>> {
+fn drain_pty_output(
+    output: &Receiver<Vec<u8>>,
+    view: &mut TerminalView,
+    mut write_response: impl FnMut(&[u8]),
+) -> Vec<Vec<u8>> {
     let started_at = Instant::now();
     let follow_output = view.is_viewport_at_bottom();
     let mut drained_chunks = Vec::new();
@@ -564,6 +577,8 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> Vec<
 
     while let Ok(chunk) = output.try_recv() {
         bytes += chunk.len();
+        view.color_query_responder
+            .process(&chunk, &view.theme, &mut write_response);
         view.process(&chunk, false);
         drained_chunks.push(chunk);
     }
@@ -583,6 +598,129 @@ fn drain_pty_output(output: &Receiver<Vec<u8>>, view: &mut TerminalView) -> Vec<
     }
 
     drained_chunks
+}
+
+#[derive(Default)]
+struct OscColorQueryResponder {
+    state: OscColorQueryState,
+}
+
+#[derive(Default)]
+enum OscColorQueryState {
+    #[default]
+    Ground,
+    Escape,
+    Osc {
+        payload: Vec<u8>,
+        pending_escape: bool,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum OscTerminator {
+    Bell,
+    St,
+}
+
+impl OscColorQueryResponder {
+    fn process(
+        &mut self,
+        bytes: &[u8],
+        theme: &TerminalTheme,
+        mut write_response: impl FnMut(&[u8]),
+    ) {
+        const MAX_OSC_BYTES: usize = 4096;
+
+        for &byte in bytes {
+            match &mut self.state {
+                OscColorQueryState::Ground => {
+                    if byte == b'\x1b' {
+                        self.state = OscColorQueryState::Escape;
+                    }
+                }
+                OscColorQueryState::Escape => {
+                    self.state = if byte == b']' {
+                        OscColorQueryState::Osc {
+                            payload: Vec::new(),
+                            pending_escape: false,
+                        }
+                    } else if byte == b'\x1b' {
+                        OscColorQueryState::Escape
+                    } else {
+                        OscColorQueryState::Ground
+                    };
+                }
+                OscColorQueryState::Osc {
+                    payload,
+                    pending_escape,
+                } => {
+                    if *pending_escape {
+                        *pending_escape = false;
+                        if byte == b'\\' {
+                            if let Some(response) =
+                                osc_color_query_response(payload, OscTerminator::St, theme)
+                            {
+                                write_response(&response);
+                            }
+                            self.state = OscColorQueryState::Ground;
+                            continue;
+                        }
+
+                        payload.push(b'\x1b');
+                    }
+
+                    match byte {
+                        b'\x07' => {
+                            if let Some(response) =
+                                osc_color_query_response(payload, OscTerminator::Bell, theme)
+                            {
+                                write_response(&response);
+                            }
+                            self.state = OscColorQueryState::Ground;
+                        }
+                        b'\x1b' => *pending_escape = true,
+                        _ if payload.len() < MAX_OSC_BYTES => payload.push(byte),
+                        _ => self.state = OscColorQueryState::Ground,
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn osc_color_query_response(
+    payload: &[u8],
+    terminator: OscTerminator,
+    theme: &TerminalTheme,
+) -> Option<Vec<u8>> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    let (target, query) = payload.split_once(';')?;
+    if query != "?" {
+        return None;
+    }
+
+    let color = match target {
+        "10" => theme.foreground,
+        "11" => theme.background,
+        "12" => theme.cursor,
+        _ => return None,
+    };
+
+    let r = ((color >> 16) & 0xff) * 257;
+    let g = ((color >> 8) & 0xff) * 257;
+    let b = (color & 0xff) * 257;
+    let mut response = format!("\x1b]{target};rgb:{r:04x}/{g:04x}/{b:04x}").into_bytes();
+    response.extend_from_slice(terminator.bytes());
+    Some(response)
+}
+
+impl OscTerminator {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Bell => b"\x07",
+            Self::St => b"\x1b\\",
+        }
+    }
 }
 
 fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
@@ -682,6 +820,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn osc_color_query_responder_answers_background_query() {
+        let mut responder = OscColorQueryResponder::default();
+        let theme = test_theme();
+        let mut responses = Vec::new();
+
+        responder.process(b"\x1b]11;?\x07", &theme, |response| {
+            responses.push(response.to_vec());
+        });
+
+        assert_eq!(responses, [b"\x1b]11;rgb:eeee/ffff/dddd\x07".to_vec()]);
+    }
+
+    #[test]
+    fn osc_color_query_responder_handles_split_st_query() {
+        let mut responder = OscColorQueryResponder::default();
+        let theme = test_theme();
+        let mut responses = Vec::new();
+
+        responder.process(b"\x1b]10", &theme, |response| {
+            responses.push(response.to_vec());
+        });
+        responder.process(b";?\x1b\\", &theme, |response| {
+            responses.push(response.to_vec());
+        });
+
+        assert_eq!(responses, [b"\x1b]10;rgb:1111/2222/3333\x1b\\".to_vec()]);
+    }
+
     fn test_view() -> TerminalView {
         test_view_with_size(10, 3)
     }
@@ -703,6 +870,15 @@ mod tests {
     fn write_numbered_lines(view: &mut TerminalView, count: usize) {
         for index in 1..=count {
             view.process(format!("L{index:02}\r\n").as_bytes(), true);
+        }
+    }
+
+    fn test_theme() -> TerminalTheme {
+        TerminalTheme {
+            foreground: 0x112233,
+            background: 0xeeffdd,
+            cursor: 0x445566,
+            palette: [0; 256],
         }
     }
 }

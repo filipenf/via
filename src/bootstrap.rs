@@ -8,6 +8,7 @@
 mod unix {
     use std::env;
     use std::fs::OpenOptions;
+    use std::io::{self, Write};
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
@@ -58,6 +59,8 @@ mod unix {
         let root = PathBuf::from(format!("/tmp/via-{pid}"));
         std::fs::create_dir_all(root.join("logs"))
             .with_context(|| format!("create runtime directory {}", root.display()))?;
+        println!("via runtime directory: {}", root.display());
+        let _ = io::stdout().flush();
 
         let log_path = root.join("logs/via.log");
         let log_file = OpenOptions::new()
