@@ -1,9 +1,13 @@
-use tokio::sync::{mpsc, oneshot};
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
 use serde::{Deserialize, Serialize};
 
+use crate::acp::{self, AcpClient, ContextUpdateParams};
 use crate::config::Config;
 use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
@@ -55,6 +59,10 @@ pub struct Mediator {
     in_flight_symbol_open: Option<JoinHandle<()>>,
     lsp_handle: Option<lsp_bridge::LspBridgeHandle>,
     agent_output_buffer: String,
+    /// ACP client when using the Agent Client Protocol instead of raw PTY.
+    acp_client: Option<Arc<Mutex<AcpClient>>>,
+    /// Current ACP session ID (if ACP is active).
+    acp_session_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -86,7 +94,45 @@ impl Mediator {
             in_flight_symbol_open: None,
             lsp_handle: None,
             agent_output_buffer: String::new(),
+            acp_client: None,
+            acp_session_id: None,
         }
+    }
+
+    /// Connect to an ACP-capable agent.
+    ///
+    /// Spawns the agent process, performs the initialize handshake,
+    /// and creates a new session. After this call, editor context updates
+    /// will be sent via ACP `context/update` instead of raw PTY injection.
+    pub async fn connect_acp(&mut self, command: &str, args: &[&str]) -> Result<String> {
+        let mut client = AcpClient::spawn(command, args).await?;
+        let init = client.initialize().await?;
+        let agent_name = init
+            .agent_info
+            .as_ref()
+            .map(|info| info.name.as_str())
+            .unwrap_or("unknown");
+        let agent_version = init
+            .agent_info
+            .as_ref()
+            .map(|info| info.version.as_str())
+            .unwrap_or("unknown");
+        tracing::info!(
+            agent = agent_name,
+            version = agent_version,
+            protocol_version = init.protocol_version,
+            "ACP agent initialized"
+        );
+
+        let session = client.new_session(&self.config.working_directory).await?;
+        tracing::info!(session_id = %session.session_id, "ACP session created");
+
+        // Start a background task that logs everything the agent sends us
+        client.spawn_reader();
+
+        self.acp_client = Some(Arc::new(Mutex::new(client)));
+        self.acp_session_id = Some(session.session_id.clone());
+        Ok(session.session_id)
     }
 
     pub fn spawn(mut self) -> MediatorHandle {
@@ -201,7 +247,30 @@ impl Mediator {
         debug!(?event, "editor context updated");
         match &event {
             EditorEvent::ActiveBufferChanged { path, line, column } => {
-                if previous_path.as_ref() != Some(path) {
+                if let (Some(client), Some(_session_id)) =
+                    (&self.acp_client, &self.acp_session_id)
+                {
+                    // ACP path: send structured context update
+                    let path = path.clone();
+                    let line = *line;
+                    let column = *column;
+                    let client = Arc::clone(client);
+                    tokio::spawn(async move {
+                        let params = ContextUpdateParams {
+                            active_buffer: Some(acp::BufferContext {
+                                path: path.to_string_lossy().to_string(),
+                                line,
+                                column,
+                            }),
+                            workspace_roots: vec![],
+                        };
+                        let mut guard = client.lock().await;
+                        if let Err(err) = guard.update_context(params).await {
+                            debug!(%err, "failed to send ACP context update");
+                        }
+                    });
+                } else if previous_path.as_ref() != Some(path) {
+                    // Legacy PTY path
                     self.send_ui_command(UiCommand::EditorContextChanged {
                         path: path.clone(),
                         line: *line,
@@ -232,6 +301,21 @@ impl Mediator {
                 }
             }
             EditorEvent::DiagnosticsChanged { .. } => {}
+            EditorEvent::BufferSendRequested {
+                path,
+                start_line,
+                end_line,
+            } => {
+                let display_path = path
+                    .strip_prefix(&self.config.working_directory)
+                    .unwrap_or(path);
+                let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
+                    format!("@{}:{start}-{end}\n", display_path.display())
+                } else {
+                    format!("@{}\n", display_path.display())
+                };
+                self.send_ui_command(UiCommand::AgentInput { payload });
+            }
         }
 
         self.editor_state.apply(event);

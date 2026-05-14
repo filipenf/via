@@ -51,6 +51,11 @@ pub enum EditorEvent {
         start_line: u32,
         end_line: u32,
     },
+    BufferSendRequested {
+        path: PathBuf,
+        start_line: Option<u32>,
+        end_line: Option<u32>,
+    },
 }
 
 #[derive(Debug, Clone)]

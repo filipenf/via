@@ -193,6 +193,34 @@ local function schedule_visual_selection()
   end, 25)
 end
 
+local function send_buffer_to_agent()
+  local path = current_file_path()
+  if not path then
+    return
+  end
+
+  if visual_mode() then
+    local start_line = vim.fn.getpos("v")[2]
+    local cursor_line = vim.api.nvim_win_get_cursor(0)[1]
+    if start_line > cursor_line then
+      start_line, cursor_line = cursor_line, start_line
+    end
+    notify({
+      type = "buffer_send_requested",
+      path = path,
+      start_line = start_line,
+      end_line = cursor_line,
+    })
+  else
+    notify({
+      type = "buffer_send_requested",
+      path = path,
+    })
+  end
+end
+
+vim.api.nvim_create_user_command("ViaBufferSend", send_buffer_to_agent, {})
+
 local function get_client_info(client)
   if not client then return nil end
   local caps = client.server_capabilities or {}
@@ -249,20 +277,14 @@ end
 
 local group = vim.api.nvim_create_augroup("viaContextSync", { clear = true })
 
-vim.api.nvim_create_autocmd({ "BufEnter", "BufFilePost", "CursorMoved", "CursorMovedI" }, {
-  group = group,
-  callback = schedule_active_buffer,
-})
-
+-- Diagnostics are still pushed automatically (useful for the agent to see errors/warnings)
 vim.api.nvim_create_autocmd("DiagnosticChanged", {
   group = group,
   callback = send_diagnostics,
 })
 
-vim.api.nvim_create_autocmd({ "CursorMoved", "ModeChanged" }, {
-  group = group,
-  callback = schedule_visual_selection,
-})
+-- NOTE: Active buffer and visual selection are no longer pushed automatically.
+-- Use :ViaBufferSend (or <leader>ab) to explicitly send the current buffer/selection to the agent.
 
 vim.api.nvim_create_autocmd("LspAttach", {
   group = group,
@@ -283,10 +305,11 @@ vim.api.nvim_create_autocmd("LspDetach", {
   end,
 })
 
+vim.keymap.set({ "n", "v" }, "<leader>ab", "<cmd>ViaBufferSend<cr>", { desc = "Send current buffer or selection to agent" })
+
 vim.schedule(function()
-  send_active_buffer()
+  -- Only send diagnostics on startup; buffer/selection context is now explicit via :ViaBufferSend
   send_diagnostics()
-  send_visual_selection()
   for _, client in ipairs(vim.lsp.get_clients()) do
     clients[client.id] = get_client_info(client)
   end

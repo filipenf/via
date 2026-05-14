@@ -55,6 +55,15 @@ impl Config {
             working_directory,
         }
     }
+
+    /// Returns true if the `VIA_AGENT` command ends with the `acp` subcommand.
+    /// In that case we treat the agent as an ACP-only process (no PTY pane).
+    pub fn is_acp_agent(&self) -> bool {
+        self.agent_command
+            .as_deref()
+            .map(|cmd| cmd.split_whitespace().last() == Some("acp"))
+            .unwrap_or(false)
+    }
 }
 
 fn default_nvim_socket_path() -> PathBuf {

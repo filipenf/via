@@ -68,6 +68,9 @@ impl EditorState {
                     end_line,
                 });
             }
+            EditorEvent::BufferSendRequested { .. } => {
+                // one-shot request, no state to update
+            }
         }
     }
 }
@@ -89,6 +92,13 @@ enum WireEditorEvent {
         path: String,
         start_line: u32,
         end_line: u32,
+    },
+    BufferSendRequested {
+        path: String,
+        #[serde(default)]
+        start_line: Option<u32>,
+        #[serde(default)]
+        end_line: Option<u32>,
     },
 }
 
@@ -193,6 +203,15 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             start_line,
             end_line,
         } => EditorEvent::VisualSelectionChanged {
+            path: resolve_path(&path, working_directory),
+            start_line,
+            end_line,
+        },
+        WireEditorEvent::BufferSendRequested {
+            path,
+            start_line,
+            end_line,
+        } => EditorEvent::BufferSendRequested {
             path: resolve_path(&path, working_directory),
             start_line,
             end_line,
