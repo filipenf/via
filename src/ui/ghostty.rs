@@ -271,20 +271,22 @@ impl WinitGhosttyApp {
             &self.terminal_config.theme,
         )?];
 
-        if let Some(agent_command) = self.config.agent_command.as_deref() {
-            let mut pane = TerminalPane::new(
-                "agent",
-                layout.pane(1).width,
-                layout.pane(1).height,
-                metrics,
-                &self.terminal_config.theme,
-            )?;
-            pane.spawn_shell_command(
-                agent_command,
-                &self.config.working_directory,
-                self.output_notifier.clone(),
-            )?;
-            panes.push(pane);
+        if self.config.agent_command.is_some() && !self.config.is_acp_agent() {
+            if let Some(agent_command) = self.config.agent_command.as_deref() {
+                let mut pane = TerminalPane::new(
+                    "agent",
+                    layout.pane(1).width,
+                    layout.pane(1).height,
+                    metrics,
+                    &self.terminal_config.theme,
+                )?;
+                pane.spawn_shell_command(
+                    agent_command,
+                    &self.config.working_directory,
+                    self.output_notifier.clone(),
+                )?;
+                panes.push(pane);
+            }
         }
 
         Ok(panes)
@@ -1003,7 +1005,11 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 }
 
 fn pane_count(config: &Config) -> usize {
-    if config.agent_command.is_some() { 2 } else { 1 }
+    if config.agent_command.is_some() && !config.is_acp_agent() {
+        2
+    } else {
+        1
+    }
 }
 
 fn is_double_click(

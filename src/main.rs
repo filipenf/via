@@ -1,3 +1,4 @@
+mod acp;
 mod bootstrap;
 mod config;
 mod editor;
@@ -35,7 +36,39 @@ async fn async_main() -> Result<()> {
         return Ok(());
     }
 
-    let mediator = Mediator::new(config.clone());
+    let mut mediator = Mediator::new(config.clone());
+
+    if config.is_acp_agent() {
+        if let Some(cmd) = &config.agent_command {
+            let tokens: Vec<&str> = cmd.split_whitespace().collect();
+            if let [command, args @ ..] = tokens.as_slice() {
+                let command = command.to_string();
+                let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+                let cmd_for_log = cmd.clone();
+
+                // Connect with a timeout so a non-responsive agent doesn't hang startup.
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    mediator.connect_acp(&command, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+                )
+                .await
+                {
+                    Ok(Ok(session_id)) => {
+                        info!(agent = %cmd_for_log, session_id, "ACP agent connected");
+                    }
+                    Ok(Err(err)) => {
+                        tracing::error!(agent = %cmd_for_log, %err, "failed to connect ACP agent");
+                    }
+                    Err(_) => {
+                        tracing::error!(agent = %cmd_for_log, "ACP agent did not respond within timeout");
+                    }
+                }
+            }
+        }
+    } else if let Some(cmd) = &config.agent_command {
+        info!(agent = %cmd, "legacy PTY agent");
+    }
+
     let mut handle = mediator.spawn();
     let ui = GhosttyUi::new(config.clone(), handle.events(), handle.take_ui_commands());
     ui.describe_backend();
