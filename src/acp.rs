@@ -94,10 +94,24 @@ pub struct NewSessionResult {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "camelCase")]
 pub struct PromptParams {
     pub session_id: String,
-    pub text: String,
+    pub prompt: Vec<ContentBlock>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -220,7 +234,7 @@ impl AcpClient {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        tracing::info!(raw = %line, "ACP message from agent");
+                        log_acp_line(&line);
                     }
                 }
                 tracing::debug!("ACP agent stdout closed");
@@ -238,14 +252,38 @@ impl AcpClient {
             .await
     }
 
-    /// Send a prompt to an existing session.
-    pub async fn prompt(&mut self, session_id: &str, text: &str) -> Result<()> {
+    /// Send explicit file context to an existing session.
+    ///
+    /// The stdout reader owns responses after startup, so this sends a JSON-RPC request and lets
+    /// the background reader log the eventual `session/prompt` response.
+    pub async fn prompt_context(
+        &mut self,
+        session_id: &str,
+        path: &Path,
+        display_path: &Path,
+        line_range: Option<(u32, u32)>,
+    ) -> Result<()> {
+        let text = if let Some((start, end)) = line_range {
+            format!(
+                "Use `{}` lines {start}-{end} as context.",
+                display_path.display()
+            )
+        } else {
+            format!("Use `{}` as context.", display_path.display())
+        };
         let params = PromptParams {
             session_id: session_id.to_string(),
-            text: text.to_string(),
+            prompt: vec![
+                ContentBlock::Text { text },
+                ContentBlock::ResourceLink {
+                    uri: format!("file://{}", path.display()),
+                    name: display_path.display().to_string(),
+                    mime_type: None,
+                },
+            ],
         };
 
-        self.send_notification("prompt", serde_json::to_value(params)?)
+        self.send_request_detached("session/prompt", serde_json::to_value(params)?)
             .await
     }
 
@@ -275,6 +313,24 @@ impl AcpClient {
     ) -> Result<()> {
         let msg = JsonRpcMessage::Notification {
             jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params,
+        };
+
+        self.write_message(&msg).await
+    }
+
+    async fn send_request_detached(
+        &mut self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<()> {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let msg = JsonRpcMessage::Request {
+            jsonrpc: "2.0".to_string(),
+            id,
             method: method.to_string(),
             params,
         };
@@ -349,5 +405,120 @@ impl Drop for AcpClient {
     fn drop(&mut self) {
         // Best effort: kill the agent process when we go away
         let _ = self.child.start_kill();
+    }
+}
+
+fn log_acp_line(line: &str) {
+    // Keep raw logs around while ACP support is still being brought up; these are invaluable
+    // when a specific agent sends a shape we do not recognize yet.
+    tracing::info!(raw = %line, "ACP message from agent");
+
+    let Ok(message) = serde_json::from_str::<JsonRpcMessage>(line) else {
+        tracing::warn!(raw = %line, "failed to parse ACP message");
+        return;
+    };
+
+    match message {
+        JsonRpcMessage::Notification { method, params, .. } if method == "session/update" => {
+            log_session_update(params);
+        }
+        JsonRpcMessage::Notification { method, .. } => {
+            tracing::debug!(method, "ACP notification from agent");
+        }
+        JsonRpcMessage::Request { id, method, .. } => {
+            tracing::info!(id, method, "ACP request from agent");
+        }
+        JsonRpcMessage::Response {
+            id, result, error, ..
+        } => {
+            tracing::debug!(id, ?result, ?error, "ACP response from agent");
+        }
+    }
+}
+
+fn log_session_update(params: serde_json::Value) {
+    let session_id = params
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let Some(update) = params.get("update") else {
+        tracing::warn!(session_id, "ACP session/update missing update payload");
+        return;
+    };
+    let kind = update
+        .get("sessionUpdate")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    match kind {
+        "available_commands_update" => {
+            let commands = update
+                .get("availableCommands")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("name").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            tracing::info!(
+                session_id,
+                count = commands.len(),
+                commands = %commands.join(", "),
+                "ACP available commands updated"
+            );
+        }
+        "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
+            let text = update
+                .get("content")
+                .and_then(content_text)
+                .unwrap_or_default();
+            tracing::info!(session_id, kind, text = %text, "ACP message chunk");
+        }
+        "tool_call" => {
+            let tool_call_id = update
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let title = update
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let status = update
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
+        }
+        "tool_call_update" => {
+            let tool_call_id = update
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            let status = update
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            tracing::info!(session_id, tool_call_id, status, "ACP tool call updated");
+        }
+        "plan" => {
+            let count = update
+                .get("entries")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            tracing::info!(session_id, count, "ACP plan updated");
+        }
+        other => {
+            tracing::debug!(session_id, kind = other, "unhandled ACP session update");
+        }
+    }
+}
+
+fn content_text(content: &serde_json::Value) -> Option<&str> {
+    match content.get("type").and_then(serde_json::Value::as_str) {
+        Some("text") => content.get("text").and_then(serde_json::Value::as_str),
+        _ => None,
     }
 }
