@@ -309,12 +309,29 @@ impl Mediator {
                 let display_path = path
                     .strip_prefix(&self.config.working_directory)
                     .unwrap_or(path);
-                let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
-                    format!("@{}:{start}-{end}\n", display_path.display())
+                if let (Some(client), Some(session_id)) = (&self.acp_client, &self.acp_session_id) {
+                    let client = Arc::clone(client);
+                    let path = path.clone();
+                    let display_path = display_path.to_path_buf();
+                    let session_id = session_id.clone();
+                    let line_range = start_line.zip(*end_line);
+                    tokio::spawn(async move {
+                        let mut guard = client.lock().await;
+                        if let Err(err) = guard
+                            .prompt_context(&session_id, &path, &display_path, line_range)
+                            .await
+                        {
+                            debug!(%err, "failed to send ACP context prompt");
+                        }
+                    });
                 } else {
-                    format!("@{}\n", display_path.display())
-                };
-                self.send_ui_command(UiCommand::AgentInput { payload });
+                    let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
+                        format!("@{}:{start}-{end}\n", display_path.display())
+                    } else {
+                        format!("@{}\n", display_path.display())
+                    };
+                    self.send_ui_command(UiCommand::AgentInput { payload });
+                }
             }
         }
 
