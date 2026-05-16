@@ -156,6 +156,11 @@ local function visual_mode()
   return mode == "v" or mode == "V" or mode == "\022"
 end
 
+local function selected_line_text(start_line, end_line)
+  local lines = vim.api.nvim_buf_get_lines(0, start_line - 1, end_line, false)
+  return table.concat(lines, "\n")
+end
+
 local function send_visual_selection()
   if not visual_mode() then
     return
@@ -178,6 +183,7 @@ local function send_visual_selection()
     path = path,
     start_line = start_line,
     end_line = cursor_line,
+    text = selected_line_text(start_line, cursor_line),
   })
 end
 
@@ -283,7 +289,27 @@ vim.api.nvim_create_autocmd("DiagnosticChanged", {
   callback = send_diagnostics,
 })
 
--- NOTE: Active buffer and visual selection are no longer pushed automatically.
+-- Visual selection is tracked as editor state so ACP prompts can embed it, but it
+-- is not pushed to the agent unless the user submits a prompt or uses :ViaBufferSend.
+vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+  group = group,
+  callback = function()
+    if visual_mode() then
+      schedule_visual_selection()
+    end
+  end,
+})
+
+vim.api.nvim_create_autocmd("ModeChanged", {
+  group = group,
+  callback = function()
+    if visual_mode() then
+      schedule_visual_selection()
+    end
+  end,
+})
+
+-- NOTE: Active buffer context is no longer pushed automatically.
 -- Use :ViaBufferSend (or <leader>ab) to explicitly send the current buffer/selection to the agent.
 
 vim.api.nvim_create_autocmd("LspAttach", {

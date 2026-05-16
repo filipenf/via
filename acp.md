@@ -52,7 +52,7 @@ Major editors (Zed, JetBrains) and several agents already implement it. The **AC
 
 ### Current State (May 2026)
 
-We have activated the **ACP-only path** for agents whose command ends with ` acp`:
+We have activated the **ACP-only path** for agents whose command ends with `acp`:
 
 - `VIA_AGENT="opencode acp"` (or `cursor-agent acp`, `claude acp`, etc.) results in a single-pane layout (only Neovim).
 - `via` spawns the agent as a stdio JSON-RPC subprocess.
@@ -65,41 +65,62 @@ The explicit `:ViaBufferSend` mechanism is the single source of truth for inject
 
 ## Next Steps / Future Directions
 
-### Short term (PTY path)
+### Phase 1 (PTY path) (implemented)
 
 - Improve the explicit context mechanism if needed (e.g. better visual-mode handling, status messages, configurable keybinding).
 - Consider adding a small Lua helper that shows "context sent" feedback.
 - Possibly support sending additional context (open buffers list, diagnostics summary, etc.) on explicit request.
 
-### Medium term (ACP exploration)
+### Phase 2 (ACP/PTY hybrid) (in progress)
 
-When we decide to invest in ACP, possible paths include:
+Hybrid mode support: Our goal is to have the best possible user experience,
+supporting different usage types:
 
-1. **Full ACP-only mode**
-   - Remove the PTY pane for the agent entirely.
-   - Build a custom renderer in `via` that displays the agent's streaming thoughts, tool calls, and permission prompts.
-   - This would give us structured context, typed tool calls, and no more prompt-injection hacks.
-   - Trade-off: we lose whatever nice TUI the agent provides.
+- Non-ACP mode for simple PTY/stdin/out coordination between nvim and the agent
+- ACP mode: for agents that support ACP
 
-2. **Parallel control channel**
-   - Keep the PTY/TUI for user interaction.
-   - Spawn a second ACP process (or use a side socket if the agent supports it) purely for context injection and tool results.
-   - Requires agents that can share session state across invocations or expose a control socket.
+ACP mode gives us more control over the agent, but it means we have to implement
+the UI for prompts and responses. On PTY mode, the agent is exposed in a
+separate pane, stdin/out is given directly to the user, but we can inject
+context into it (ie current selection/buffer, etc)
 
-3. **Hybrid detection**
-   - Re-introduce the `is_acp_agent()` check, but this time **keep** the PTY pane and only use ACP for the control-plane messages.
-   - Only useful if we find agents that support both modes.
+Current status:
 
-4. **Expand the minimal ACP client**
-   - Handle streaming `response/chunk` notifications.
-   - Implement tool-call execution and permission flows.
-   - Add support for images, multi-file context blocks, slash commands, etc.
+- PTY mode works by opening a side pane with the agent rendered in it, giving
+  the user direct stdin/stdout and neovim can push context to it - current
+  buffer/selection via (<leader>ab).
+- ACP mode is partially implemented, mediator communicates with it and sends
+  context.
+- ACP mode now has a small read-only UI spike: when `VIA_AGENT` ends with
+  `acp`, via opens a second pane backed by a Ratatui `Buffer` and paints those
+  cells through via's existing native renderer. This is static placeholder
+  content, not live ACP transcript/input yet.
+- ACP Pane is now rendering, user an prompt and get responses back from the
+  agent. UI is pretty basic still, need to match neovim's styling, allow
+  for model selection, diff viewing, etc. When the user sends a message to
+  the agent, we embed the current visual selection
+
+Next steps:
+
+- Match neovim's styling on the ACP pane
+- Improve ACP pane layout
+- Prompt box scaling to multiline with the user input
+- ACP pane scrolling
+- Mode selection (plan/build/etc)
+- Model selection
 
 ### Open questions
 
-- Are there any agents that expose both a rich TUI **and** an ACP/side-channel control interface for the same session?
-- Would a thin wrapper around existing agents (that speaks ACP on one side and drives the real agent on the other) be worth building?
-- How important is it to preserve the exact TUI/UX of the chosen agent vs. building a via-native experience?
+- Library choice: Ratatui is the current direction. The first spike uses
+  Ratatui as an in-process widget/buffer layer and converts Ratatui cells into
+  via's pixel buffer instead of letting Ratatui own stdout/raw terminal state.
+- Alternative architecture: spawning `via --agent-tui` as a subprocess remains
+  viable, especially if the in-process bridge becomes too complex. That path
+  would let Ratatui render normally to a PTY but would require a separate Unix
+  socket IPC protocol between the parent via process and the TUI child.
+- Prompt input: start with custom prompt editing or the small `tui-input` crate
+  for single-line input. `ratatui-textarea` is a better fit only if ACP prompts
+  need multiline editing, selection, undo/redo, or richer editor behavior.
 
 ## References
 

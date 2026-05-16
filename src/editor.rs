@@ -36,6 +36,7 @@ pub struct VisualSelection {
     pub path: PathBuf,
     pub start_line: u32,
     pub end_line: u32,
+    pub text: String,
 }
 
 impl EditorState {
@@ -61,11 +62,13 @@ impl EditorState {
                 path,
                 start_line,
                 end_line,
+                text,
             } => {
                 self.visual_selection = Some(VisualSelection {
                     path,
                     start_line,
                     end_line,
+                    text,
                 });
             }
             EditorEvent::BufferSendRequested { .. } => {
@@ -92,6 +95,8 @@ enum WireEditorEvent {
         path: String,
         start_line: u32,
         end_line: u32,
+        #[serde(default)]
+        text: String,
     },
     BufferSendRequested {
         path: String,
@@ -202,10 +207,12 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             path,
             start_line,
             end_line,
+            text,
         } => EditorEvent::VisualSelectionChanged {
             path: resolve_path(&path, working_directory),
             start_line,
             end_line,
+            text,
         },
         WireEditorEvent::BufferSendRequested {
             path,
@@ -287,6 +294,7 @@ mod tests {
                 path: PathBuf::from("/repo/src/main.rs"),
                 start_line: 3,
                 end_line: 8,
+                text: String::new(),
             }
         );
     }
@@ -309,6 +317,7 @@ mod tests {
             path: PathBuf::from("/repo/src/main.rs"),
             start_line: 3,
             end_line: 8,
+            text: "fn main() {}".to_string(),
         });
 
         assert_eq!(
@@ -332,6 +341,7 @@ mod tests {
                 path: PathBuf::from("/repo/src/main.rs"),
                 start_line: 3,
                 end_line: 8,
+                text: "fn main() {}".to_string(),
             })
         );
     }

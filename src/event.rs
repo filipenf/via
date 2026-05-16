@@ -14,6 +14,7 @@ pub enum Event {
 pub enum UiEvent {
     OpenRequested { path: PathBuf, line: Option<u32> },
     SymbolOpenRequested { symbol: String },
+    AgentPromptSubmitted { text: String },
     Resize { columns: u16, rows: u16 },
 }
 
@@ -31,6 +32,15 @@ pub enum UiCommand {
     },
     AgentInput {
         payload: String,
+    },
+    AcpTranscriptChunk {
+        kind: String,
+        text: String,
+    },
+    AcpProgress {
+        id: String,
+        label: String,
+        active: bool,
     },
 }
 
@@ -50,6 +60,7 @@ pub enum EditorEvent {
         path: PathBuf,
         start_line: u32,
         end_line: u32,
+        text: String,
     },
     BufferSendRequested {
         path: PathBuf,
@@ -61,5 +72,17 @@ pub enum EditorEvent {
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     OutputChunk(String),
-    FileReference { path: PathBuf, line: Option<u32> },
+    FileReference {
+        path: PathBuf,
+        line: Option<u32>,
+    },
+    AcpTranscriptChunk {
+        kind: String,
+        text: String,
+    },
+    AcpProgress {
+        id: String,
+        label: String,
+        active: bool,
+    },
 }
