@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-use crate::event::{AgentEvent, Event};
+use crate::event::{AgentEvent, AcpPermissionOption, Event};
 use crate::mediator::EventSender;
 
 /// Minimal ACP (Agent Client Protocol) client.
@@ -124,7 +124,7 @@ pub struct PromptResource {
 enum JsonRpcMessage {
     Request {
         jsonrpc: String,
-        id: u64,
+        id: serde_json::Value,
         method: String,
         params: serde_json::Value,
     },
@@ -135,7 +135,7 @@ enum JsonRpcMessage {
     },
     Response {
         jsonrpc: String,
-        id: u64,
+        id: serde_json::Value,
         #[serde(default)]
         result: Option<serde_json::Value>,
         #[serde(default)]
@@ -304,14 +304,14 @@ impl AcpClient {
         let id = self.next_id;
         self.next_id += 1;
 
-        let msg = JsonRpcMessage::Request {
-            jsonrpc: "2.0".to_string(),
-            id,
-            method: method.to_string(),
-            params,
-        };
+        let line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
 
-        self.write_message(&msg).await?;
+        self.write_line_json(&line).await?;
         self.read_response(id).await
     }
 
@@ -333,14 +333,43 @@ impl AcpClient {
         let id = self.next_id;
         self.next_id += 1;
 
-        let msg = JsonRpcMessage::Request {
-            jsonrpc: "2.0".to_string(),
-            id,
-            method: method.to_string(),
-            params,
-        };
+        let line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        });
 
-        self.write_message(&msg).await
+        self.write_line_json(&line).await
+    }
+
+    async fn write_line_json(&mut self, value: &serde_json::Value) -> Result<()> {
+        let mut json = serde_json::to_string(value)?;
+        json.push('\n');
+        debug!(json = %json.trim_end(), "writing ACP message to agent stdin");
+        let stdin = self
+            .child
+            .stdin
+            .as_mut()
+            .context("agent stdin unavailable")?;
+        stdin.write_all(json.as_bytes()).await?;
+        stdin.flush().await?;
+        debug!("ACP message flushed to agent");
+        Ok(())
+    }
+
+    /// Reply to a JSON-RPC **request** from the agent (e.g. `session/request_permission`, `cursor/ask_question`).
+    pub async fn send_jsonrpc_result(
+        &mut self,
+        id: serde_json::Value,
+        result: serde_json::Value,
+    ) -> Result<()> {
+        let line = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result,
+        });
+        self.write_line_json(&line).await
     }
 
     async fn write_message(&mut self, msg: &JsonRpcMessage) -> Result<()> {
@@ -383,7 +412,7 @@ impl AcpClient {
                     result,
                     error,
                 } => {
-                    if id == expected_id {
+                    if jsonrpc_id_matches(&id, expected_id) {
                         if let Some(err) = error {
                             anyhow::bail!(
                                 "ACP error {}: {}{}",
@@ -421,6 +450,99 @@ impl Drop for AcpClient {
     }
 }
 
+fn jsonrpc_id_matches(received: &serde_json::Value, expected: u64) -> bool {
+    received.as_u64() == Some(expected)
+        || received.as_i64() == Some(expected as i64)
+        || received.as_str().and_then(|s| s.parse::<u64>().ok()) == Some(expected)
+}
+
+fn parse_permission_request(
+    jsonrpc_id: serde_json::Value,
+    params: serde_json::Value,
+) -> Option<AgentEvent> {
+    let session_id = params
+        .get("sessionId")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let tool_call = params.get("toolCall")?;
+    let tool_call_id = tool_call
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)?
+        .to_string();
+    let title = tool_call
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Permission required")
+        .to_string();
+    let options_arr = params.get("options")?.as_array()?;
+    let mut options = Vec::new();
+    for item in options_arr {
+        let option_id = item.get("optionId").and_then(serde_json::Value::as_str)?;
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(option_id)
+            .to_string();
+        options.push(AcpPermissionOption {
+            option_id: option_id.to_string(),
+            name,
+        });
+    }
+    if options.is_empty() {
+        return None;
+    }
+    Some(AgentEvent::AcpPermissionRequest {
+        jsonrpc_id,
+        session_id,
+        tool_call_id,
+        title,
+        options,
+    })
+}
+
+fn parse_cursor_ask_question(
+    jsonrpc_id: serde_json::Value,
+    params: serde_json::Value,
+) -> Option<AgentEvent> {
+    let title = params
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Question")
+        .to_string();
+    let questions = params.get("questions")?.as_array()?;
+    let q = questions.first()?;
+    let question_id = q.get("id").and_then(serde_json::Value::as_str)?.to_string();
+    let prompt = q
+        .get("prompt")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let opts_arr = q.get("options")?.as_array()?;
+    let mut options = Vec::new();
+    for item in opts_arr {
+        let option_id = item.get("id").and_then(serde_json::Value::as_str)?;
+        let name = item
+            .get("label")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(option_id)
+            .to_string();
+        options.push(AcpPermissionOption {
+            option_id: option_id.to_string(),
+            name,
+        });
+    }
+    if options.is_empty() {
+        return None;
+    }
+    Some(AgentEvent::AcpCursorAskQuestion {
+        jsonrpc_id,
+        title,
+        question_id,
+        prompt,
+        options,
+    })
+}
+
 fn log_acp_line(line: &str) -> Option<AgentEvent> {
     // Keep raw logs around while ACP support is still being brought up; these are invaluable
     // when a specific agent sends a shape we do not recognize yet.
@@ -439,14 +561,23 @@ fn log_acp_line(line: &str) -> Option<AgentEvent> {
             tracing::debug!(method, "ACP notification from agent");
             None
         }
-        JsonRpcMessage::Request { id, method, .. } => {
-            tracing::info!(id, method, "ACP request from agent");
-            None
-        }
+        JsonRpcMessage::Request {
+            id,
+            method,
+            params,
+            ..
+        } => match method.as_str() {
+            "session/request_permission" => parse_permission_request(id, params),
+            "cursor/ask_question" => parse_cursor_ask_question(id, params),
+            _ => {
+                tracing::info!(?id, %method, "ACP request from agent (no handler)");
+                None
+            }
+        },
         JsonRpcMessage::Response {
             id, result, error, ..
         } => {
-            tracing::debug!(id, ?result, ?error, "ACP response from agent");
+            tracing::debug!(?id, ?result, ?error, "ACP response from agent");
             if result
                 .as_ref()
                 .and_then(|result| result.get("stopReason"))

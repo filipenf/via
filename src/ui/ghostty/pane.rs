@@ -194,7 +194,12 @@ impl TerminalPane {
             damage,
         );
         if redrawn || force_redraw {
-            draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
+            let border_color = if active {
+                self.view.theme.palette[12]
+            } else {
+                self.view.theme.palette[8]
+            };
+            draw_pane_border(buffer, buffer_width, buffer_height, rect, border_color);
         }
         redrawn
     }

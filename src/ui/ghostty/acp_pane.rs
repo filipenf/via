@@ -300,7 +300,12 @@ impl AcpPane {
         );
 
         if redrawn || force_redraw {
-            draw_pane_border(buffer, buffer_width, buffer_height, rect, active);
+            let border_color = if active {
+                self.theme.palette[12]
+            } else {
+                self.theme.palette[8]
+            };
+            draw_pane_border(buffer, buffer_width, buffer_height, rect, border_color);
         }
         self.dirty = false;
         redrawn
@@ -318,17 +323,17 @@ impl AcpPane {
         .split(area);
 
         let title_style = Style::default()
-            .fg(Color::Rgb(0x83, 0xa5, 0x98))
+            .fg(Color::Indexed(12))
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(Color::Indexed(8));
         let user_style = Style::default()
-            .fg(Color::Rgb(0xfe, 0x80, 0x19))
+            .fg(Color::Indexed(11))
             .add_modifier(Modifier::BOLD);
         let agent_style = Style::default()
-            .fg(Color::Rgb(0xb8, 0xbb, 0x26))
+            .fg(Color::Indexed(10))
             .add_modifier(Modifier::BOLD);
-        let thought_style = Style::default().fg(Color::Rgb(0x8e, 0xc0, 0x7c));
-        let tool_style = Style::default().fg(Color::Rgb(0xd3, 0x86, 0x9b));
+        let thought_style = Style::default().fg(Color::Indexed(14));
+        let tool_style = Style::default().fg(Color::Indexed(13));
 
         Paragraph::new(vec![Line::from(vec![
             Span::styled("ACP mode", title_style),
@@ -403,7 +408,7 @@ impl AcpPane {
             Layout::horizontal([Constraint::Min(1)]).split(chunks[2])
         };
         Paragraph::new(Line::from(vec![
-            Span::styled("> ", Style::default().fg(Color::Rgb(0x83, 0xa5, 0x98))),
+            Span::styled("> ", Style::default().fg(Color::Indexed(12))),
             prompt_text,
         ]))
         .wrap(Wrap { trim: false })

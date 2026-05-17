@@ -9,8 +9,6 @@ use super::config::TerminalMetrics;
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 
-const ACTIVE_BORDER: u32 = 0x83a598;
-const INACTIVE_BORDER: u32 = 0x3c3836;
 const SELECTION_BACKGROUND: u32 = 0x4f6480;
 const SELECTION_FOREGROUND: u32 = 0xfbf1c7;
 
@@ -35,19 +33,13 @@ pub(super) fn draw_pane_border(
     width: usize,
     height: usize,
     rect: PaneRect,
-    active: bool,
+    border_color: u32,
 ) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
 
-    let color = if active {
-        ACTIVE_BORDER
-    } else {
-        INACTIVE_BORDER
-    };
-
-    draw_rect(buffer, width, height, rect.x, rect.y, rect.width, 1, color);
+    draw_rect(buffer, width, height, rect.x, rect.y, rect.width, 1, border_color);
     draw_rect(
         buffer,
         width,
@@ -56,9 +48,9 @@ pub(super) fn draw_pane_border(
         rect.y + rect.height.saturating_sub(1),
         rect.width,
         1,
-        color,
+        border_color,
     );
-    draw_rect(buffer, width, height, rect.x, rect.y, 1, rect.height, color);
+    draw_rect(buffer, width, height, rect.x, rect.y, 1, rect.height, border_color);
     draw_rect(
         buffer,
         width,
@@ -67,7 +59,7 @@ pub(super) fn draw_pane_border(
         rect.y,
         1,
         rect.height,
-        color,
+        border_color,
     );
 }
 

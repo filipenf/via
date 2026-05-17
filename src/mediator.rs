@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use anyhow::Result;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -11,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
 use crate::config::Config;
 use crate::editor::{self, EditorState};
-use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
+use crate::event::{AgentEvent, AcpModalKind, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim::{self, FileTarget};
 
@@ -68,6 +69,8 @@ pub struct Mediator {
     acp_client: Option<Arc<Mutex<AcpClient>>>,
     /// Current ACP session ID (if ACP is active).
     acp_session_id: Option<String>,
+    /// Tool call id → latest title from `session/update` (for permission UI).
+    acp_tool_titles: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -101,6 +104,7 @@ impl Mediator {
             agent_output_buffer: String::new(),
             acp_client: None,
             acp_session_id: None,
+            acp_tool_titles: HashMap::new(),
         }
     }
 
@@ -273,6 +277,17 @@ impl Mediator {
                         }
                     });
                 }
+                Event::Ui(UiEvent::AcpJsonRpcResult { id, result }) => {
+                    let Some(client) = self.acp_client.clone() else {
+                        continue;
+                    };
+                    tokio::spawn(async move {
+                        let mut guard = client.lock().await;
+                        if let Err(err) = guard.send_jsonrpc_result(id, result).await {
+                            debug!(%err, "failed to send ACP JSON-RPC result to agent");
+                        }
+                    });
+                }
                 Event::Editor(event) => self.apply_editor_event(event),
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
                     self.handle_agent_output(chunk).await;
@@ -281,7 +296,48 @@ impl Mediator {
                     self.send_ui_command(UiCommand::AcpTranscriptChunk { kind, text });
                 }
                 Event::Agent(AgentEvent::AcpProgress { id, label, active }) => {
+                    if active && !label.is_empty() {
+                        self.acp_tool_titles.insert(id.clone(), label.clone());
+                    }
+                    if !active {
+                        self.acp_tool_titles.remove(&id);
+                    }
                     self.send_ui_command(UiCommand::AcpProgress { id, label, active });
+                }
+                Event::Agent(AgentEvent::AcpPermissionRequest {
+                    jsonrpc_id,
+                    session_id,
+                    tool_call_id,
+                    mut title,
+                    options,
+                }) => {
+                    if title == "Permission required" || title.trim().is_empty() {
+                        if let Some(t) = self.acp_tool_titles.get(&tool_call_id) {
+                            title = t.clone();
+                        }
+                    }
+                    self.send_ui_command(UiCommand::AcpModalPrompt {
+                        jsonrpc_id,
+                        title,
+                        message: format!("Session `{session_id}`\nTool call `{tool_call_id}`"),
+                        options,
+                        kind: AcpModalKind::SessionPermission,
+                    });
+                }
+                Event::Agent(AgentEvent::AcpCursorAskQuestion {
+                    jsonrpc_id,
+                    title,
+                    question_id,
+                    prompt,
+                    options,
+                }) => {
+                    self.send_ui_command(UiCommand::AcpModalPrompt {
+                        jsonrpc_id,
+                        title,
+                        message: prompt,
+                        options,
+                        kind: AcpModalKind::CursorAskQuestion { question_id },
+                    });
                 }
                 Event::Agent(event) => debug!(?event, "agent event received"),
                 event => debug!(?event, "mediator event received"),

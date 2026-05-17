@@ -21,6 +21,7 @@ use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 
 mod acp_pane;
+mod acp_modal;
 mod config;
 mod font;
 mod input;
@@ -29,6 +30,7 @@ mod links;
 mod pane;
 mod render;
 
+use acp_modal::{render_acp_modal_buffer, AcpModalState};
 use acp_pane::AcpPane;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
@@ -39,7 +41,7 @@ use input::{
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use links::ReferenceTarget;
 use pane::TerminalPane;
-use render::DamageRect;
+use render::{DamageRect, draw_ratatui_buffer};
 
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
@@ -131,6 +133,7 @@ struct WinitGhosttyApp {
     damage: Vec<DamageRect>,
     panes: Vec<TerminalPane>,
     acp_pane: Option<AcpPane>,
+    acp_modal: Option<AcpModalState>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
@@ -182,6 +185,7 @@ impl WinitGhosttyApp {
             damage: Vec::new(),
             panes: Vec::new(),
             acp_pane: None,
+            acp_modal: None,
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
@@ -413,7 +417,76 @@ impl WinitGhosttyApp {
         }
     }
 
+    fn handle_acp_modal_winit_key(&mut self, event: &KeyEvent) -> bool {
+        let Some(modal) = &mut self.acp_modal else {
+            return false;
+        };
+        if self.modifiers.ctrl || self.modifiers.super_key {
+            return false;
+        }
+        let PhysicalKey::Code(code) = event.physical_key else {
+            return false;
+        };
+        match code {
+            KeyCode::Escape => {
+                let id = modal.jsonrpc_id.clone();
+                let result = modal.result_cancelled();
+                self.acp_modal = None;
+                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                true
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                let id = modal.jsonrpc_id.clone();
+                let result = modal.result_for_selection(modal.focused);
+                self.acp_modal = None;
+                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                true
+            }
+            KeyCode::ArrowUp => {
+                modal.move_focus(-1);
+                true
+            }
+            KeyCode::ArrowDown => {
+                modal.move_focus(1);
+                true
+            }
+            KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_modal_select_digit(0),
+            KeyCode::Digit2 | KeyCode::Numpad2 => self.acp_modal_select_digit(1),
+            KeyCode::Digit3 | KeyCode::Numpad3 => self.acp_modal_select_digit(2),
+            KeyCode::Digit4 | KeyCode::Numpad4 => self.acp_modal_select_digit(3),
+            KeyCode::Digit5 | KeyCode::Numpad5 => self.acp_modal_select_digit(4),
+            KeyCode::Digit6 | KeyCode::Numpad6 => self.acp_modal_select_digit(5),
+            KeyCode::Digit7 | KeyCode::Numpad7 => self.acp_modal_select_digit(6),
+            KeyCode::Digit8 | KeyCode::Numpad8 => self.acp_modal_select_digit(7),
+            KeyCode::Digit9 | KeyCode::Numpad9 => self.acp_modal_select_digit(8),
+            _ => false,
+        }
+    }
+
+    fn acp_modal_select_digit(&mut self, index: usize) -> bool {
+        let Some(modal) = &mut self.acp_modal else {
+            return false;
+        };
+        if index >= modal.options.len() {
+            return false;
+        }
+        let id = modal.jsonrpc_id.clone();
+        let result = modal.result_for_selection(index);
+        self.acp_modal = None;
+        self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+        true
+    }
+
     fn handle_key_event(&mut self, event: KeyEvent) -> Result<()> {
+        if self.acp_modal.is_some()
+            && event.state == ElementState::Pressed
+            && self.handle_acp_modal_winit_key(&event)
+        {
+            self.dirty = true;
+            self.force_redraw = true;
+            return Ok(());
+        }
+
         if event.state != ElementState::Pressed || self.panes.is_empty() {
             return Ok(());
         }
@@ -562,6 +635,9 @@ impl WinitGhosttyApp {
     }
 
     fn handle_text_commit(&mut self, text: &str) -> Result<()> {
+        if self.acp_modal.is_some() {
+            return Ok(());
+        }
         if self.panes.is_empty() {
             return Ok(());
         }
@@ -874,6 +950,34 @@ impl WinitGhosttyApp {
             );
         }
 
+        if let Some(ref modal) = self.acp_modal {
+            let m = self.terminal_config.metrics;
+            let cols = (self.width / m.cell_width).min(u16::MAX as usize) as u16;
+            let rows = (self.height / m.cell_height).min(u16::MAX as usize) as u16;
+            if cols > 0 && rows > 0 {
+                let mb = render_acp_modal_buffer(
+                    modal,
+                    cols,
+                    rows,
+                    self.terminal_config.theme.background,
+                );
+                redrawn |= draw_ratatui_buffer(
+                    &mb,
+                    &mut self.font_renderer,
+                    &mut self.buffer,
+                    self.width,
+                    self.height,
+                    0,
+                    0,
+                    m,
+                    self.terminal_config.theme.foreground,
+                    self.terminal_config.theme.background,
+                    self.force_redraw || self.dirty,
+                    &mut self.damage,
+                );
+            }
+        }
+
         if !redrawn {
             self.dirty = false;
             return Ok(());
@@ -962,6 +1066,21 @@ impl WinitGhosttyApp {
                     };
                     debug!(id, label, active, "forwarding ACP progress update to pane");
                     acp_pane.update_progress(id, label, active);
+                }
+                UiCommand::AcpModalPrompt {
+                    jsonrpc_id,
+                    title,
+                    message,
+                    options,
+                    kind,
+                } => {
+                    self.acp_modal = Some(AcpModalState::new(
+                        jsonrpc_id,
+                        title,
+                        message,
+                        options,
+                        kind,
+                    ));
                 }
             }
         }

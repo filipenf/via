@@ -15,7 +15,26 @@ pub enum UiEvent {
     OpenRequested { path: PathBuf, line: Option<u32> },
     SymbolOpenRequested { symbol: String },
     AgentPromptSubmitted { text: String },
+    /// JSON-RPC response written to the ACP agent stdin (`id` + `result` only).
+    AcpJsonRpcResult {
+        id: serde_json::Value,
+        result: serde_json::Value,
+    },
     Resize { columns: u16, rows: u16 },
+}
+
+/// ACP permission or Cursor ask-question option (`optionId` + display `name` / `label`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcpPermissionOption {
+    pub option_id: String,
+    pub name: String,
+}
+
+/// How to build the JSON-RPC `result` when the user answers the modal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpModalKind {
+    SessionPermission,
+    CursorAskQuestion { question_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +60,14 @@ pub enum UiCommand {
         id: String,
         label: String,
         active: bool,
+    },
+    /// Centered modal: ACP `session/request_permission` or Cursor `cursor/ask_question`.
+    AcpModalPrompt {
+        jsonrpc_id: serde_json::Value,
+        title: String,
+        message: String,
+        options: Vec<AcpPermissionOption>,
+        kind: AcpModalKind,
     },
 }
 
@@ -84,5 +111,21 @@ pub enum AgentEvent {
         id: String,
         label: String,
         active: bool,
+    },
+    /// `session/request_permission` from the agent.
+    AcpPermissionRequest {
+        jsonrpc_id: serde_json::Value,
+        session_id: String,
+        tool_call_id: String,
+        title: String,
+        options: Vec<AcpPermissionOption>,
+    },
+    /// Cursor `cursor/ask_question` blocking request.
+    AcpCursorAskQuestion {
+        jsonrpc_id: serde_json::Value,
+        title: String,
+        question_id: String,
+        prompt: String,
+        options: Vec<AcpPermissionOption>,
     },
 }
