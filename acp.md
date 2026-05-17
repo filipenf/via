@@ -14,7 +14,7 @@ Major editors (Zed, JetBrains) and several agents already implement it. The **AC
 
 ## Current State in via (as of May 2026)
 
-### What we built
+### What works so far
 
 - `src/acp.rs`: A minimal ACP client (`AcpClient`) that can:
   - Spawn an agent subprocess (`opencode acp`, `cursor-agent acp`, etc.)
@@ -24,31 +24,8 @@ Major editors (Zed, JetBrains) and several agents already implement it. The **AC
 - Integration into `Mediator`:
   - `connect_acp(command, args)` method
   - `acp_client` + `acp_session_id` fields
-  - `BufferSendRequested` events are routed through ACP when a client is connected (otherwise fall back to legacy PTY injection)
-- Auto-detection logic in `main.rs` (now removed): if `VIA_AGENT` ends with `acp`, it would call `connect_acp` and skip the PTY agent pane.
-
-### What we discovered
-
-1. **Most major agents support ACP**:
-   - `opencode acp`
-   - `claude acp` / Claude Code (official adapter)
-   - `cursor-agent acp`
-   - Gemini CLI (registry entry)
-   - Crush (PR in review, ~90% complete)
-
-2. **ACP agents are currently "ACP-only"**:
-   - Commands like `opencode acp` speak JSON-RPC on stdio and expect the client to render everything.
-   - They do **not** also provide their normal interactive TUI.
-   - Running them directly hangs (they wait for the first `initialize` message).
-
-3. **The duplicate-file problem**:
-   - The original automatic `BufEnter` + `CursorMoved` context pushing was appending `@path\n` on every navigation.
-   - We removed the automatic pushing entirely.
-   - Context is now **explicit and on-demand** via `:ViaBufferSend` (or `<leader>ab`).
-
-4. **Hybrid PTY + ACP is not trivial today**:
-   - Most agents do not expose both a TUI and a parallel ACP control channel for the same session.
-   - Running two separate invocations (one PTY, one ACP) would create disconnected sessions.
+  - `BufferSendRequested` events are routed through ACP when a client is
+    connected (otherwise fall back to legacy PTY injection)
 
 ### Current State (May 2026)
 
@@ -62,14 +39,6 @@ We have activated the **ACP-only path** for agents whose command ends with `acp`
 - Legacy PTY agents continue to work unchanged (`VIA_AGENT="claude"` etc. still get the two-pane layout and raw PTY injection).
 
 The explicit `:ViaBufferSend` mechanism is the single source of truth for injecting context on both paths.
-
-## Next Steps / Future Directions
-
-### Phase 1 (PTY path) (implemented)
-
-- Improve the explicit context mechanism if needed (e.g. better visual-mode handling, status messages, configurable keybinding).
-- Consider adding a small Lua helper that shows "context sent" feedback.
-- Possibly support sending additional context (open buffers list, diagnostics summary, etc.) on explicit request.
 
 ### Phase 2 (ACP/PTY hybrid) (in progress)
 

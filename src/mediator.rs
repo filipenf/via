@@ -295,7 +295,6 @@ impl Mediator {
             .active_buffer
             .as_ref()
             .map(|buffer| buffer.path.clone());
-        let previous_selection = self.editor_state.visual_selection.clone();
 
         debug!(?event, "editor context updated");
         match &event {
@@ -330,29 +329,7 @@ impl Mediator {
                     });
                 }
             }
-            EditorEvent::VisualSelectionChanged {
-                path,
-                start_line,
-                end_line,
-                text: _,
-            } => {
-                let changed = previous_selection
-                    .as_ref()
-                    .map(|selection| {
-                        selection.path != *path
-                            || selection.start_line != *start_line
-                            || selection.end_line != *end_line
-                    })
-                    .unwrap_or(true);
-
-                if changed && self.acp_client.is_none() {
-                    self.send_ui_command(UiCommand::VisualSelectionChanged {
-                        path: path.clone(),
-                        start_line: *start_line,
-                        end_line: *end_line,
-                    });
-                }
-            }
+            EditorEvent::VisualSelectionChanged { .. } => {}
             EditorEvent::DiagnosticsChanged { .. } => {}
             EditorEvent::BufferSendRequested {
                 path,
