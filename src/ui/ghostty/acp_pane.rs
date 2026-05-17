@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, StatefulWidget, Widget, Wrap};
 use throbber_widgets_tui::{QUADRANT_BLOCK_CRACK, Throbber, ThrobberState};
+use unicode_width::UnicodeWidthChar;
 
 use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
@@ -21,6 +22,10 @@ pub(super) struct AcpPane {
     progress: Option<ProgressState>,
     prompt: String,
     last_submitted: Option<String>,
+    /// Vertical scroll offset in wrapped transcript lines (ratatui `Paragraph::scroll` y).
+    transcript_scroll_y: u16,
+    /// When true, keep the transcript pinned to the newest lines as content grows.
+    transcript_follow_bottom: bool,
     dirty: bool,
 }
 
@@ -70,8 +75,49 @@ impl AcpPane {
             progress: None,
             prompt: String::new(),
             last_submitted: None,
+            transcript_scroll_y: 0,
+            transcript_follow_bottom: true,
             dirty: true,
         }
+    }
+
+    /// Scroll transcript lines. `delta_lines` matches terminal PTY semantics: positive scrolls
+    /// "up" into older content (decreases the top offset), negative moves toward the live bottom.
+    pub(super) fn scroll_transcript(&mut self, delta_lines: isize) -> bool {
+        self.transcript_follow_bottom = false;
+        let next = (self.transcript_scroll_y as i32).saturating_sub(delta_lines as i32);
+        self.transcript_scroll_y = next.clamp(0, i32::from(u16::MAX)) as u16;
+        self.dirty = true;
+        true
+    }
+
+    /// Rows available for the transcript body (ratatui cells), for page-scroll step size.
+    pub(super) fn transcript_viewport_rows(&self) -> u16 {
+        let prompt_h = self.prompt_height_cells();
+        self.size
+            .rows
+            .saturating_sub(3)
+            .saturating_sub(prompt_h)
+            .max(1)
+    }
+
+    fn prompt_height_cells(&self) -> u16 {
+        let content_width = self.size.cols.saturating_sub(8);
+        let display_text = if self.prompt.is_empty() {
+            "Ask the agent..."
+        } else {
+            self.prompt.as_str()
+        };
+        let prefix_width = 2;
+        let wrap_width = content_width.saturating_sub(prefix_width).max(1) as usize;
+        let char_count = display_text.chars().count();
+        let lines_needed = if wrap_width > 0 {
+            (char_count + wrap_width - 1) / wrap_width
+        } else {
+            1
+        };
+        let h = (lines_needed as u16 + 2).max(3);
+        h.min(self.size.rows.saturating_sub(6)).max(3)
     }
 
     pub(super) fn handle_text_input(&mut self, text: &str, modifiers: Modifiers) -> bool {
@@ -99,6 +145,7 @@ impl AcpPane {
                 self.last_submitted = Some(text.clone());
                 self.push_transcript(TranscriptKind::User, text.clone());
                 self.update_progress(TURN_PROGRESS_ID.to_string(), "Thinking".to_string(), true);
+                self.transcript_follow_bottom = true;
                 self.dirty = true;
                 Some(text)
             }
@@ -235,15 +282,7 @@ impl AcpPane {
         }
 
         let mut ratatui_buffer = Buffer::empty(Rect::new(0, 0, self.size.cols, self.size.rows));
-        render_static_spike(
-            &mut ratatui_buffer,
-            self.size,
-            &self.theme,
-            &self.transcript,
-            self.progress.as_mut(),
-            &self.prompt,
-            self.last_submitted.as_deref(),
-        );
+        self.render_into_buffer(&mut ratatui_buffer);
 
         let redrawn = draw_ratatui_buffer(
             &ratatui_buffer,
@@ -266,127 +305,161 @@ impl AcpPane {
         self.dirty = false;
         redrawn
     }
-}
 
-fn render_static_spike(
-    buffer: &mut Buffer,
-    size: RatatuiPaneSize,
-    theme: &TerminalTheme,
-    transcript_entries: &[TranscriptEntry],
-    progress: Option<&mut ProgressState>,
-    prompt: &str,
-    last_submitted: Option<&str>,
-) {
-    let area = Rect::new(0, 0, size.cols, size.rows);
-    let prompt_height = {
-        // Use conservative width (account for possible progress sidebar)
-        let content_width = size.cols.saturating_sub(8);
-        let display_text = if prompt.is_empty() {
-            "Ask the agent..."
+    fn render_into_buffer(&mut self, buffer: &mut Buffer) {
+        let size = self.size;
+        let area = Rect::new(0, 0, size.cols, size.rows);
+        let prompt_height = self.prompt_height_cells();
+        let chunks = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(prompt_height),
+        ])
+        .split(area);
+
+        let title_style = Style::default()
+            .fg(Color::Rgb(0x83, 0xa5, 0x98))
+            .add_modifier(Modifier::BOLD);
+        let muted_style = Style::default().fg(Color::Indexed(8));
+        let user_style = Style::default()
+            .fg(Color::Rgb(0xfe, 0x80, 0x19))
+            .add_modifier(Modifier::BOLD);
+        let agent_style = Style::default()
+            .fg(Color::Rgb(0xb8, 0xbb, 0x26))
+            .add_modifier(Modifier::BOLD);
+        let thought_style = Style::default().fg(Color::Rgb(0x8e, 0xc0, 0x7c));
+        let tool_style = Style::default().fg(Color::Rgb(0xd3, 0x86, 0x9b));
+
+        Paragraph::new(vec![Line::from(vec![
+            Span::styled("ACP mode", title_style),
+            Span::raw("  "),
+        ])])
+        .block(Block::default().borders(Borders::BOTTOM))
+        .render(chunks[0], buffer);
+
+        let mut transcript = Vec::new();
+        if self.transcript.is_empty() {
+            transcript.push(Line::from(Span::styled(
+                "Type in the prompt area and press Enter to submit.",
+                muted_style,
+            )));
         } else {
-            prompt
-        };
-        let prefix_width = 2; // "> "
-        let wrap_width = content_width.saturating_sub(prefix_width).max(1) as usize;
-        let char_count = display_text.len();
-        let lines_needed = if wrap_width > 0 {
-            (char_count + wrap_width - 1) / wrap_width
+            for entry in &self.transcript {
+                let (label, style) = match entry.kind {
+                    TranscriptKind::User => ("You", user_style),
+                    TranscriptKind::Agent => ("Agent", agent_style),
+                    TranscriptKind::Thought => ("Thought", thought_style),
+                    TranscriptKind::Tool => ("Tool", tool_style),
+                    TranscriptKind::System => ("System", muted_style),
+                };
+                transcript.push(Line::from(vec![
+                    Span::styled(label, style),
+                    Span::raw(format!(": {}", entry.text)),
+                ]));
+                transcript.push(Line::from(""));
+            }
+        }
+        if let Some(text) = self.last_submitted.as_deref() {
+            transcript.push(Line::from(Span::styled(
+                format!("Last prompt: {text}"),
+                muted_style,
+            )));
+        }
+
+        let transcript_width = chunks[1].width.max(1);
+        let transcript_visible = chunks[1].height as usize;
+        let total_rows = transcript_wrapped_rows(&transcript, transcript_width);
+        let max_scroll = total_rows
+            .saturating_sub(transcript_visible)
+            .min(usize::from(u16::MAX)) as u16;
+
+        let scroll_y = if self.transcript_follow_bottom {
+            max_scroll
         } else {
-            1
+            self.transcript_scroll_y.min(max_scroll)
         };
-        let h = (lines_needed as u16 + 2).max(3);
-        h.min(size.rows.saturating_sub(6)).max(3)
-    };
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(3),
-        Constraint::Length(prompt_height),
-    ])
-    .split(area);
+        self.transcript_scroll_y = scroll_y;
+        if scroll_y >= max_scroll {
+            self.transcript_follow_bottom = true;
+        }
 
-    let title_style = Style::default()
-        .fg(Color::Rgb(0x83, 0xa5, 0x98))
-        .add_modifier(Modifier::BOLD);
-    let muted_style = Style::default().fg(Color::Indexed(8));
-    let user_style = Style::default()
-        .fg(Color::Rgb(0xfe, 0x80, 0x19))
-        .add_modifier(Modifier::BOLD);
-    let agent_style = Style::default()
-        .fg(Color::Rgb(0xb8, 0xbb, 0x26))
-        .add_modifier(Modifier::BOLD);
-    let thought_style = Style::default().fg(Color::Rgb(0x8e, 0xc0, 0x7c));
-    let tool_style = Style::default().fg(Color::Rgb(0xd3, 0x86, 0x9b));
+        Paragraph::new(transcript)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0))
+            .block(Block::default().borders(Borders::NONE))
+            .render(chunks[1], buffer);
 
-    Paragraph::new(vec![Line::from(vec![
-        Span::styled("ACP mode", title_style),
-        Span::raw("  "),
-    ])])
-    .block(Block::default().borders(Borders::BOTTOM))
-    .render(chunks[0], buffer);
+        let prompt_text = if self.prompt.is_empty() {
+            Span::styled("Ask the agent...", muted_style)
+        } else {
+            Span::raw(self.prompt.as_str())
+        };
+        let show_progress = self.progress.is_some() && chunks[2].width >= 10;
+        let prompt_chunks = if show_progress {
+            Layout::horizontal([Constraint::Min(1), Constraint::Length(3)])
+                .spacing(1)
+                .split(chunks[2])
+        } else {
+            Layout::horizontal([Constraint::Min(1)]).split(chunks[2])
+        };
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Rgb(0x83, 0xa5, 0x98))),
+            prompt_text,
+        ]))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(Color::Rgb(
+            ((self.theme.background >> 16) & 0xff) as u8,
+            ((self.theme.background >> 8) & 0xff) as u8,
+            (self.theme.background & 0xff) as u8,
+        )))
+        .block(Block::default().borders(Borders::ALL).title("Prompt"))
+        .render(prompt_chunks[0], buffer);
 
-    let mut transcript = Vec::new();
-    if transcript_entries.is_empty() {
-        transcript.push(Line::from(Span::styled(
-            "Type in the prompt area and press Enter to submit.",
-            muted_style,
-        )));
-    } else {
-        for entry in transcript_entries {
-            let (label, style) = match entry.kind {
-                TranscriptKind::User => ("You", user_style),
-                TranscriptKind::Agent => ("Agent", agent_style),
-                TranscriptKind::Thought => ("Thought", thought_style),
-                TranscriptKind::Tool => ("Tool", tool_style),
-                TranscriptKind::System => ("System", muted_style),
-            };
-            transcript.push(Line::from(vec![
-                Span::styled(label, style),
-                Span::raw(format!(": {}", entry.text)),
-            ]));
-            transcript.push(Line::from(""));
+        if show_progress {
+            let progress = self
+                .progress
+                .as_mut()
+                .expect("progress is present when show_progress is true");
+            render_progress(buffer, prompt_chunks[1], progress, title_style);
         }
     }
-    if let Some(text) = last_submitted {
-        transcript.push(Line::from(Span::styled(
-            format!("Last prompt: {text}"),
-            muted_style,
-        )));
-    }
-    Paragraph::new(transcript)
-        .wrap(Wrap { trim: false })
-        .block(Block::default().borders(Borders::NONE))
-        .render(chunks[1], buffer);
+}
 
-    let prompt_text = if prompt.is_empty() {
-        Span::styled("Ask the agent...", muted_style)
-    } else {
-        Span::raw(prompt)
-    };
-    let show_progress = progress.is_some() && chunks[2].width >= 10;
-    let prompt_chunks = if show_progress {
-        Layout::horizontal([Constraint::Min(1), Constraint::Length(3)])
-            .spacing(1)
-            .split(chunks[2])
-    } else {
-        Layout::horizontal([Constraint::Min(1)]).split(chunks[2])
-    };
-    Paragraph::new(Line::from(vec![
-        Span::styled("> ", Style::default().fg(Color::Rgb(0x83, 0xa5, 0x98))),
-        prompt_text,
-    ]))
-    .wrap(Wrap { trim: false })
-    .style(Style::default().bg(Color::Rgb(
-        ((theme.background >> 16) & 0xff) as u8,
-        ((theme.background >> 8) & 0xff) as u8,
-        (theme.background & 0xff) as u8,
-    )))
-    .block(Block::default().borders(Borders::ALL).title("Prompt"))
-    .render(prompt_chunks[0], buffer);
-
-    if show_progress {
-        let progress = progress.expect("progress is present when show_progress is true");
-        render_progress(buffer, prompt_chunks[1], progress, title_style);
+fn estimate_wrapped_line_rows(line: &Line, width: usize) -> usize {
+    if width < 1 {
+        return 1;
     }
+    let mut row_width = 0usize;
+    let mut rows = 1usize;
+    let mut has_content = false;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            has_content = true;
+            let mut cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cw == 0 {
+                cw = 1;
+            }
+            if row_width + cw > width {
+                rows += 1;
+                row_width = cw;
+            } else {
+                row_width += cw;
+            }
+        }
+    }
+    if has_content {
+        rows
+    } else {
+        1
+    }
+}
+
+fn transcript_wrapped_rows(lines: &[Line], width: u16) -> usize {
+    let w = width.max(1) as usize;
+    lines
+        .iter()
+        .map(|line| estimate_wrapped_line_rows(line, w))
+        .sum()
 }
 
 fn render_progress(

@@ -68,15 +68,16 @@ Current status:
   agent. UI is pretty basic still, need to match neovim's styling, allow
   for model selection, diff viewing, etc. When the user sends a message to
   the agent, we embed the current visual selection
+- Prompt box scaling to multiline with the user input
+- ACP pane scrolling
 
 Next steps:
 
 - Match neovim's styling on the ACP pane
 - Improve ACP pane layout
-- Prompt box scaling to multiline with the user input
-- ACP pane scrolling
 - Mode selection (plan/build/etc)
 - Model selection
+- Tool request handling
 
 ### Open questions
 
@@ -99,4 +100,4 @@ Next steps:
 
 ---
 
-*This document was created after the initial ACP spike and the decision to remain PTY-first with explicit context injection.*
+_This document was created after the initial ACP spike and the decision to remain PTY-first with explicit context injection._

@@ -456,6 +456,28 @@ impl WinitGhosttyApp {
             self.dirty = true;
         }
         if self.active_pane >= self.panes.len() {
+            if !layout_shortcut_consumed && self.modifiers.shift {
+                if let Some(acp_pane) = &mut self.acp_pane {
+                    let step = acp_pane.transcript_viewport_rows().max(1) as isize;
+                    for key in pressed_keys.iter().copied() {
+                        match key {
+                            Key::PageUp => {
+                                acp_pane.scroll_transcript(step);
+                                self.dirty = true;
+                                self.force_redraw = true;
+                                return Ok(());
+                            }
+                            Key::PageDown => {
+                                acp_pane.scroll_transcript(-step);
+                                self.dirty = true;
+                                self.force_redraw = true;
+                                return Ok(());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             self.handle_acp_key_event(key, event.text.as_deref(), layout_shortcut_consumed);
             return Ok(());
         }
@@ -569,6 +591,28 @@ impl WinitGhosttyApp {
             MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
             MouseScrollDelta::PixelDelta(position) => (position.x as f32, position.y as f32),
         };
+
+        if let Some(acp_pane) = &mut self.acp_pane {
+            if let Some((x, y)) = self.cursor_position {
+                if let Some((pane_index, _)) = self.layout.pane_at(x, y) {
+                    if pane_index == 1 {
+                        let (sx, sy) = scroll_delta;
+                        let sy = sy + sx;
+                        if sy.abs() > 1e-4 {
+                            let scaled = -sy / 40.0;
+                            let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
+                            if delta_y == 0 {
+                                delta_y = -sy.signum() as isize;
+                            }
+                            acp_pane.scroll_transcript(delta_y);
+                            self.dirty = true;
+                            self.force_redraw = true;
+                        }
+                        return;
+                    }
+                }
+            }
+        }
 
         let scrolled = forward_mouse_scroll(
             scroll_delta,
