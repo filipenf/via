@@ -278,10 +278,29 @@ fn render_static_spike(
     last_submitted: Option<&str>,
 ) {
     let area = Rect::new(0, 0, size.cols, size.rows);
+    let prompt_height = {
+        // Use conservative width (account for possible progress sidebar)
+        let content_width = size.cols.saturating_sub(8);
+        let display_text = if prompt.is_empty() {
+            "Ask the agent..."
+        } else {
+            prompt
+        };
+        let prefix_width = 2; // "> "
+        let wrap_width = content_width.saturating_sub(prefix_width).max(1) as usize;
+        let char_count = display_text.len();
+        let lines_needed = if wrap_width > 0 {
+            (char_count + wrap_width - 1) / wrap_width
+        } else {
+            1
+        };
+        let h = (lines_needed as u16 + 2).max(3);
+        h.min(size.rows.saturating_sub(6)).max(3)
+    };
     let chunks = Layout::vertical([
         Constraint::Length(3),
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(prompt_height),
     ])
     .split(area);
 
@@ -355,6 +374,7 @@ fn render_static_spike(
         Span::styled("> ", Style::default().fg(Color::Rgb(0x83, 0xa5, 0x98))),
         prompt_text,
     ]))
+    .wrap(Wrap { trim: false })
     .style(Style::default().bg(Color::Rgb(
         ((theme.background >> 16) & 0xff) as u8,
         ((theme.background >> 8) & 0xff) as u8,
