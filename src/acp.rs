@@ -6,6 +6,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
+use crate::event::{AgentEvent, Event};
+use crate::mediator::EventSender;
+
 /// Minimal ACP (Agent Client Protocol) client.
 ///
 /// This implements a lightweight JSON-RPC 2.0 client that speaks the
@@ -103,15 +106,17 @@ pub struct PromptParams {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text {
-        text: String,
-    },
-    ResourceLink {
-        uri: String,
-        name: String,
-        #[serde(rename = "mimeType", skip_serializing_if = "Option::is_none")]
-        mime_type: Option<String>,
-    },
+    Text { text: String },
+    Resource { resource: PromptResource },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptResource {
+    pub uri: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    pub text: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,10 +180,7 @@ impl AcpClient {
         }
 
         debug!(command, "ACP agent process started");
-        Ok(Self {
-            child,
-            next_id: 1,
-        })
+        Ok(Self { child, next_id: 1 })
     }
 
     /// Perform the ACP initialize handshake.
@@ -227,14 +229,16 @@ impl AcpClient {
     ///
     /// This is the simplest way to observe streaming responses and
     /// notifications while we build proper rendering.
-    pub fn spawn_reader(&mut self) {
+    pub fn spawn_reader(&mut self, events: EventSender) {
         if let Some(stdout) = self.child.stdout.take() {
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        log_acp_line(&line);
+                        if let Some(event) = log_acp_line(&line) {
+                            events.send(Event::Agent(event)).await;
+                        }
                     }
                 }
                 tracing::debug!("ACP agent stdout closed");
@@ -252,10 +256,29 @@ impl AcpClient {
             .await
     }
 
-    /// Send explicit file context to an existing session.
-    ///
-    /// The stdout reader owns responses after startup, so this sends a JSON-RPC request and lets
-    /// the background reader log the eventual `session/prompt` response.
+    /// Send a prompt to an existing session.
+    pub async fn prompt(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        resource: Option<PromptResource>,
+    ) -> Result<()> {
+        let mut prompt = vec![ContentBlock::Text {
+            text: text.to_string(),
+        }];
+        if let Some(resource) = resource {
+            prompt.push(ContentBlock::Resource { resource });
+        }
+
+        let params = PromptParams {
+            session_id: session_id.to_string(),
+            prompt,
+        };
+
+        self.send_request_detached("session/prompt", serde_json::to_value(params)?)
+            .await
+    }
+
     pub async fn prompt_context(
         &mut self,
         session_id: &str,
@@ -263,28 +286,14 @@ impl AcpClient {
         display_path: &Path,
         line_range: Option<(u32, u32)>,
     ) -> Result<()> {
-        let text = if let Some((start, end)) = line_range {
-            format!(
-                "Use `{}` lines {start}-{end} as context.",
-                display_path.display()
-            )
-        } else {
-            format!("Use `{}` as context.", display_path.display())
-        };
-        let params = PromptParams {
-            session_id: session_id.to_string(),
-            prompt: vec![
-                ContentBlock::Text { text },
-                ContentBlock::ResourceLink {
-                    uri: format!("file://{}", path.display()),
-                    name: display_path.display().to_string(),
-                    mime_type: None,
-                },
-            ],
-        };
+        let mut prompt_text = format!("Use `{}` as context.", display_path.display());
+        let resource = selected_file_resource(path, line_range).await?;
 
-        self.send_request_detached("session/prompt", serde_json::to_value(params)?)
-            .await
+        if let Some((start, end)) = line_range {
+            prompt_text = format!("Use `{}:{start}-{end}` as context.", display_path.display());
+        }
+
+        self.prompt(session_id, &prompt_text, resource).await
     }
 
     async fn send_request(
@@ -306,11 +315,7 @@ impl AcpClient {
         self.read_response(id).await
     }
 
-    async fn send_notification(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<()> {
+    async fn send_notification(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
         let msg = JsonRpcMessage::Notification {
             jsonrpc: "2.0".to_string(),
             method: method.to_string(),
@@ -341,7 +346,11 @@ impl AcpClient {
     async fn write_message(&mut self, msg: &JsonRpcMessage) -> Result<()> {
         let json = serde_json::to_string(msg)?;
         debug!(json = %json, "writing ACP message to agent stdin");
-        let stdin = self.child.stdin.as_mut().context("agent stdin unavailable")?;
+        let stdin = self
+            .child
+            .stdin
+            .as_mut()
+            .context("agent stdin unavailable")?;
         stdin.write_all(json.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
@@ -351,7 +360,11 @@ impl AcpClient {
 
     async fn read_response(&mut self, expected_id: u64) -> Result<serde_json::Value> {
         debug!(expected_id, "waiting for ACP response");
-        let stdout = self.child.stdout.as_mut().context("agent stdout unavailable")?;
+        let stdout = self
+            .child
+            .stdout
+            .as_mut()
+            .context("agent stdout unavailable")?;
         let reader = BufReader::new(stdout);
         let mut lines = reader.lines();
 
@@ -408,42 +421,58 @@ impl Drop for AcpClient {
     }
 }
 
-fn log_acp_line(line: &str) {
+fn log_acp_line(line: &str) -> Option<AgentEvent> {
     // Keep raw logs around while ACP support is still being brought up; these are invaluable
     // when a specific agent sends a shape we do not recognize yet.
     tracing::info!(raw = %line, "ACP message from agent");
 
     let Ok(message) = serde_json::from_str::<JsonRpcMessage>(line) else {
         tracing::warn!(raw = %line, "failed to parse ACP message");
-        return;
+        return None;
     };
 
     match message {
         JsonRpcMessage::Notification { method, params, .. } if method == "session/update" => {
-            log_session_update(params);
+            log_session_update(params)
         }
         JsonRpcMessage::Notification { method, .. } => {
             tracing::debug!(method, "ACP notification from agent");
+            None
         }
         JsonRpcMessage::Request { id, method, .. } => {
             tracing::info!(id, method, "ACP request from agent");
+            None
         }
         JsonRpcMessage::Response {
             id, result, error, ..
         } => {
             tracing::debug!(id, ?result, ?error, "ACP response from agent");
+            if result
+                .as_ref()
+                .and_then(|result| result.get("stopReason"))
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+            {
+                Some(AgentEvent::AcpProgress {
+                    id: "__turn".to_string(),
+                    label: String::new(),
+                    active: false,
+                })
+            } else {
+                None
+            }
         }
     }
 }
 
-fn log_session_update(params: serde_json::Value) {
+fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     let Some(update) = params.get("update") else {
         tracing::warn!(session_id, "ACP session/update missing update payload");
-        return;
+        return None;
     };
     let kind = update
         .get("sessionUpdate")
@@ -468,6 +497,7 @@ fn log_session_update(params: serde_json::Value) {
                 commands = %commands.join(", "),
                 "ACP available commands updated"
             );
+            None
         }
         "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
             let text = update
@@ -475,32 +505,62 @@ fn log_session_update(params: serde_json::Value) {
                 .and_then(content_text)
                 .unwrap_or_default();
             tracing::info!(session_id, kind, text = %text, "ACP message chunk");
+            if text.is_empty() {
+                None
+            } else {
+                Some(AgentEvent::AcpTranscriptChunk {
+                    kind: kind.to_string(),
+                    text: text.to_string(),
+                })
+            }
         }
         "tool_call" => {
-            let tool_call_id = update
-                .get("toolCallId")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
             let title = update
                 .get("title")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
+                .filter(|title| !title.is_empty())
+                .unwrap_or("Working");
             let status = update
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
-        }
-        "tool_call_update" => {
             let tool_call_id = update
                 .get("toolCallId")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
+            tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
+            Some(AgentEvent::AcpProgress {
+                id: tool_call_id.to_string(),
+                label: title.to_string(),
+                active: status != "completed" && status != "failed" && status != "cancelled",
+            })
+        }
+        "tool_call_update" => {
+            let title = update
+                .get("title")
+                .and_then(serde_json::Value::as_str)
+                .filter(|title| !title.is_empty())
+                .unwrap_or("Working");
             let status = update
                 .get("status")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            tracing::info!(session_id, tool_call_id, status, "ACP tool call updated");
+            let tool_call_id = update
+                .get("toolCallId")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            tracing::info!(
+                session_id,
+                tool_call_id,
+                title,
+                status,
+                "ACP tool call updated"
+            );
+            Some(AgentEvent::AcpProgress {
+                id: tool_call_id.to_string(),
+                label: title.to_string(),
+                active: status != "completed" && status != "failed" && status != "cancelled",
+            })
         }
         "plan" => {
             let count = update
@@ -509,9 +569,11 @@ fn log_session_update(params: serde_json::Value) {
                 .map(Vec::len)
                 .unwrap_or(0);
             tracing::info!(session_id, count, "ACP plan updated");
+            None
         }
         other => {
             tracing::debug!(session_id, kind = other, "unhandled ACP session update");
+            None
         }
     }
 }
@@ -521,4 +583,40 @@ fn content_text(content: &serde_json::Value) -> Option<&str> {
         Some("text") => content.get("text").and_then(serde_json::Value::as_str),
         _ => None,
     }
+}
+
+async fn selected_file_resource(
+    path: &Path,
+    line_range: Option<(u32, u32)>,
+) -> Result<Option<PromptResource>> {
+    let text = tokio::fs::read_to_string(path)
+        .await
+        .with_context(|| format!("failed to read context file {}", path.display()))?;
+    let text = match line_range {
+        Some((start, end)) => {
+            let start = start.max(1) as usize;
+            let end = end.max(start as u32) as usize;
+            text.lines()
+                .skip(start - 1)
+                .take(end - start + 1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        None => text,
+    };
+
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+
+    let uri = match line_range {
+        Some((start, end)) => format!("file://{}#L{start}-L{end}", path.display()),
+        None => format!("file://{}", path.display()),
+    };
+
+    Ok(Some(PromptResource {
+        uri,
+        mime_type: Some("text/plain".to_string()),
+        text,
+    }))
 }

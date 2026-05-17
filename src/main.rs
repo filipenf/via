@@ -49,7 +49,10 @@ async fn async_main() -> Result<()> {
                 // Connect with a timeout so a non-responsive agent doesn't hang startup.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(8),
-                    mediator.connect_acp(&command, &args.iter().map(|s| s.as_str()).collect::<Vec<_>>()),
+                    mediator.connect_acp(
+                        &command,
+                        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+                    ),
                 )
                 .await
                 {

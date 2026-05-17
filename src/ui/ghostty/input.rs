@@ -243,7 +243,11 @@ pub(super) fn forward_mouse_scroll(
         delta_y = -sy.signum() as isize;
     }
 
-    panes[pane_index].scroll_viewport(delta_y);
+    let Some(pane) = panes.get_mut(pane_index) else {
+        return false;
+    };
+
+    pane.scroll_viewport(delta_y);
     true
 }
 

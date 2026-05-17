@@ -20,6 +20,7 @@ use crate::event::{Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 
+mod acp_pane;
 mod config;
 mod font;
 mod input;
@@ -28,6 +29,7 @@ mod links;
 mod pane;
 mod render;
 
+use acp_pane::AcpPane;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{
@@ -128,6 +130,7 @@ struct WinitGhosttyApp {
     buffer: Vec<u32>,
     damage: Vec<DamageRect>,
     panes: Vec<TerminalPane>,
+    acp_pane: Option<AcpPane>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
@@ -178,6 +181,7 @@ impl WinitGhosttyApp {
             buffer: vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT],
             damage: Vec::new(),
             panes: Vec::new(),
+            acp_pane: None,
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
@@ -230,6 +234,15 @@ impl WinitGhosttyApp {
         if self.panes.is_empty() {
             self.panes =
                 self.create_panes(self.width, self.height, self.terminal_config.metrics)?;
+            if self.config.is_acp_agent() {
+                let rect = self.layout.pane(1);
+                self.acp_pane = Some(AcpPane::new(
+                    rect.width,
+                    rect.height,
+                    self.terminal_config.metrics,
+                    &self.terminal_config.theme,
+                ));
+            }
             let nvim_args = nvim_args(&self.config);
             self.panes[0].spawn(
                 &self.config.nvim_command,
@@ -364,7 +377,7 @@ impl WinitGhosttyApp {
         let new_layout = SplitLayout::for_window(
             self.width,
             self.height,
-            self.panes.len(),
+            pane_count(&self.config),
             self.pane_layout_mode,
             self.pane_split_direction,
         );
@@ -389,6 +402,13 @@ impl WinitGhosttyApp {
 
             if let Some(size) = pane.resize_with_metrics(rect.width, rect.height, metrics) {
                 debug!(pane = pane.title, ?size, "resized terminal pane");
+            }
+        }
+
+        if let Some(acp_pane) = &mut self.acp_pane {
+            let rect = self.layout.pane(1);
+            if rect.width != 0 && rect.height != 0 {
+                acp_pane.resize_with_metrics(rect.width, rect.height, metrics);
             }
         }
     }
@@ -426,7 +446,7 @@ impl WinitGhosttyApp {
             &pressed_keys,
             self.modifiers.alt,
             self.modifiers.shift,
-            self.panes.len(),
+            pane_count(&self.config),
             &mut self.pane_layout_mode,
             &mut self.pane_split_direction,
             &mut self.active_pane,
@@ -434,6 +454,10 @@ impl WinitGhosttyApp {
         if layout_shortcut_consumed {
             self.relayout();
             self.dirty = true;
+        }
+        if self.active_pane >= self.panes.len() {
+            self.handle_acp_key_event(key, event.text.as_deref(), layout_shortcut_consumed);
+            return Ok(());
         }
 
         let paste_requested = !event.repeat
@@ -492,8 +516,38 @@ impl WinitGhosttyApp {
         Ok(())
     }
 
+    fn handle_acp_key_event(&mut self, key: Option<Key>, text: Option<&str>, suppress_input: bool) {
+        if suppress_input {
+            return;
+        }
+
+        let Some(acp_pane) = &mut self.acp_pane else {
+            return;
+        };
+
+        if let Some(key) = key {
+            if let Some(prompt) = acp_pane.handle_key(key, self.modifiers) {
+                self.events
+                    .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text: prompt }));
+            }
+        }
+
+        if let Some(text) = text.filter(|text| text.chars().all(|ch| !ch.is_control())) {
+            self.dirty |= acp_pane.handle_text_input(text, self.modifiers);
+        }
+
+        self.dirty = true;
+    }
+
     fn handle_text_commit(&mut self, text: &str) -> Result<()> {
         if self.panes.is_empty() {
+            return Ok(());
+        }
+
+        if self.active_pane >= self.panes.len() {
+            if let Some(acp_pane) = &mut self.acp_pane {
+                self.dirty |= acp_pane.handle_text_input(text, self.modifiers);
+            }
             return Ok(());
         }
 
@@ -559,6 +613,9 @@ impl WinitGhosttyApp {
 
         let pane_changed = self.active_pane != pane_index;
         self.active_pane = pane_index;
+        if pane_index >= self.panes.len() {
+            return pane_changed;
+        }
         for (index, pane) in self.panes.iter_mut().enumerate() {
             if index != pane_index {
                 pane.clear_selection();
@@ -588,6 +645,9 @@ impl WinitGhosttyApp {
         if pane_index != self.active_pane {
             return false;
         }
+        if pane_index >= self.panes.len() {
+            return false;
+        }
 
         let metrics = self.panes[pane_index].metrics();
         let row = (y - rect.y) / metrics.cell_height;
@@ -614,6 +674,9 @@ impl WinitGhosttyApp {
 
         let pane_changed = self.active_pane != pane_index;
         self.active_pane = pane_index;
+        if pane_index >= self.panes.len() {
+            return pane_changed;
+        }
 
         let metrics = self.panes[pane_index].metrics();
         let row = (y - rect.y) / metrics.cell_height;
@@ -693,6 +756,9 @@ impl WinitGhosttyApp {
         self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.flush_pending_agent_write()?;
+        if let Some(acp_pane) = &mut self.acp_pane {
+            self.dirty |= acp_pane.tick_progress();
+        }
         Ok(())
     }
 
@@ -712,6 +778,9 @@ impl WinitGhosttyApp {
         self.font_renderer.theme = loaded_config.theme;
         for pane in &mut self.panes {
             pane.apply_theme(&self.terminal_config.theme);
+        }
+        if let Some(acp_pane) = &mut self.acp_pane {
+            acp_pane.apply_theme(&self.terminal_config.theme);
         }
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
@@ -744,6 +813,18 @@ impl WinitGhosttyApp {
                 self.height,
                 self.layout.pane(index),
                 index == self.active_pane,
+                self.force_redraw,
+                &mut self.damage,
+            );
+        }
+        if let Some(acp_pane) = &mut self.acp_pane {
+            redrawn |= acp_pane.draw(
+                &mut self.font_renderer,
+                &mut self.buffer,
+                self.width,
+                self.height,
+                self.layout.pane(1),
+                self.active_pane == 1,
                 self.force_redraw,
                 &mut self.damage,
             );
@@ -823,6 +904,20 @@ impl WinitGhosttyApp {
                     debug!("forwarding tool response to agent");
                     agent_pane.write_all(payload.as_bytes())?;
                     self.pending_agent_write = None;
+                }
+                UiCommand::AcpTranscriptChunk { kind, text } => {
+                    let Some(acp_pane) = &mut self.acp_pane else {
+                        continue;
+                    };
+                    debug!(kind, "forwarding ACP transcript chunk to pane");
+                    acp_pane.append_transcript_chunk(&kind, &text);
+                }
+                UiCommand::AcpProgress { id, label, active } => {
+                    let Some(acp_pane) = &mut self.acp_pane else {
+                        continue;
+                    };
+                    debug!(id, label, active, "forwarding ACP progress update to pane");
+                    acp_pane.update_progress(id, label, active);
                 }
             }
         }
@@ -1005,11 +1100,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 }
 
 fn pane_count(config: &Config) -> usize {
-    if config.agent_command.is_some() && !config.is_acp_agent() {
-        2
-    } else {
-        1
-    }
+    if config.agent_command.is_some() { 2 } else { 1 }
 }
 
 fn is_double_click(

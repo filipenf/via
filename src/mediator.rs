@@ -1,13 +1,14 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use tokio::sync::{mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info};
 
 use serde::{Deserialize, Serialize};
 
-use crate::acp::{self, AcpClient, ContextUpdateParams};
+use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
 use crate::config::Config;
 use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
@@ -49,6 +50,10 @@ fn serialize_tool_response(response: AgentToolResponse) -> String {
             error
         ),
     }
+}
+
+fn selection_resource_uri(path: &Path, start_line: u32, end_line: u32) -> String {
+    format!("file://{}#L{start_line}-L{end_line}", path.display())
 }
 
 pub struct Mediator {
@@ -127,9 +132,6 @@ impl Mediator {
         let session = client.new_session(&self.config.working_directory).await?;
         tracing::info!(session_id = %session.session_id, "ACP session created");
 
-        // Start a background task that logs everything the agent sends us
-        client.spawn_reader();
-
         self.acp_client = Some(Arc::new(Mutex::new(client)));
         self.acp_session_id = Some(session.session_id.clone());
         Ok(session.session_id)
@@ -143,6 +145,16 @@ impl Mediator {
         let events = EventSender {
             events: events_tx.clone(),
         };
+
+        if let Some(client) = &self.acp_client {
+            let client = Arc::clone(client);
+            let events = events.clone();
+            tokio::spawn(async move {
+                let mut guard = client.lock().await;
+                guard.spawn_reader(events);
+            });
+        }
+
         let editor_listener = editor::spawn_listener(
             self.config.editor_socket_path.clone(),
             self.config.working_directory.clone(),
@@ -226,9 +238,50 @@ impl Mediator {
                         }
                     }));
                 }
+                Event::Ui(UiEvent::AgentPromptSubmitted { text }) => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+
+                    let prompt_resource = self
+                        .editor_state
+                        .visual_selection
+                        .as_ref()
+                        .filter(|selection| !selection.text.trim().is_empty())
+                        .map(|selection| PromptResource {
+                            uri: selection_resource_uri(
+                                &selection.path,
+                                selection.start_line,
+                                selection.end_line,
+                            ),
+                            mime_type: Some("text/plain".to_string()),
+                            text: selection.text.clone(),
+                        });
+
+                    let (Some(client), Some(session_id)) =
+                        (&self.acp_client, self.acp_session_id.clone())
+                    else {
+                        debug!("agent prompt submitted without an active ACP session");
+                        continue;
+                    };
+                    let client = Arc::clone(client);
+                    tokio::spawn(async move {
+                        let mut guard = client.lock().await;
+                        if let Err(error) = guard.prompt(&session_id, &text, prompt_resource).await
+                        {
+                            debug!(%error, "failed to send ACP prompt");
+                        }
+                    });
+                }
                 Event::Editor(event) => self.apply_editor_event(event),
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
                     self.handle_agent_output(chunk).await;
+                }
+                Event::Agent(AgentEvent::AcpTranscriptChunk { kind, text }) => {
+                    self.send_ui_command(UiCommand::AcpTranscriptChunk { kind, text });
+                }
+                Event::Agent(AgentEvent::AcpProgress { id, label, active }) => {
+                    self.send_ui_command(UiCommand::AcpProgress { id, label, active });
                 }
                 Event::Agent(event) => debug!(?event, "agent event received"),
                 event => debug!(?event, "mediator event received"),
@@ -247,8 +300,7 @@ impl Mediator {
         debug!(?event, "editor context updated");
         match &event {
             EditorEvent::ActiveBufferChanged { path, line, column } => {
-                if let (Some(client), Some(_session_id)) =
-                    (&self.acp_client, &self.acp_session_id)
+                if let (Some(client), Some(_session_id)) = (&self.acp_client, &self.acp_session_id)
                 {
                     // ACP path: send structured context update
                     let path = path.clone();
@@ -282,6 +334,7 @@ impl Mediator {
                 path,
                 start_line,
                 end_line,
+                text: _,
             } => {
                 let changed = previous_selection
                     .as_ref()
@@ -292,7 +345,7 @@ impl Mediator {
                     })
                     .unwrap_or(true);
 
-                if changed {
+                if changed && self.acp_client.is_none() {
                     self.send_ui_command(UiCommand::VisualSelectionChanged {
                         path: path.clone(),
                         start_line: *start_line,

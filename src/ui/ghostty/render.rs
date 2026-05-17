@@ -2,6 +2,8 @@ use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::RgbColor;
+use ratatui::buffer::Buffer;
+use ratatui::style::{Color, Modifier};
 
 use super::config::TerminalMetrics;
 use super::font::FontRenderer;
@@ -223,6 +225,74 @@ pub(super) fn draw_screen(
     true
 }
 
+pub(super) fn draw_ratatui_buffer(
+    ratatui_buffer: &Buffer,
+    font_renderer: &mut FontRenderer,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    origin_y: usize,
+    metrics: TerminalMetrics,
+    default_fg: u32,
+    default_bg: u32,
+    force_redraw: bool,
+    damage: &mut Vec<DamageRect>,
+) -> bool {
+    if !force_redraw {
+        return false;
+    }
+
+    let area = ratatui_buffer.area;
+    for row in 0..area.height {
+        let y = origin_y + row as usize * metrics.cell_height;
+        let row_width = area.width as usize * metrics.cell_width;
+        draw_rect(
+            buffer,
+            width,
+            height,
+            origin_x,
+            y,
+            row_width,
+            metrics.cell_height,
+            default_bg,
+        );
+        push_damage(
+            damage,
+            origin_x,
+            y,
+            row_width,
+            metrics.cell_height,
+            width,
+            height,
+        );
+
+        for col in 0..area.width {
+            let cell = &ratatui_buffer[(col, row)];
+            if cell.skip {
+                continue;
+            }
+
+            let x = origin_x + col as usize * metrics.cell_width;
+            draw_ratatui_cell(
+                cell,
+                font_renderer,
+                buffer,
+                width,
+                height,
+                x,
+                y,
+                metrics,
+                default_fg,
+                default_bg,
+            );
+        }
+    }
+
+    coalesce_damage(damage);
+    true
+}
+
 fn coalesce_damage(damage: &mut Vec<DamageRect>) {
     if damage.len() < 2 {
         return;
@@ -376,6 +446,139 @@ fn draw_cell(
         );
     }
     Some(ch)
+}
+
+fn draw_ratatui_cell(
+    cell: &ratatui::buffer::Cell,
+    font_renderer: &mut FontRenderer,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    metrics: TerminalMetrics,
+    default_fg: u32,
+    default_bg: u32,
+) {
+    let modifier = cell.modifier;
+    let mut fg = ratatui_color(cell.fg, default_fg);
+    let mut bg = ratatui_color(cell.bg, default_bg);
+
+    if modifier.contains(Modifier::REVERSED) {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    if modifier.contains(Modifier::DIM) {
+        fg = dim_toward(fg, bg);
+    }
+
+    draw_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        metrics.cell_width,
+        metrics.cell_height,
+        bg,
+    );
+
+    if modifier.contains(Modifier::HIDDEN) {
+        return;
+    }
+
+    let Some(ch) = cell.symbol().chars().next().filter(|ch| *ch != ' ') else {
+        return;
+    };
+
+    if !try_draw_block_char(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        metrics.cell_width,
+        metrics.cell_height,
+        ch,
+        fg,
+    ) {
+        font_renderer.draw_char(
+            buffer,
+            width,
+            height,
+            x,
+            y,
+            ch,
+            fg,
+            modifier.contains(Modifier::BOLD),
+            modifier.contains(Modifier::ITALIC),
+        );
+    }
+
+    if modifier.contains(Modifier::UNDERLINED) {
+        draw_rect(
+            buffer,
+            width,
+            height,
+            x,
+            y + metrics.cell_height.saturating_sub(2),
+            metrics.cell_width,
+            1,
+            fg,
+        );
+    }
+}
+
+fn ratatui_color(color: Color, default: u32) -> u32 {
+    match color {
+        Color::Reset => default,
+        Color::Black => 0x0c0c0c,
+        Color::Red => 0xcc241d,
+        Color::Green => 0x98971a,
+        Color::Yellow => 0xd79921,
+        Color::Blue => 0x458588,
+        Color::Magenta => 0xb16286,
+        Color::Cyan => 0x689d6a,
+        Color::Gray => 0xa89984,
+        Color::DarkGray => 0x928374,
+        Color::LightRed => 0xfb4934,
+        Color::LightGreen => 0xb8bb26,
+        Color::LightYellow => 0xfabd2f,
+        Color::LightBlue => 0x83a598,
+        Color::LightMagenta => 0xd3869b,
+        Color::LightCyan => 0x8ec07c,
+        Color::White => 0xebdbb2,
+        Color::Indexed(index) => ansi_color(index),
+        Color::Rgb(red, green, blue) => ((red as u32) << 16) | ((green as u32) << 8) | blue as u32,
+    }
+}
+
+fn ansi_color(index: u8) -> u32 {
+    const ANSI_16: [u32; 16] = [
+        0x0c0c0c, 0xcc241d, 0x98971a, 0xd79921, 0x458588, 0xb16286, 0x689d6a, 0xa89984, 0x928374,
+        0xfb4934, 0xb8bb26, 0xfabd2f, 0x83a598, 0xd3869b, 0x8ec07c, 0xebdbb2,
+    ];
+
+    if let Some(color) = ANSI_16.get(index as usize) {
+        return *color;
+    }
+
+    let index = index.saturating_sub(16);
+    if index < 216 {
+        let r = index / 36;
+        let g = (index % 36) / 6;
+        let b = index % 6;
+        return (cube_component(r) << 16) | (cube_component(g) << 8) | cube_component(b);
+    }
+
+    let gray = 8 + (index.saturating_sub(216) as u32) * 10;
+    (gray << 16) | (gray << 8) | gray
+}
+
+fn cube_component(value: u8) -> u32 {
+    match value {
+        0 => 0,
+        value => 55 + value as u32 * 40,
+    }
 }
 
 fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
