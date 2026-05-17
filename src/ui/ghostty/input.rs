@@ -166,6 +166,19 @@ pub(super) fn try_clipboard_paste(
     Ok(true)
 }
 
+/// Plain clipboard text for UI fields (ACP prompt). Same read path as terminal paste; no bracketed
+/// paste wrapper.
+pub(super) fn read_clipboard_text() -> Option<String> {
+    match Clipboard::new().and_then(|mut c| c.get_text()) {
+        Ok(t) if !t.is_empty() => Some(t),
+        Ok(_) => None,
+        Err(error) => {
+            warn!(%error, "clipboard read failed");
+            None
+        }
+    }
+}
+
 /// Keyboard scroll of the active pane's viewport (Shift+PgUp / Shift+PgDn). Does not send escape
 /// sequences to the PTY—same behavior as the mouse wheel. Ghostty: scroll up (into scrollback) is a
 /// negative delta.

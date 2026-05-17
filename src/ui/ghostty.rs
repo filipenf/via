@@ -36,7 +36,7 @@ use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{
     Key, Modifiers, forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
-    forward_text_input, try_clipboard_paste,
+    forward_text_input, read_clipboard_text, try_clipboard_paste,
 };
 use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use links::ReferenceTarget;
@@ -551,6 +551,20 @@ impl WinitGhosttyApp {
                     }
                 }
             }
+
+            let paste_requested = !event.repeat
+                && key
+                    .map(|key| paste_requested(key, self.modifiers))
+                    .unwrap_or(false);
+            if paste_requested && !layout_shortcut_consumed {
+                if let Some(text) = read_clipboard_text() {
+                    if let Some(acp_pane) = &mut self.acp_pane {
+                        self.dirty |= acp_pane.paste_text(&text);
+                    }
+                }
+                return Ok(());
+            }
+
             self.handle_acp_key_event(key, event.text.as_deref(), layout_shortcut_consumed);
             return Ok(());
         }

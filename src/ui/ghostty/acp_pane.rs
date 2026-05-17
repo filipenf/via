@@ -130,7 +130,30 @@ impl AcpPane {
         true
     }
 
+    /// Insert OS clipboard text (Super+V / Ctrl+Shift+V / Shift+Insert). Strips control
+    /// characters except newline and tab so bracketed-paste escape sequences never enter the
+    /// prompt.
+    pub(super) fn paste_text(&mut self, text: &str) -> bool {
+        let sanitized: String = text
+            .chars()
+            .filter(|&ch| ch == '\n' || ch == '\t' || !ch.is_control())
+            .collect();
+        if sanitized.is_empty() {
+            return false;
+        }
+        self.prompt.push_str(&sanitized);
+        self.dirty = true;
+        true
+    }
+
     pub(super) fn handle_key(&mut self, key: Key, modifiers: Modifiers) -> Option<String> {
+        if modifiers.ctrl && key == Key::W {
+            if delete_word_backward(&mut self.prompt) {
+                self.dirty = true;
+            }
+            return None;
+        }
+
         if modifiers.ctrl || modifiers.super_key {
             return None;
         }
@@ -428,6 +451,19 @@ impl AcpPane {
             render_progress(buffer, prompt_chunks[1], progress, title_style);
         }
     }
+}
+
+/// Shell/readline-style backward-kill-word: drop trailing whitespace, then the last run of
+/// non-whitespace characters.
+fn delete_word_backward(prompt: &mut String) -> bool {
+    let before = prompt.len();
+    while prompt.chars().last().is_some_and(|c| c.is_whitespace()) {
+        prompt.pop();
+    }
+    while prompt.chars().last().is_some_and(|c| !c.is_whitespace()) {
+        prompt.pop();
+    }
+    prompt.len() != before
 }
 
 fn estimate_wrapped_line_rows(line: &Line, width: usize) -> usize {
