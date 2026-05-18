@@ -1,6 +1,6 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use std::collections::HashMap;
 
 use anyhow::Result;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
 use crate::config::Config;
 use crate::editor::{self, EditorState};
-use crate::event::{AgentEvent, AcpModalKind, EditorEvent, Event, UiCommand, UiEvent};
+use crate::event::{AcpModalKind, AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim::{self, FileTarget};
 
@@ -241,6 +241,16 @@ impl Mediator {
                             error!(%error, symbol, "failed to open symbol in Neovim");
                         }
                     }));
+                }
+                Event::Ui(UiEvent::ReviewRequested) => {
+                    if let Err(error) = nvim::open_review(
+                        &self.config.nvim_socket_path,
+                        &self.config.working_directory,
+                    )
+                    .await
+                    {
+                        error!(%error, "failed to open review in Neovim");
+                    }
                 }
                 Event::Ui(UiEvent::AgentPromptSubmitted { text }) => {
                     if text.trim().is_empty() {
@@ -601,6 +611,7 @@ mod tests {
         Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("echo agent".to_string()),
+            review_backend: crate::config::ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),

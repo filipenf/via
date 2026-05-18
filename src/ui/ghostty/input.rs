@@ -3,7 +3,7 @@ use arboard::Clipboard;
 use tracing::warn;
 use winit::keyboard::KeyCode;
 
-use super::layout::{SplitLayout, pane_layout_shortcut, pane_navigation_shortcut};
+use super::layout::{pane_layout_shortcut, pane_navigation_shortcut};
 use super::pane::TerminalPane;
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -179,89 +179,13 @@ pub(super) fn read_clipboard_text() -> Option<String> {
     }
 }
 
-/// Keyboard scroll of the active pane's viewport (Shift+PgUp / Shift+PgDn). Does not send escape
-/// sequences to the PTY—same behavior as the mouse wheel. Ghostty: scroll up (into scrollback) is a
-/// negative delta.
-pub(super) fn forward_keyboard_viewport_scroll(
-    pressed_keys: &[Key],
-    modifiers: Modifiers,
-    active_pane: usize,
-    panes: &mut [TerminalPane],
-    suppress_input: bool,
-) -> bool {
-    if suppress_input {
-        return false;
-    }
-
-    if !modifiers.shift {
-        return false;
-    }
-
-    let Some(pane) = panes.get_mut(active_pane) else {
-        return false;
-    };
-
-    let step = pane.viewport_rows().max(1) as isize;
-
-    for key in pressed_keys.iter().copied() {
-        match key {
-            Key::PageUp => {
-                pane.scroll_viewport(-step);
-                return true;
-            }
-            Key::PageDown => {
-                pane.scroll_viewport(step);
-                return true;
-            }
-            _ => {}
-        }
-    }
-
-    false
+pub(super) fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
+    (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
+        || (key == Key::Insert && (modifiers.shift || modifiers.super_key))
 }
 
-/// Scroll the terminal viewport under the mouse wheel using libghostty scrollback.
-pub(super) fn forward_mouse_scroll(
-    scroll_delta: (f32, f32),
-    cursor_position: Option<(usize, usize)>,
-    layout: &SplitLayout,
-    panes: &mut [TerminalPane],
-    suppress_input: bool,
-) -> bool {
-    if suppress_input {
-        return false;
-    }
-
-    let (sx, sy) = scroll_delta;
-    // Combine axes so shift+horizontal wheel / sideways trackpad still scrolls the terminal.
-    let sy = sy + sx;
-
-    if sy.abs() <= 1e-4 {
-        return false;
-    }
-
-    let Some((x, y)) = cursor_position else {
-        return false;
-    };
-
-    let Some((pane_index, _rect)) = layout.pane_at(x, y) else {
-        return false;
-    };
-
-    // Ghostty: scroll up (into scrollback) is negative. Match low-amplitude axis events: rounding
-    // `-sy/40` often yields 0 for a single notch on Wayland/X11.
-    let scaled = -sy / 40.0;
-    let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
-    if delta_y == 0 {
-        delta_y = -sy.signum() as isize;
-    }
-
-    let Some(pane) = panes.get_mut(pane_index) else {
-        return false;
-    };
-
-    pane.scroll_viewport(delta_y);
-    true
+pub(super) fn copy_requested(key: Key, modifiers: Modifiers) -> bool {
+    key == Key::C && modifiers.super_key
 }
 
 pub(super) fn forward_special_keys(
@@ -297,7 +221,7 @@ pub(super) fn forward_special_keys(
             continue;
         }
 
-        // Viewport scroll handled in `forward_keyboard_viewport_scroll`; do not send CSI Page keys.
+        // Viewport scroll is handled before key forwarding; do not send CSI Page keys.
         if modifiers.shift && matches!(key, Key::PageUp | Key::PageDown) {
             continue;
         }

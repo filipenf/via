@@ -1,5 +1,6 @@
 use std::env;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::OnceLock;
 
 /// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
@@ -20,6 +21,7 @@ pub fn runtime_base_dir() -> PathBuf {
 pub struct Config {
     pub nvim_command: String,
     pub agent_command: Option<String>,
+    pub review_backend: ReviewBackend,
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
@@ -27,10 +29,38 @@ pub struct Config {
     pub working_directory: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewBackend {
+    Hunk,
+    Nvim,
+}
+
+impl Default for ReviewBackend {
+    fn default() -> Self {
+        Self::Nvim
+    }
+}
+
+impl FromStr for ReviewBackend {
+    type Err = String;
+
+    fn from_str(input: &str) -> Result<Self, Self::Err> {
+        match input.trim().to_ascii_lowercase().as_str() {
+            "hunk" => Ok(Self::Hunk),
+            "nvim" | "vim" | "vimdiff" => Ok(Self::Nvim),
+            other => Err(format!("unknown review backend `{other}`")),
+        }
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         let nvim_command = env::var("VIA_NVIM").unwrap_or_else(|_| "nvim".to_owned());
         let agent_command = env::var("VIA_AGENT").ok();
+        let review_backend = env::var("VIA_REVIEW_BACKEND")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default();
         let nvim_socket_path = env::var_os("VIA_NVIM_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_socket_path);
@@ -48,6 +78,7 @@ impl Config {
         Self {
             nvim_command,
             agent_command,
+            review_backend,
             nvim_socket_path,
             editor_socket_path,
             nvim_context_bridge_path,
@@ -63,6 +94,34 @@ impl Config {
             .as_deref()
             .map(|cmd| cmd.split_whitespace().last() == Some("acp"))
             .unwrap_or(false)
+    }
+
+    pub fn apply_cli_args<I, S>(&mut self, args: I)
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let mut args = args.into_iter();
+        while let Some(arg) = args.next() {
+            let arg = arg.as_ref();
+            if let Some(value) = arg.strip_prefix("--review-backend=") {
+                self.apply_review_backend(value);
+                continue;
+            }
+
+            if arg == "--review-backend" {
+                if let Some(value) = args.next() {
+                    self.apply_review_backend(value.as_ref());
+                }
+            }
+        }
+    }
+
+    fn apply_review_backend(&mut self, value: &str) {
+        match value.parse() {
+            Ok(review_backend) => self.review_backend = review_backend,
+            Err(error) => tracing::warn!(%error, "ignoring invalid review backend"),
+        }
     }
 }
 
@@ -135,5 +194,30 @@ mod tests {
         let path = default_lsp_bridge_socket_path();
 
         assert!(path.ends_with(format!("via-lsp-bridge-{}.sock", std::process::id())));
+    }
+
+    #[test]
+    fn parses_review_backend_aliases() {
+        assert_eq!("hunk".parse::<ReviewBackend>(), Ok(ReviewBackend::Hunk));
+        assert_eq!("nvim".parse::<ReviewBackend>(), Ok(ReviewBackend::Nvim));
+        assert_eq!("vimdiff".parse::<ReviewBackend>(), Ok(ReviewBackend::Nvim));
+    }
+
+    #[test]
+    fn cli_review_backend_overrides_existing_value() {
+        let mut config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: None,
+            review_backend: ReviewBackend::Nvim,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/repo"),
+        };
+
+        config.apply_cli_args(["--review-backend", "hunk"]);
+
+        assert_eq!(config.review_backend, ReviewBackend::Hunk);
     }
 }

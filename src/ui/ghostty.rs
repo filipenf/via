@@ -1,6 +1,7 @@
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::Path;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,32 +16,30 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::config::Config;
+use crate::config::{Config, ReviewBackend};
 use crate::event::{Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 
-mod acp_pane;
 mod acp_modal;
+mod acp_pane;
 mod config;
 mod font;
 mod input;
 mod layout;
 mod links;
 mod pane;
+mod pane_controller;
 mod render;
 
-use acp_modal::{render_acp_modal_buffer, AcpModalState};
+use acp_modal::{AcpModalState, render_acp_modal_buffer};
 use acp_pane::AcpPane;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
-use input::{
-    Key, Modifiers, forward_keyboard_viewport_scroll, forward_mouse_scroll, forward_special_keys,
-    forward_text_input, read_clipboard_text, try_clipboard_paste,
-};
-use layout::{PaneLayoutMode, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
-use links::ReferenceTarget;
+use input::{Key, Modifiers, paste_requested, read_clipboard_text};
+use layout::{PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
 use pane::TerminalPane;
+use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
 use render::{DamageRect, draw_ratatui_buffer};
 
 const INITIAL_WIDTH: usize = 960;
@@ -50,7 +49,6 @@ const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
 const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(20);
 const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
-const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 
 pub struct GhosttyUi {
     config: Config,
@@ -62,14 +60,6 @@ pub struct GhosttyUi {
 struct PendingAgentWrite {
     ready_at: Instant,
     bytes: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ReferenceClick {
-    at: Instant,
-    pane_index: usize,
-    row: usize,
-    column: usize,
 }
 
 impl GhosttyUi {
@@ -131,7 +121,9 @@ struct WinitGhosttyApp {
     font_renderer: FontRenderer,
     buffer: Vec<u32>,
     damage: Vec<DamageRect>,
-    panes: Vec<TerminalPane>,
+    panes: Vec<TerminalPaneController>,
+    review_pane: Option<TerminalPaneController>,
+    review_active: bool,
     acp_pane: Option<AcpPane>,
     acp_modal: Option<AcpModalState>,
     active_pane: usize,
@@ -142,8 +134,6 @@ struct WinitGhosttyApp {
     height: usize,
     modifiers: Modifiers,
     cursor_position: Option<(usize, usize)>,
-    left_mouse_down: bool,
-    last_reference_click: Option<ReferenceClick>,
     dirty: bool,
     force_redraw: bool,
     next_redraw_at: Instant,
@@ -184,6 +174,8 @@ impl WinitGhosttyApp {
             buffer: vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT],
             damage: Vec::new(),
             panes: Vec::new(),
+            review_pane: None,
+            review_active: false,
             acp_pane: None,
             acp_modal: None,
             active_pane: 0,
@@ -194,8 +186,6 @@ impl WinitGhosttyApp {
             height: INITIAL_HEIGHT,
             modifiers: Modifiers::default(),
             cursor_position: None,
-            left_mouse_down: false,
-            last_reference_click: None,
             dirty: true,
             force_redraw: true,
             next_redraw_at: Instant::now(),
@@ -272,7 +262,7 @@ impl WinitGhosttyApp {
         width: usize,
         height: usize,
         metrics: TerminalMetrics,
-    ) -> Result<Vec<TerminalPane>> {
+    ) -> Result<Vec<TerminalPaneController>> {
         let layout = SplitLayout::for_window(
             width,
             height,
@@ -280,13 +270,16 @@ impl WinitGhosttyApp {
             PaneLayoutMode::Split,
             PaneSplitDirection::for_window(width, height),
         );
-        let mut panes = vec![TerminalPane::new(
-            "nvim",
-            layout.pane(0).width,
-            layout.pane(0).height,
-            metrics,
-            &self.terminal_config.theme,
-        )?];
+        let mut panes = vec![TerminalPaneController::new(
+            PaneRole::Editor,
+            TerminalPane::new(
+                "nvim",
+                layout.pane(0).width,
+                layout.pane(0).height,
+                metrics,
+                &self.terminal_config.theme,
+            )?,
+        )];
 
         if self.config.agent_command.is_some() && !self.config.is_acp_agent() {
             if let Some(agent_command) = self.config.agent_command.as_deref() {
@@ -302,7 +295,7 @@ impl WinitGhosttyApp {
                     &self.config.working_directory,
                     self.output_notifier.clone(),
                 )?;
-                panes.push(pane);
+                panes.push(TerminalPaneController::new(PaneRole::AgentTerminal, pane));
             }
         }
 
@@ -415,6 +408,13 @@ impl WinitGhosttyApp {
                 acp_pane.resize_with_metrics(rect.width, rect.height, metrics);
             }
         }
+
+        if let Some(review_pane) = &mut self.review_pane {
+            let rect = full_window_rect(self.width, self.height);
+            if rect.width != 0 && rect.height != 0 {
+                review_pane.resize_with_metrics(rect.width, rect.height, metrics);
+            }
+        }
     }
 
     fn handle_acp_modal_winit_key(&mut self, event: &KeyEvent) -> bool {
@@ -432,14 +432,16 @@ impl WinitGhosttyApp {
                 let id = modal.jsonrpc_id.clone();
                 let result = modal.result_cancelled();
                 self.acp_modal = None;
-                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                self.events
+                    .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
                 true
             }
             KeyCode::Enter | KeyCode::NumpadEnter => {
                 let id = modal.jsonrpc_id.clone();
                 let result = modal.result_for_selection(modal.focused);
                 self.acp_modal = None;
-                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                self.events
+                    .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
                 true
             }
             KeyCode::ArrowUp => {
@@ -473,7 +475,8 @@ impl WinitGhosttyApp {
         let id = modal.jsonrpc_id.clone();
         let result = modal.result_for_selection(index);
         self.acp_modal = None;
-        self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+        self.events
+            .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
         true
     }
 
@@ -515,6 +518,25 @@ impl WinitGhosttyApp {
             PhysicalKey::Unidentified(_) => None,
         };
         let pressed_keys = key.into_iter().collect::<Vec<_>>();
+        if self.handle_review_shortcut(&pressed_keys)? {
+            return Ok(());
+        }
+        if self.review_active {
+            if let Some(review_pane) = &mut self.review_pane {
+                let outcome = review_pane.handle_terminal_key(
+                    &pressed_keys,
+                    key,
+                    event.text.as_deref(),
+                    event.repeat,
+                    self.modifiers,
+                    false,
+                )?;
+                self.apply_pane_outcome(outcome);
+            } else {
+                self.review_active = false;
+            }
+            return Ok(());
+        }
         let layout_shortcut_consumed = handle_layout_shortcuts(
             &pressed_keys,
             self.modifiers.alt,
@@ -569,60 +591,88 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let paste_requested = !event.repeat
-            && key
-                .map(|key| paste_requested(key, self.modifiers))
-                .unwrap_or(false);
-        if paste_requested {
-            try_clipboard_paste(
-                true,
-                &mut self.panes[self.active_pane],
-                layout_shortcut_consumed,
-            )?;
-            return Ok(());
-        }
-
-        let copy_requested = !event.repeat
-            && key
-                .map(|key| copy_requested(key, self.modifiers))
-                .unwrap_or(false);
-        if copy_requested {
-            self.dirty |= self.panes[self.active_pane].copy_selection_to_clipboard();
-            return Ok(());
-        }
-
-        let keyboard_scrolled = forward_keyboard_viewport_scroll(
+        let outcome = self.panes[self.active_pane].handle_terminal_key(
             &pressed_keys,
+            key,
+            event.text.as_deref(),
+            event.repeat,
             self.modifiers,
-            self.active_pane,
-            &mut self.panes,
-            layout_shortcut_consumed,
-        );
-        if keyboard_scrolled {
-            self.dirty = true;
-            self.force_redraw = true;
-        }
-        forward_special_keys(
-            &pressed_keys,
-            self.modifiers,
-            &mut self.panes[self.active_pane],
             layout_shortcut_consumed,
         )?;
-
-        if let Some(text) = event
-            .text
-            .as_deref()
-            .filter(|text| text.chars().all(|ch| !ch.is_control()))
-        {
-            forward_text_input(
-                text,
-                self.modifiers,
-                &mut self.panes[self.active_pane],
-                layout_shortcut_consumed,
-            )?;
-        }
+        self.apply_pane_outcome(outcome);
 
         Ok(())
+    }
+
+    fn handle_review_shortcut(&mut self, pressed_keys: &[Key]) -> Result<bool> {
+        if !self.modifiers.alt || self.modifiers.ctrl || self.modifiers.super_key {
+            return Ok(false);
+        }
+        if !pressed_keys.iter().any(|key| *key == Key::R) {
+            return Ok(false);
+        }
+
+        match self.config.review_backend {
+            ReviewBackend::Hunk => self.toggle_hunk_review()?,
+            ReviewBackend::Nvim => self.open_nvim_review(),
+        }
+
+        self.dirty = true;
+        self.force_redraw = true;
+        Ok(true)
+    }
+
+    fn toggle_hunk_review(&mut self) -> Result<()> {
+        if self.review_active {
+            self.review_active = false;
+            return Ok(());
+        }
+
+        if self.review_pane.is_none() {
+            let rect = full_window_rect(self.width, self.height);
+            let mut pane = TerminalPane::new(
+                "review",
+                rect.width,
+                rect.height,
+                self.terminal_config.metrics,
+                &self.terminal_config.theme,
+            )?;
+            pane.spawn_shell_command(
+                hunk_review_command(),
+                &self.config.working_directory,
+                self.output_notifier.clone(),
+            )?;
+            self.review_pane = Some(TerminalPaneController::new(PaneRole::ReviewTerminal, pane));
+        } else {
+            self.reload_hunk_review();
+        }
+
+        self.review_active = true;
+        Ok(())
+    }
+
+    fn reload_hunk_review(&self) {
+        let repo = self.config.working_directory.clone();
+        std::thread::spawn(move || {
+            let status = Command::new("hunk")
+                .args(["session", "reload", "--repo"])
+                .arg(&repo)
+                .args(["--", "diff"])
+                .current_dir(&repo)
+                .status();
+
+            if let Err(error) = status {
+                debug!(%error, "failed to reload hunk review");
+            }
+        });
+    }
+
+    fn open_nvim_review(&mut self) {
+        self.review_active = false;
+        self.pane_layout_mode = PaneLayoutMode::NvimMaximized;
+        self.active_pane = 0;
+        self.relayout();
+        self.events.try_send(Event::Ui(UiEvent::ReviewRequested));
     }
 
     fn handle_acp_key_event(&mut self, key: Option<Key>, text: Option<&str>, suppress_input: bool) {
@@ -656,6 +706,16 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
+        if self.review_active {
+            if let Some(review_pane) = &mut self.review_pane {
+                let outcome = review_pane.handle_text_commit(text, self.modifiers)?;
+                self.apply_pane_outcome(outcome);
+            } else {
+                self.review_active = false;
+            }
+            return Ok(());
+        }
+
         if self.active_pane >= self.panes.len() {
             if let Some(acp_pane) = &mut self.acp_pane {
                 self.dirty |= acp_pane.handle_text_input(text, self.modifiers);
@@ -663,24 +723,33 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        forward_text_input(
-            text,
-            self.modifiers,
-            &mut self.panes[self.active_pane],
-            false,
-        )?;
+        let outcome = self.panes[self.active_pane].handle_text_commit(text, self.modifiers)?;
+        self.apply_pane_outcome(outcome);
         Ok(())
     }
 
-    fn handle_mouse_scroll(&mut self, delta: MouseScrollDelta) {
+    fn handle_mouse_scroll(&mut self, delta: MouseScrollDelta) -> Result<()> {
         if self.panes.is_empty() {
-            return;
+            return Ok(());
         }
 
         let scroll_delta = match delta {
             MouseScrollDelta::LineDelta(x, y) => (x * 40.0, y * 40.0),
             MouseScrollDelta::PixelDelta(position) => (position.x as f32, position.y as f32),
         };
+
+        if self.review_active {
+            if let Some((x, y)) = self.cursor_position {
+                if let Some(review_pane) = &mut self.review_pane {
+                    let outcome =
+                        review_pane.handle_mouse_wheel(scroll_delta, x, y, self.modifiers)?;
+                    self.apply_pane_outcome(outcome);
+                } else {
+                    self.review_active = false;
+                }
+            }
+            return Ok(());
+        }
 
         if let Some(acp_pane) = &mut self.acp_pane {
             if let Some((x, y)) = self.cursor_position {
@@ -698,168 +767,120 @@ impl WinitGhosttyApp {
                             self.dirty = true;
                             self.force_redraw = true;
                         }
-                        return;
+                        return Ok(());
                     }
                 }
             }
         }
 
-        let scrolled = forward_mouse_scroll(
-            scroll_delta,
-            self.cursor_position,
-            &self.layout,
-            &mut self.panes,
-            false,
-        );
-        if scrolled {
-            self.dirty = true;
-            self.force_redraw = true;
-        }
-    }
-
-    fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) {
-        if button != MouseButton::Left {
-            return;
-        }
-
-        let is_down = state == ElementState::Pressed;
-        let just_pressed = is_down && !self.left_mouse_down;
-        let just_released = !is_down && self.left_mouse_down;
-        self.left_mouse_down = is_down;
-
-        if just_pressed {
-            self.dirty |= self.start_mouse_selection();
-            self.dirty |= self.forward_reference_click();
-        }
-
-        if just_released {
-            self.dirty |= self.finalize_mouse_selection();
-        }
-    }
-
-    fn start_mouse_selection(&mut self) -> bool {
         let Some((x, y)) = self.cursor_position else {
-            return false;
+            return Ok(());
         };
         let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
-            return false;
+            return Ok(());
         };
+        if let Some(pane) = self.panes.get_mut(pane_index) {
+            let outcome =
+                pane.handle_mouse_wheel(scroll_delta, x - rect.x, y - rect.y, self.modifiers)?;
+            self.apply_pane_outcome(outcome);
+        }
+        Ok(())
+    }
 
+    fn handle_mouse_input(&mut self, state: ElementState, button: MouseButton) -> Result<()> {
+        if self.review_active {
+            if let Some((x, y)) = self.cursor_position {
+                if let Some(review_pane) = &mut self.review_pane {
+                    let outcome = review_pane.handle_mouse_input(
+                        state,
+                        button,
+                        x,
+                        y,
+                        self.modifiers,
+                        &self.config.working_directory,
+                    )?;
+                    self.apply_pane_outcome(outcome);
+                } else {
+                    self.review_active = false;
+                }
+            }
+            return Ok(());
+        }
+
+        let Some((x, y)) = self.cursor_position else {
+            return Ok(());
+        };
+        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+            return Ok(());
+        };
         let pane_changed = self.active_pane != pane_index;
         self.active_pane = pane_index;
         if pane_index >= self.panes.len() {
-            return pane_changed;
+            if pane_changed {
+                self.dirty = true;
+            }
+            return Ok(());
         }
         for (index, pane) in self.panes.iter_mut().enumerate() {
             if index != pane_index {
-                pane.clear_selection();
+                self.dirty |= pane.clear_selection();
             }
         }
 
-        let metrics = self.panes[pane_index].metrics();
-        let row = (y - rect.y) / metrics.cell_height;
-        let column = (x - rect.x) / metrics.cell_width;
-        let selection_changed = self.panes[pane_index].begin_selection(row, column);
-
-        pane_changed || selection_changed
+        let outcome = self.panes[pane_index].handle_mouse_input(
+            state,
+            button,
+            x - rect.x,
+            y - rect.y,
+            self.modifiers,
+            &self.config.working_directory,
+        )?;
+        self.dirty |= pane_changed;
+        self.apply_pane_outcome(outcome);
+        Ok(())
     }
 
-    fn update_mouse_selection(&mut self) -> bool {
-        if !self.left_mouse_down {
-            return false;
-        }
-
+    fn handle_mouse_motion(&mut self) -> Result<()> {
         let Some((x, y)) = self.cursor_position else {
-            return false;
+            return Ok(());
         };
-        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
-            return false;
-        };
-
-        if pane_index != self.active_pane {
-            return false;
-        }
-        if pane_index >= self.panes.len() {
-            return false;
-        }
-
-        let metrics = self.panes[pane_index].metrics();
-        let row = (y - rect.y) / metrics.cell_height;
-        let column = (x - rect.x) / metrics.cell_width;
-
-        self.panes[pane_index].update_selection(row, column)
-    }
-
-    fn finalize_mouse_selection(&mut self) -> bool {
-        if self.panes.is_empty() || self.active_pane >= self.panes.len() {
-            return false;
-        }
-
-        self.panes[self.active_pane].copy_selection_to_clipboard()
-    }
-
-    fn forward_reference_click(&mut self) -> bool {
-        let Some((x, y)) = self.cursor_position else {
-            return false;
-        };
-        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
-            return false;
-        };
-
-        let pane_changed = self.active_pane != pane_index;
-        self.active_pane = pane_index;
-        if pane_index >= self.panes.len() {
-            return pane_changed;
-        }
-
-        let metrics = self.panes[pane_index].metrics();
-        let row = (y - rect.y) / metrics.cell_height;
-        let column = (x - rect.x) / metrics.cell_width;
-        let click = ReferenceClick {
-            at: Instant::now(),
-            pane_index,
-            row,
-            column,
-        };
-        let is_double_click = is_double_click(
-            self.last_reference_click.as_ref(),
-            &click,
-            DOUBLE_CLICK_THRESHOLD,
-        );
-        self.last_reference_click = Some(click);
-
-        let Some(target) =
-            self.panes[pane_index].reference_at(row, column, &self.config.working_directory)
-        else {
-            return pane_changed;
-        };
-
-        match target {
-            ReferenceTarget::File(target) => {
-                if !is_double_click {
-                    return pane_changed;
-                }
-
-                info!(
-                    path = %target.path.display(),
-                    line = ?target.line,
-                    "file reference double clicked"
-                );
-                self.events.try_send(Event::Ui(UiEvent::OpenRequested {
-                    path: target.path,
-                    line: target.line,
-                }));
-                true
+        if self.review_active {
+            if let Some(review_pane) = &mut self.review_pane {
+                let outcome = review_pane.handle_mouse_motion(x, y, self.modifiers)?;
+                self.apply_pane_outcome(outcome);
+            } else {
+                self.review_active = false;
             }
-            ReferenceTarget::Symbol(symbol) => {
-                if is_double_click {
-                    return pane_changed;
-                }
+            return Ok(());
+        }
 
-                info!(symbol = %symbol, "symbol reference clicked");
-                self.events
-                    .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
-                true
+        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+            return Ok(());
+        };
+
+        if pane_index != self.active_pane || pane_index >= self.panes.len() {
+            return Ok(());
+        }
+
+        let outcome =
+            self.panes[pane_index].handle_mouse_motion(x - rect.x, y - rect.y, self.modifiers)?;
+        self.apply_pane_outcome(outcome);
+        Ok(())
+    }
+
+    fn apply_pane_outcome(&mut self, outcome: PaneEventOutcome) {
+        self.dirty |= outcome.dirty;
+        self.force_redraw |= outcome.force_redraw;
+        if let Some(command) = outcome.command {
+            match command {
+                PaneCommand::OpenRequested { path, line } => {
+                    self.events
+                        .try_send(Event::Ui(UiEvent::OpenRequested { path, line }));
+                }
+                PaneCommand::SymbolOpenRequested { symbol } => {
+                    self.events
+                        .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
+                }
             }
         }
     }
@@ -869,9 +890,8 @@ impl WinitGhosttyApp {
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
         // rather than being silently swallowed.
         self.output_notifier.clear();
-        let is_agent_pane = self.panes.len() == 2;
-        for (idx, pane) in self.panes.iter_mut().enumerate() {
-            if is_agent_pane && idx == 1 {
+        for pane in self.panes.iter_mut() {
+            if pane.role() == PaneRole::AgentTerminal {
                 let chunks = pane.drain_output_chunks();
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
@@ -886,6 +906,9 @@ impl WinitGhosttyApp {
                 let had_output = pane.drain_output();
                 self.dirty |= had_output;
             }
+        }
+        if let Some(review_pane) = &mut self.review_pane {
+            self.dirty |= review_pane.drain_output();
         }
         self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
@@ -913,6 +936,9 @@ impl WinitGhosttyApp {
         for pane in &mut self.panes {
             pane.apply_theme(&self.terminal_config.theme);
         }
+        if let Some(review_pane) = &mut self.review_pane {
+            review_pane.apply_theme(&self.terminal_config.theme);
+        }
         if let Some(acp_pane) = &mut self.acp_pane {
             acp_pane.apply_theme(&self.terminal_config.theme);
         }
@@ -939,29 +965,47 @@ impl WinitGhosttyApp {
         }
         self.damage.clear();
         let mut redrawn = self.force_redraw;
-        for (index, pane) in self.panes.iter_mut().enumerate() {
-            redrawn |= pane.draw(
-                &mut self.font_renderer,
-                &mut self.buffer,
-                self.width,
-                self.height,
-                self.layout.pane(index),
-                index == self.active_pane,
-                self.force_redraw,
-                &mut self.damage,
-            );
-        }
-        if let Some(acp_pane) = &mut self.acp_pane {
-            redrawn |= acp_pane.draw(
-                &mut self.font_renderer,
-                &mut self.buffer,
-                self.width,
-                self.height,
-                self.layout.pane(1),
-                self.active_pane == 1,
-                self.force_redraw,
-                &mut self.damage,
-            );
+
+        if self.review_active {
+            if let Some(review_pane) = &mut self.review_pane {
+                redrawn |= review_pane.draw(
+                    &mut self.font_renderer,
+                    &mut self.buffer,
+                    self.width,
+                    self.height,
+                    full_window_rect(self.width, self.height),
+                    true,
+                    self.force_redraw,
+                    &mut self.damage,
+                );
+            } else {
+                self.review_active = false;
+            }
+        } else {
+            for (index, pane) in self.panes.iter_mut().enumerate() {
+                redrawn |= pane.draw(
+                    &mut self.font_renderer,
+                    &mut self.buffer,
+                    self.width,
+                    self.height,
+                    self.layout.pane(index),
+                    index == self.active_pane,
+                    self.force_redraw,
+                    &mut self.damage,
+                );
+            }
+            if let Some(acp_pane) = &mut self.acp_pane {
+                redrawn |= acp_pane.draw(
+                    &mut self.font_renderer,
+                    &mut self.buffer,
+                    self.width,
+                    self.height,
+                    self.layout.pane(1),
+                    self.active_pane == 1,
+                    self.force_redraw,
+                    &mut self.damage,
+                );
+            }
         }
 
         if let Some(ref modal) = self.acp_modal {
@@ -1089,11 +1133,7 @@ impl WinitGhosttyApp {
                     kind,
                 } => {
                     self.acp_modal = Some(AcpModalState::new(
-                        jsonrpc_id,
-                        title,
-                        message,
-                        options,
-                        kind,
+                        jsonrpc_id, title, message, options, kind,
                     ));
                 }
             }
@@ -1221,21 +1261,14 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
             WindowEvent::CursorMoved { position, .. } => {
                 self.cursor_position =
                     Some((position.x.max(0.0) as usize, position.y.max(0.0) as usize));
-                self.dirty |= self.update_mouse_selection();
-                Ok(())
+                self.handle_mouse_motion()
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_position = None;
                 Ok(())
             }
-            WindowEvent::MouseWheel { delta, .. } => {
-                self.handle_mouse_scroll(delta);
-                Ok(())
-            }
-            WindowEvent::MouseInput { state, button, .. } => {
-                self.handle_mouse_input(state, button);
-                Ok(())
-            }
+            WindowEvent::MouseWheel { delta, .. } => self.handle_mouse_scroll(delta),
+            WindowEvent::MouseInput { state, button, .. } => self.handle_mouse_input(state, button),
             WindowEvent::RedrawRequested => {
                 self.skip_background_drain_once = false;
                 self.render()
@@ -1280,26 +1313,17 @@ fn pane_count(config: &Config) -> usize {
     if config.agent_command.is_some() { 2 } else { 1 }
 }
 
-fn is_double_click(
-    previous: Option<&ReferenceClick>,
-    current: &ReferenceClick,
-    threshold: Duration,
-) -> bool {
-    previous.is_some_and(|previous| {
-        previous.pane_index == current.pane_index
-            && previous.row == current.row
-            && previous.column == current.column
-            && current.at.saturating_duration_since(previous.at) <= threshold
-    })
+fn full_window_rect(width: usize, height: usize) -> PaneRect {
+    PaneRect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    }
 }
 
-fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
-    (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
-        || (key == Key::Insert && (modifiers.shift || modifiers.super_key))
-}
-
-fn copy_requested(key: Key, modifiers: Modifiers) -> bool {
-    key == Key::C && modifiers.super_key
+fn hunk_review_command() -> &'static str {
+    r#"if command -v hunk >/dev/null 2>&1; then hunk diff; printf '\n[hunk exited - press Alt+R to return to via]\n'; exec "${SHELL:-sh}"; else printf 'via: hunk is not available on PATH. Set VIA_REVIEW_BACKEND=nvim or install hunk.\n'; exec "${SHELL:-sh}"; fi"#
 }
 
 fn nvim_args(config: &Config) -> Vec<OsString> {
@@ -1820,6 +1844,7 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: None,
+            review_backend: ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
@@ -1937,61 +1962,6 @@ mod tests {
         assert!(
             file_target_from_uri("https://example.com/src/main.rs", Path::new("/repo")).is_none()
         );
-    }
-
-    #[test]
-    fn classifies_double_click_when_same_cell_within_threshold() {
-        let first = ReferenceClick {
-            at: Instant::now(),
-            pane_index: 1,
-            row: 3,
-            column: 12,
-        };
-        let second = ReferenceClick {
-            at: first.at + Duration::from_millis(120),
-            pane_index: 1,
-            row: 3,
-            column: 12,
-        };
-
-        assert!(is_double_click(
-            Some(&first),
-            &second,
-            Duration::from_millis(300)
-        ));
-    }
-
-    #[test]
-    fn rejects_double_click_when_cell_or_pane_differs() {
-        let first = ReferenceClick {
-            at: Instant::now(),
-            pane_index: 1,
-            row: 3,
-            column: 12,
-        };
-        let different_cell = ReferenceClick {
-            at: first.at + Duration::from_millis(120),
-            pane_index: 1,
-            row: 4,
-            column: 12,
-        };
-        let different_pane = ReferenceClick {
-            at: first.at + Duration::from_millis(120),
-            pane_index: 0,
-            row: 3,
-            column: 12,
-        };
-
-        assert!(!is_double_click(
-            Some(&first),
-            &different_cell,
-            Duration::from_millis(300)
-        ));
-        assert!(!is_double_click(
-            Some(&first),
-            &different_pane,
-            Duration::from_millis(300)
-        ));
     }
 
     #[test]

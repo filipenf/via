@@ -12,15 +12,26 @@ pub enum Event {
 
 #[derive(Debug, Clone)]
 pub enum UiEvent {
-    OpenRequested { path: PathBuf, line: Option<u32> },
-    SymbolOpenRequested { symbol: String },
-    AgentPromptSubmitted { text: String },
+    OpenRequested {
+        path: PathBuf,
+        line: Option<u32>,
+    },
+    SymbolOpenRequested {
+        symbol: String,
+    },
+    ReviewRequested,
+    AgentPromptSubmitted {
+        text: String,
+    },
     /// JSON-RPC response written to the ACP agent stdin (`id` + `result` only).
     AcpJsonRpcResult {
         id: serde_json::Value,
         result: serde_json::Value,
     },
-    Resize { columns: u16, rows: u16 },
+    Resize {
+        columns: u16,
+        rows: u16,
+    },
 }
 
 /// ACP permission or Cursor ask-question option (`optionId` + display `name` / `label`).

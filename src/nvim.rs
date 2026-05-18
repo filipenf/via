@@ -12,6 +12,7 @@ type NvimWriter = Compat<WriteHalf<UnixStream>>;
 
 const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
 const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
+const REVIEW_LUA_TEMPLATE: &str = include_str!("../nvim/review.lua");
 
 pub async fn open_file(
     socket_path: &Path,
@@ -53,6 +54,32 @@ pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
 
     io_handle.abort();
     Ok(())
+}
+
+pub async fn open_review(socket_path: &Path, working_directory: &Path) -> Result<()> {
+    if !socket_path.exists() {
+        bail!(
+            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before opening review.",
+            socket_path.display()
+        );
+    }
+
+    let (nvim, io_handle) = connect(socket_path).await?;
+    let command = review_command(working_directory);
+
+    nvim.command(&command)
+        .await
+        .with_context(|| "failed to open Neovim review")?;
+
+    io_handle.abort();
+    Ok(())
+}
+
+fn review_command(working_directory: &Path) -> String {
+    let working_directory = lua_string_literal(&working_directory.to_string_lossy());
+    let replacements: [(&str, &str); 1] = [("__WORKING_DIRECTORY__", working_directory.as_str())];
+
+    lua_command(REVIEW_LUA_TEMPLATE, replacements.as_slice())
 }
 
 async fn connect(

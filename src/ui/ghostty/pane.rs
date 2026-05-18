@@ -9,7 +9,7 @@ use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
-use libghostty_vt::{Terminal, TerminalOptions};
+use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 
 use tracing::{debug, warn};
 
@@ -30,6 +30,30 @@ pub(super) struct TerminalPane {
     pub(super) title: &'static str,
     view: TerminalView,
     pty: Option<Rc<RefCell<PtySession>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneMouseAction {
+    Press,
+    Release,
+    Motion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PaneMouseButton {
+    Left,
+    Middle,
+    Right,
+    WheelUp,
+    WheelDown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct PaneMouseModifiers {
+    pub(super) ctrl: bool,
+    pub(super) shift: bool,
+    pub(super) alt: bool,
+    pub(super) super_key: bool,
 }
 
 impl TerminalPane {
@@ -133,6 +157,26 @@ impl TerminalPane {
         self.view.scroll_viewport(delta);
     }
 
+    pub(super) fn forward_mouse_event(
+        &mut self,
+        action: PaneMouseAction,
+        button: Option<PaneMouseButton>,
+        x: usize,
+        y: usize,
+        modifiers: PaneMouseModifiers,
+        any_button_pressed: bool,
+    ) -> Result<bool> {
+        let payload =
+            self.view
+                .mouse_event_payload(action, button, x, y, modifiers, any_button_pressed)?;
+        if payload.is_empty() {
+            return Ok(false);
+        }
+
+        self.write_all(&payload)?;
+        Ok(true)
+    }
+
     pub(super) fn begin_selection(&mut self, row: usize, column: usize) -> bool {
         self.view.begin_selection(row, column)
     }
@@ -219,6 +263,11 @@ impl TerminalPane {
 
     pub(super) fn apply_theme(&mut self, theme: &TerminalTheme) {
         self.view.apply_theme(theme);
+    }
+
+    #[cfg(test)]
+    pub(super) fn process_for_test(&mut self, bytes: &[u8], follow_output: bool) {
+        self.view.process(bytes, follow_output);
     }
 
     /// Visible terminal rows in the current pane (for page-scroll step size).
@@ -331,6 +380,57 @@ impl TerminalView {
 
     fn scroll_viewport(&mut self, delta: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+    }
+
+    fn mouse_event_payload(
+        &mut self,
+        action: PaneMouseAction,
+        button: Option<PaneMouseButton>,
+        x: usize,
+        y: usize,
+        modifiers: PaneMouseModifiers,
+        any_button_pressed: bool,
+    ) -> Result<Vec<u8>> {
+        let mut encoder = mouse::Encoder::new().context("failed to create mouse encoder")?;
+        encoder
+            .set_options_from_terminal(&self.terminal)
+            .set_size(mouse::EncoderSize {
+                screen_width: self.size.pixel_width as u32,
+                screen_height: self.size.pixel_height as u32,
+                cell_width: self.metrics.cell_width as u32,
+                cell_height: self.metrics.cell_height as u32,
+                padding_top: 0,
+                padding_bottom: 0,
+                padding_right: 0,
+                padding_left: 0,
+            })
+            .set_any_button_pressed(any_button_pressed);
+
+        let mut event = mouse::Event::new().context("failed to create mouse event")?;
+        event
+            .set_action(match action {
+                PaneMouseAction::Press => mouse::Action::Press,
+                PaneMouseAction::Release => mouse::Action::Release,
+                PaneMouseAction::Motion => mouse::Action::Motion,
+            })
+            .set_button(button.map(|button| match button {
+                PaneMouseButton::Left => mouse::Button::Left,
+                PaneMouseButton::Middle => mouse::Button::Middle,
+                PaneMouseButton::Right => mouse::Button::Right,
+                PaneMouseButton::WheelUp => mouse::Button::Four,
+                PaneMouseButton::WheelDown => mouse::Button::Five,
+            }))
+            .set_mods(mouse_modifiers(modifiers))
+            .set_position(mouse::Position {
+                x: x.min(self.size.pixel_width.saturating_sub(1) as usize) as f32,
+                y: y.min(self.size.pixel_height.saturating_sub(1) as usize) as f32,
+            });
+
+        let mut payload = Vec::with_capacity(32);
+        encoder
+            .encode_to_vec(&event, &mut payload)
+            .context("failed to encode mouse event")?;
+        Ok(payload)
     }
 
     fn set_pty_response_writer(&mut self, pty: Rc<RefCell<PtySession>>) -> Result<()> {
@@ -603,6 +703,23 @@ fn drain_pty_output(
     }
 
     drained_chunks
+}
+
+fn mouse_modifiers(modifiers: PaneMouseModifiers) -> vt_key::Mods {
+    let mut mods = vt_key::Mods::empty();
+    if modifiers.ctrl {
+        mods |= vt_key::Mods::CTRL;
+    }
+    if modifiers.shift {
+        mods |= vt_key::Mods::SHIFT;
+    }
+    if modifiers.alt {
+        mods |= vt_key::Mods::ALT;
+    }
+    if modifiers.super_key {
+        mods |= vt_key::Mods::SUPER;
+    }
+    mods
 }
 
 #[derive(Default)]

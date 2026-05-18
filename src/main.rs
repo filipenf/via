@@ -27,7 +27,8 @@ fn main() -> Result<()> {
 async fn async_main() -> Result<()> {
     logging::init();
 
-    let config = Config::from_env();
+    let mut config = Config::from_env();
+    config.apply_cli_args(std::env::args().skip(1));
     info!(?config, "starting via");
 
     if let Some(target) = cli_open_target(&config) {
@@ -86,10 +87,19 @@ async fn async_main() -> Result<()> {
 fn cli_open_target(config: &Config) -> Option<FileTarget> {
     let mut args = std::env::args().skip(1);
 
-    match args.next().as_deref() {
-        Some("--open") => args
-            .next()
-            .map(|target| FileTarget::parse(&target, &config.working_directory)),
-        _ => None,
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--open" => {
+                return args
+                    .next()
+                    .map(|target| FileTarget::parse(&target, &config.working_directory));
+            }
+            "--review-backend" => {
+                let _ = args.next();
+            }
+            _ => {}
+        }
     }
+
+    None
 }
