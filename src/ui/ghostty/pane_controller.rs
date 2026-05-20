@@ -7,8 +7,8 @@ use tracing::info;
 use winit::event::{ElementState, MouseButton};
 
 use super::input::{
-    Key, Modifiers, copy_requested, forward_special_keys, forward_text_input, paste_requested,
-    try_clipboard_paste,
+    copy_requested, forward_special_keys, forward_text_input, paste_requested, try_clipboard_paste,
+    Key, Modifiers,
 };
 use super::links::ReferenceTarget;
 use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
@@ -161,6 +161,12 @@ impl TerminalPaneController {
                 self.forward_terminal_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
             }
             PaneRole::Editor | PaneRole::AgentTerminal => {
+                let forwarded =
+                    self.forward_terminal_mouse_wheel(scroll_delta, local_x, local_y, modifiers)?;
+                if forwarded.dirty {
+                    return Ok(forwarded);
+                }
+
                 let Some(delta_y) = viewport_scroll_delta(scroll_delta) else {
                     return Ok(PaneEventOutcome::default());
                 };
@@ -679,6 +685,35 @@ mod tests {
             .unwrap();
 
         assert_eq!(pane.held_button_for_test(), Some(PaneMouseButton::Left));
+    }
+
+    #[test]
+    fn local_wheel_falls_back_to_viewport_without_mouse_reporting() {
+        for role in [PaneRole::Editor, PaneRole::AgentTerminal] {
+            let mut pane = test_controller(role);
+
+            let outcome = pane
+                .handle_mouse_wheel((0.0, 40.0), 0, 0, Modifiers::default())
+                .unwrap();
+
+            assert!(outcome.dirty);
+            assert!(outcome.force_redraw);
+        }
+    }
+
+    #[test]
+    fn local_wheel_forwards_when_mouse_reporting_is_enabled() {
+        for role in [PaneRole::Editor, PaneRole::AgentTerminal] {
+            let mut pane = test_controller(role);
+            pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+            let outcome = pane
+                .handle_mouse_wheel((0.0, 40.0), 0, 0, Modifiers::default())
+                .unwrap();
+
+            assert!(outcome.dirty);
+            assert!(!outcome.force_redraw);
+        }
     }
 
     fn test_controller(role: PaneRole) -> TerminalPaneController {
