@@ -91,6 +91,19 @@ impl AcpPane {
         true
     }
 
+    pub(super) fn scroll_transcript_to_top(&mut self) -> bool {
+        self.transcript_follow_bottom = false;
+        self.transcript_scroll_y = 0;
+        self.dirty = true;
+        true
+    }
+
+    pub(super) fn scroll_transcript_to_bottom(&mut self) -> bool {
+        self.transcript_follow_bottom = true;
+        self.dirty = true;
+        true
+    }
+
     /// Rows available for the transcript body (ratatui cells), for page-scroll step size.
     pub(super) fn transcript_viewport_rows(&self) -> u16 {
         let prompt_h = self.prompt_height_cells();

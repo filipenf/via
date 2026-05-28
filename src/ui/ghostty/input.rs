@@ -221,8 +221,8 @@ pub(super) fn forward_special_keys(
             continue;
         }
 
-        // Viewport scroll is handled before key forwarding; do not send CSI Page keys.
-        if modifiers.shift && matches!(key, Key::PageUp | Key::PageDown) {
+        // Viewport scroll is handled before key forwarding; do not send CSI navigation keys.
+        if matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End) {
             continue;
         }
 

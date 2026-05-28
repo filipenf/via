@@ -157,6 +157,16 @@ impl TerminalPane {
         self.view.scroll_viewport(delta);
     }
 
+    pub(super) fn scroll_viewport_to_top(&mut self) {
+        self.view.clear_selection();
+        self.view.scroll_viewport_to_top();
+    }
+
+    pub(super) fn scroll_viewport_to_bottom(&mut self) {
+        self.view.clear_selection();
+        self.view.scroll_viewport_to_bottom();
+    }
+
     pub(super) fn forward_mouse_event(
         &mut self,
         action: PaneMouseAction,
@@ -380,6 +390,14 @@ impl TerminalView {
 
     fn scroll_viewport(&mut self, delta: isize) {
         self.terminal.scroll_viewport(ScrollViewport::Delta(delta));
+    }
+
+    fn scroll_viewport_to_top(&mut self) {
+        self.terminal.scroll_viewport(ScrollViewport::Top);
+    }
+
+    fn scroll_viewport_to_bottom(&mut self) {
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
     }
 
     fn mouse_event_payload(

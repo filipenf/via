@@ -106,7 +106,7 @@ impl TerminalPaneController {
             return Ok(outcome);
         }
 
-        if modifiers.shift && !suppress_input {
+        if !suppress_input {
             let step = self.pane.viewport_rows().max(1) as isize;
             for key in pressed_keys.iter().copied() {
                 match key {
@@ -118,6 +118,18 @@ impl TerminalPaneController {
                     }
                     Key::PageDown => {
                         self.pane.scroll_viewport(step);
+                        outcome.dirty = true;
+                        outcome.force_redraw = true;
+                        return Ok(outcome);
+                    }
+                    Key::Home => {
+                        self.pane.scroll_viewport_to_top();
+                        outcome.dirty = true;
+                        outcome.force_redraw = true;
+                        return Ok(outcome);
+                    }
+                    Key::End => {
+                        self.pane.scroll_viewport_to_bottom();
                         outcome.dirty = true;
                         outcome.force_redraw = true;
                         return Ok(outcome);

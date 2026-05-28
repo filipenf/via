@@ -551,7 +551,7 @@ impl WinitGhosttyApp {
             self.dirty = true;
         }
         if self.active_pane >= self.panes.len() {
-            if !layout_shortcut_consumed && self.modifiers.shift {
+            if !layout_shortcut_consumed {
                 if let Some(acp_pane) = &mut self.acp_pane {
                     let step = acp_pane.transcript_viewport_rows().max(1) as isize;
                     for key in pressed_keys.iter().copied() {
@@ -564,6 +564,18 @@ impl WinitGhosttyApp {
                             }
                             Key::PageDown => {
                                 acp_pane.scroll_transcript(-step);
+                                self.dirty = true;
+                                self.force_redraw = true;
+                                return Ok(());
+                            }
+                            Key::Home => {
+                                acp_pane.scroll_transcript_to_top();
+                                self.dirty = true;
+                                self.force_redraw = true;
+                                return Ok(());
+                            }
+                            Key::End => {
+                                acp_pane.scroll_transcript_to_bottom();
                                 self.dirty = true;
                                 self.force_redraw = true;
                                 return Ok(());
