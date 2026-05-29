@@ -221,11 +221,6 @@ pub(super) fn forward_special_keys(
             continue;
         }
 
-        // Viewport scroll is handled before key forwarding; do not send CSI navigation keys.
-        if matches!(key, Key::PageUp | Key::PageDown | Key::Home | Key::End) {
-            continue;
-        }
-
         if modifiers.ctrl {
             if let Some(bytes) = ctrl_sequence(key) {
                 payload.extend_from_slice(&bytes);

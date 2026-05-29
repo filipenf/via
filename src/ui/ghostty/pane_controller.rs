@@ -106,7 +106,7 @@ impl TerminalPaneController {
             return Ok(outcome);
         }
 
-        if !suppress_input {
+        if !suppress_input && self.intercepts_viewport_navigation_keys() {
             let step = self.pane.viewport_rows().max(1) as isize;
             for key in pressed_keys.iter().copied() {
                 match key {
@@ -464,6 +464,19 @@ impl DerefMut for TerminalPaneController {
     }
 }
 
+impl TerminalPaneController {
+    /// Agent panes always use Page/Home/End for scrollback. Editor/review panes forward those
+    /// keys to the running program (e.g. Neovim) while pinned to the live bottom; after the user
+    /// scrolls into history, the same keys move the viewport again.
+    fn intercepts_viewport_navigation_keys(&self) -> bool {
+        match self.role {
+            PaneRole::AgentTerminal => true,
+            PaneRole::ReviewTerminal => false,
+            PaneRole::Editor => !self.pane.is_viewport_at_bottom(),
+        }
+    }
+}
+
 fn viewport_scroll_delta(scroll_delta: (f32, f32)) -> Option<isize> {
     let (sx, sy) = scroll_delta;
     let sy = sy + sx;
@@ -555,6 +568,61 @@ mod tests {
             &different_cell,
             Duration::from_millis(300)
         ));
+    }
+
+    #[test]
+    fn agent_intercepts_page_keys_for_viewport_scroll() {
+        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let outcome = pane
+            .handle_terminal_key(
+                &[Key::PageUp],
+                Some(Key::PageUp),
+                None,
+                false,
+                Modifiers::default(),
+                false,
+            )
+            .unwrap();
+        assert!(outcome.force_redraw);
+    }
+
+    #[test]
+    fn editor_forwards_page_keys_at_live_bottom() {
+        let mut pane = test_controller(PaneRole::Editor);
+        let outcome = pane
+            .handle_terminal_key(
+                &[Key::PageUp],
+                Some(Key::PageUp),
+                None,
+                false,
+                Modifiers::default(),
+                false,
+            )
+            .unwrap();
+        assert!(outcome.dirty);
+        assert!(!outcome.force_redraw);
+    }
+
+    #[test]
+    fn editor_intercepts_page_keys_when_scrolled_into_scrollback() {
+        let mut pane = test_controller(PaneRole::Editor);
+        for index in 1..=10 {
+            pane.process_for_test(format!("L{index:02}\r\n").as_bytes(), true);
+        }
+        pane.scroll_viewport(-2);
+        assert!(!pane.is_viewport_at_bottom());
+
+        let outcome = pane
+            .handle_terminal_key(
+                &[Key::PageUp],
+                Some(Key::PageUp),
+                None,
+                false,
+                Modifiers::default(),
+                false,
+            )
+            .unwrap();
+        assert!(outcome.force_redraw);
     }
 
     #[test]

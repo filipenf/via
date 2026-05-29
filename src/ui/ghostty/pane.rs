@@ -284,6 +284,10 @@ impl TerminalPane {
     pub(super) fn viewport_rows(&self) -> usize {
         self.view.size.rows as usize
     }
+
+    pub(super) fn is_viewport_at_bottom(&self) -> bool {
+        self.view.is_viewport_at_bottom()
+    }
 }
 
 struct TerminalView {
