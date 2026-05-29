@@ -1,6 +1,43 @@
 # via
 
-A Rust terminal application that bridges Neovim and AI agents via libghostty's VT engine.
+A Rust terminal application that bridges Neovim and AI agents via libghostty's
+VT engine.
+
+## why via?
+
+I built via because I didn't like the way most AI plugins for nvim work. The
+fundamental problem is that managing the AI panes inside nvim is tricky, you
+get a lot of flickering, screen incorrectly laid out and hard to navigate, etc.
+
+So via is my attempt to solve those problems by bridging the AI agent with
+nvim. It creates separate panes (libghostty terminals) for each and connects
+them.
+
+**neovim to Agent**
+
+- You can send the current selection or buffer with <leader>a,b
+
+**Agent to nvim**
+
+- Clicking on a file name will open that file in nvim
+- Clicking on a symbol will open the Symbol search pane in neovim
+
+## Work in progress
+
+This is very much an experimental project, although I used it as my daily "IDE"
+it has some rough edges still. Some things I have planned:
+
+- Review process: make it easier to switch between agent/review and send
+  feedback to the agent directly from the vim pane (may use some existing nvim
+  plugin for this)
+- Diagnostics integration: allow the agent to pull diagnostics info from nvim
+- Better use of LSP: the symbol search could be further updated to highlight
+  known symbols on the agent pane
+
+## Runtime requirements
+
+Both my work and personal laptops are Omarchy Linux (so hyprland/wayland). I
+haven't tried it in other linux distros and/or other operating systems
 
 ## Build requirements
 
@@ -30,6 +67,13 @@ search path setup is needed.
 Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
 bridge is written to a temp file when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
 if you want to load a custom script from disk during development.
+
+## Release
+
+Create and publish a GitHub release for a tag, such as `v0.1.0`. The release
+workflow builds `via` in release mode, packages the binary and README into
+`via-<tag>-linux-x86_64.tgz`, and uploads the archive plus its SHA-256 checksum
+to the release.
 
 ## Detached mode
 
