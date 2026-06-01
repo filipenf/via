@@ -4,6 +4,8 @@ use anyhow::{Context, Result, bail};
 use nvim_rs::compat::tokio::Compat;
 use nvim_rs::create::tokio as create;
 use nvim_rs::rpc::handler::Dummy;
+use nvim_rs::rpc::unpack::TryUnpack;
+use serde::{Deserialize, Serialize};
 use tokio::io::WriteHalf;
 use tokio::net::UnixStream;
 use tokio::time::{Duration, sleep};
@@ -13,6 +15,43 @@ type NvimWriter = Compat<WriteHalf<UnixStream>>;
 const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
 const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
 const REVIEW_LUA_TEMPLATE: &str = include_str!("../nvim/review.lua");
+const DIAGNOSTICS_LUA_TEMPLATE: &str = include_str!("../nvim/diagnostics.lua");
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticsOutput {
+    pub repo: PathBuf,
+    #[serde(flatten)]
+    pub report: DiagnosticsReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticsReport {
+    pub path: PathBuf,
+    pub summary: DiagnosticSummary,
+    pub items: Vec<DiagnosticItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticSummary {
+    pub errors: usize,
+    pub warnings: usize,
+    pub infos: usize,
+    pub hints: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiagnosticItem {
+    pub lnum: u32,
+    pub col: u32,
+    pub end_lnum: u32,
+    pub end_col: u32,
+    pub message: String,
+    pub severity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<serde_json::Value>,
+}
 
 pub async fn open_file(
     socket_path: &Path,
@@ -54,6 +93,40 @@ pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
 
     io_handle.abort();
     Ok(())
+}
+
+pub async fn get_diagnostics(
+    socket_path: &Path,
+    file: Option<&Path>,
+) -> Result<DiagnosticsReport> {
+    if !socket_path.exists() {
+        bail!(
+            "Neovim RPC socket does not exist at {}. Start via before running session diagnostics.",
+            socket_path.display()
+        );
+    }
+
+    let (nvim, io_handle) = connect(socket_path).await?;
+    let file_path = file
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_literal = lua_string_literal(&file_path);
+    let replacements: [(&str, &str); 1] = [("__FILE_PATH__", file_literal.as_str())];
+    let code = exec_lua_chunk(DIAGNOSTICS_LUA_TEMPLATE, &replacements);
+
+    let value = nvim
+        .exec_lua(&code, Vec::new())
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to query Neovim diagnostics: {error}"))?;
+    let json: String = value
+        .try_unpack()
+        .map_err(|error| anyhow::anyhow!("unexpected diagnostics payload from Neovim: {error:?}"))?;
+
+    io_handle.abort();
+
+    let report: DiagnosticsReport =
+        serde_json::from_str(&json).context("failed to parse diagnostics JSON from Neovim")?;
+    Ok(report)
 }
 
 pub async fn open_review(socket_path: &Path, working_directory: &Path) -> Result<()> {
@@ -200,13 +273,17 @@ fn symbol_open_command(symbol: &str) -> String {
 }
 
 fn lua_command(template: &str, replacements: &[(&str, &str)]) -> String {
+    format!("lua {}", exec_lua_chunk(template, replacements))
+}
+
+fn exec_lua_chunk(template: &str, replacements: &[(&str, &str)]) -> String {
     let mut command = template.trim().to_string();
 
     for (needle, value) in replacements {
         command = command.replace(needle, value);
     }
 
-    format!("lua {command}")
+    command
 }
 
 fn lua_string_literal(input: &str) -> String {
@@ -336,5 +413,18 @@ mod tests {
     #[test]
     fn escapes_symbol_for_lua_literal() {
         assert_eq!(lua_string_literal("Foo\"\\\n\t"), "\"Foo\\\"\\\\\\n\\t\"");
+    }
+
+    #[test]
+    fn parses_sample_diagnostics_json() {
+        let json = r#"{
+            "path":"/repo/src/main.rs",
+            "summary":{"errors":1,"warnings":0,"infos":0,"hints":0},
+            "items":[{"lnum":10,"col":3,"end_lnum":10,"end_col":8,"message":"expected `;`","severity":"error","source":"rustc","code":"E0423"}]
+        }"#;
+        let report: DiagnosticsReport = serde_json::from_str(json).unwrap();
+        assert_eq!(report.summary.errors, 1);
+        assert_eq!(report.items.len(), 1);
+        assert_eq!(report.items[0].severity, "error");
     }
 }

@@ -10,7 +10,6 @@ mod unix {
     use std::fs::OpenOptions;
     use std::io::{self, Write};
     use std::os::unix::process::CommandExt;
-    use std::path::PathBuf;
     use std::process::{Command, Stdio};
 
     use anyhow::{Context, Result};
@@ -56,7 +55,7 @@ mod unix {
         }
 
         let pid = std::process::id();
-        let root = PathBuf::from(format!("/tmp/via-{pid}"));
+        let root = crate::config::via_data_dir().join(format!("via-{pid}"));
         std::fs::create_dir_all(root.join("logs"))
             .with_context(|| format!("create runtime directory {}", root.display()))?;
         println!("via runtime directory: {}", root.display());

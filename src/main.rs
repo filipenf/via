@@ -1,5 +1,6 @@
 mod acp;
 mod bootstrap;
+mod cli;
 mod config;
 mod editor;
 mod event;
@@ -8,6 +9,7 @@ mod lsp_bridge;
 mod mediator;
 mod nvim;
 mod pty;
+mod session;
 mod ui;
 
 use anyhow::Result;
@@ -19,23 +21,45 @@ use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
 fn main() -> Result<()> {
-    bootstrap::maybe_detach()?;
-    async_main()
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli_command = cli::parse_cli(&args)?;
+
+    // CLI subcommands run headless; only the TUI detaches from the controlling terminal.
+    if cli_command.is_none() {
+        bootstrap::maybe_detach()?;
+        // Single-threaded here (before the runtime starts), so exporting the session handle is
+        // safe. Child panes/agents capture the process environment when they are spawned, so they
+        // inherit VIA_SESSION and can resolve diagnostics without a `--repo` argument.
+        unsafe {
+            std::env::set_var(session::VIA_SESSION_ENV, session::manifest_path());
+        }
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(async_main(args, cli_command))
 }
 
-#[tokio::main]
-async fn async_main() -> Result<()> {
+async fn async_main(args: Vec<String>, cli_command: Option<cli::CliCommand>) -> Result<()> {
+    if let Some(command) = cli_command {
+        return cli::run(command).await;
+    }
+
     logging::init();
+    config::ensure_runtime_dir()?;
 
     let mut config = Config::from_env();
-    config.apply_cli_args(std::env::args().skip(1));
+    config.apply_cli_args(args.iter().map(String::as_str));
     info!(?config, "starting via");
 
-    if let Some(target) = cli_open_target(&config) {
+    if let Some(target) = cli_open_target(&config, &args) {
         nvim::log_socket_warning(&config.nvim_socket_path);
         nvim::open_file(&config.nvim_socket_path, &config.working_directory, target).await?;
         return Ok(());
     }
+
+    let _session_guard = session::SessionGuard::create(&config)?;
 
     let mut mediator = Mediator::new(config.clone());
 
@@ -84,20 +108,20 @@ async fn async_main() -> Result<()> {
     Ok(())
 }
 
-fn cli_open_target(config: &Config) -> Option<FileTarget> {
-    let mut args = std::env::args().skip(1);
-
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
+fn cli_open_target(config: &Config, args: &[String]) -> Option<FileTarget> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
             "--open" => {
+                index += 1;
                 return args
-                    .next()
-                    .map(|target| FileTarget::parse(&target, &config.working_directory));
+                    .get(index)
+                    .map(|target| FileTarget::parse(target, &config.working_directory));
             }
             "--review-backend" => {
-                let _ = args.next();
+                index += 2;
             }
-            _ => {}
+            _ => index += 1,
         }
     }
 

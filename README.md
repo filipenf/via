@@ -30,7 +30,7 @@ it has some rough edges still. Some things I have planned:
 - Review process: make it easier to switch between agent/review and send
   feedback to the agent directly from the vim pane (may use some existing nvim
   plugin for this)
-- Diagnostics integration: allow the agent to pull diagnostics info from nvim
+- Diagnostics integration: `via session diagnostics --repo . --json` and `via agent skill show`
 - Better use of LSP: the symbol search could be further updated to highlight
   known symbols on the agent pane
 
@@ -65,7 +65,8 @@ cargo build --release
 search path setup is needed.
 
 Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
-bridge is written to a temp file when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
+bridge is written to via's data directory (`$XDG_DATA_HOME/via`, or
+`~/.local/share/via`) when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
 if you want to load a custom script from disk during development.
 
 ## Release

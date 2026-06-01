@@ -9,12 +9,37 @@ static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Directory for sockets, the context bridge script, and other per-process files.
 ///
-/// After a detached start this is `/tmp/via-<pid>/` from `VIA_RUNTIME_ROOT`. Otherwise it matches
-/// [`std::env::temp_dir`] unless overridden per-path via environment variables.
+/// After a detached start this is `<data dir>/via-<pid>/` from `VIA_RUNTIME_ROOT`. Otherwise it is
+/// the via data directory itself (see [`via_data_dir`]), unless overridden per-path via environment
+/// variables.
 pub fn runtime_base_dir() -> PathBuf {
     env::var_os("VIA_RUNTIME_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(env::temp_dir)
+        .unwrap_or_else(via_data_dir)
+}
+
+/// via's data directory: `$XDG_DATA_HOME/via`, falling back to `$HOME/.local/share/via`, then the
+/// system temp dir as a last resort.
+///
+/// This is derived purely from `XDG_DATA_HOME`/`HOME` (never `VIA_RUNTIME_ROOT`), so a detached
+/// via process and the child commands it spawns always agree on it. It is the parent of detached
+/// per-pid runtime directories and the search root for session discovery.
+pub fn via_data_dir() -> PathBuf {
+    if let Some(dir) = env::var_os("XDG_DATA_HOME") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return dir.join("via");
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        return PathBuf::from(home).join(".local/share/via");
+    }
+    env::temp_dir().join("via")
+}
+
+/// Ensure the runtime directory exists before sockets are bound or scripts are written.
+pub fn ensure_runtime_dir() -> std::io::Result<()> {
+    std::fs::create_dir_all(runtime_base_dir())
 }
 
 #[derive(Debug, Clone)]
@@ -136,8 +161,11 @@ fn default_editor_socket_path() -> PathBuf {
 fn default_nvim_context_bridge_path() -> PathBuf {
     EMBEDDED_CONTEXT_BRIDGE_PATH
         .get_or_init(|| {
-            let path =
-                runtime_base_dir().join(format!("via-context-bridge-{}.lua", std::process::id()));
+            let dir = runtime_base_dir();
+            let path = dir.join(format!("via-context-bridge-{}.lua", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
+                panic!("failed to create via runtime directory {}: {err}", dir.display());
+            });
             std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
                 |err| {
                     panic!(
