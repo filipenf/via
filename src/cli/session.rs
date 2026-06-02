@@ -1,54 +1,37 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+use clap::Subcommand;
 
 use crate::nvim::{self, DiagnosticsOutput};
 use crate::session;
 
-pub struct SessionCli {
-    pub subcommand: SessionSubcommand,
-}
-
-pub enum SessionSubcommand {
-    List { json: bool },
-    Get { json: bool },
+#[derive(Subcommand)]
+pub enum SessionCommand {
+    /// List live via sessions.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show the session referenced by `VIA_SESSION`.
+    Get {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export Neovim diagnostics for the current session.
     Diagnostics {
+        #[arg(long)]
         file: Option<PathBuf>,
+        #[arg(long)]
         json: bool,
     },
 }
 
-impl SessionCli {
-    pub fn parse(args: &[String]) -> Result<Self> {
-        let Some(subcommand) = args.first().map(String::as_str) else {
-            bail!("missing session subcommand (list, get, diagnostics)");
-        };
-
-        let subcommand = match subcommand {
-            "list" => SessionSubcommand::List {
-                json: args.contains(&"--json".to_string()),
-            },
-            "get" => SessionSubcommand::Get {
-                json: args.contains(&"--json".to_string()),
-            },
-            "diagnostics" => SessionSubcommand::Diagnostics {
-                file: optional_flag_value(args, "--file")?,
-                json: args.contains(&"--json".to_string()),
-            },
-            other => bail!("unknown session subcommand `{other}`"),
-        };
-
-        Ok(Self { subcommand })
-    }
-}
-
-pub async fn run(command: SessionCli) -> Result<()> {
-    match command.subcommand {
-        SessionSubcommand::List { json } => run_list(json),
-        SessionSubcommand::Get { json } => run_get(json),
-        SessionSubcommand::Diagnostics { file, json } => {
-            run_diagnostics(file.as_deref(), json).await
-        }
+pub async fn run(command: SessionCommand) -> Result<()> {
+    match command {
+        SessionCommand::List { json } => run_list(json),
+        SessionCommand::Get { json } => run_get(json),
+        SessionCommand::Diagnostics { file, json } => run_diagnostics(file.as_deref(), json).await,
     }
 }
 
@@ -129,48 +112,5 @@ fn print_human_diagnostics(output: &DiagnosticsOutput) {
             item.severity,
             item.message
         );
-    }
-}
-
-fn optional_flag_value(args: &[String], flag: &str) -> Result<Option<PathBuf>> {
-    let Some(index) = args.iter().position(|arg| arg == flag) else {
-        return Ok(None);
-    };
-    let Some(value) = args.get(index + 1) else {
-        bail!("missing value for `{flag}`");
-    };
-    Ok(Some(PathBuf::from(value)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_session_list() {
-        let command = SessionCli::parse(&["list".to_string(), "--json".to_string()]).unwrap();
-        assert!(matches!(
-            command.subcommand,
-            SessionSubcommand::List { json: true }
-        ));
-    }
-
-    #[test]
-    fn parses_session_diagnostics() {
-        let command = SessionCli::parse(&[
-            "diagnostics".to_string(),
-            "--file".to_string(),
-            "src/main.rs".to_string(),
-            "--json".to_string(),
-        ])
-        .unwrap();
-        assert!(matches!(
-            command.subcommand,
-            SessionSubcommand::Diagnostics {
-                json: true,
-                file: Some(_),
-                ..
-            }
-        ));
     }
 }

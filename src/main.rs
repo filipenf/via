@@ -1,4 +1,5 @@
 mod acp;
+mod agent_skill;
 mod bootstrap;
 mod cli;
 mod config;
@@ -13,53 +14,85 @@ mod session;
 mod ui;
 
 use anyhow::Result;
+use clap::Parser;
 use tracing::info;
 
+use crate::cli::Cli;
 use crate::config::Config;
 use crate::mediator::Mediator;
 use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
 fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let cli_command = cli::parse_cli(&args)?;
+    let cli = Cli::parse();
 
-    // CLI subcommands run headless; only the TUI detaches from the controlling terminal.
-    if cli_command.is_none() {
-        bootstrap::maybe_detach()?;
-        // Single-threaded here (before the runtime starts), so exporting the session handle is
-        // safe. Child panes/agents capture the process environment when they are spawned, so they
-        // inherit VIA_SESSION and can resolve diagnostics without a `--repo` argument.
-        unsafe {
-            std::env::set_var(session::VIA_SESSION_ENV, session::manifest_path());
-        }
+    if cli.command.is_some() {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(run_headless(cli));
+    }
+
+    bootstrap::maybe_detach()?;
+    // Single-threaded here (before the runtime starts), so exporting the session handle is
+    // safe. Child panes/agents capture the process environment when they are spawned, so they
+    // inherit VIA_SESSION and can resolve diagnostics without a `--repo` argument.
+    unsafe {
+        std::env::set_var(session::VIA_SESSION_ENV, session::manifest_path());
     }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(async_main(args, cli_command))
+        .block_on(async_main(cli))
 }
 
-async fn async_main(args: Vec<String>, cli_command: Option<cli::CliCommand>) -> Result<()> {
-    if let Some(command) = cli_command {
-        return cli::run(command).await;
-    }
+async fn run_headless(cli: Cli) -> Result<()> {
+    let Some(command) = cli.command else {
+        return Ok(());
+    };
+    cli::run(command).await
+}
 
+async fn async_main(cli: Cli) -> Result<()> {
     logging::init();
     config::ensure_runtime_dir()?;
 
     let mut config = Config::from_env();
-    config.apply_cli_args(args.iter().map(String::as_str));
+    if let Some(review_backend) = cli.review_backend {
+        config.review_backend = review_backend;
+    }
     info!(?config, "starting via");
 
-    if let Some(target) = cli_open_target(&config, &args) {
+    if let Some(open) = cli.open {
         nvim::log_socket_warning(&config.nvim_socket_path);
+        let target = FileTarget::parse(&open, &config.working_directory);
         nvim::open_file(&config.nvim_socket_path, &config.working_directory, target).await?;
         return Ok(());
     }
 
     let _session_guard = session::SessionGuard::create(&config)?;
+
+    if let Some(agent_command) = &config.agent_command {
+        let family = agent_skill::detect_agent_family(agent_command);
+        match agent_skill::ensure_global_skill(family) {
+            Ok(paths) if !paths.is_empty() => {
+                info!(
+                    agent = %agent_command,
+                    count = paths.len(),
+                    "installed via-editor skill for agent"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                tracing::warn!(
+                    agent = %agent_command,
+                    %err,
+                    "failed to install via-editor skill for agent"
+                );
+            }
+        }
+    }
 
     let mut mediator = Mediator::new(config.clone());
 
@@ -106,24 +139,4 @@ async fn async_main(args: Vec<String>, cli_command: Option<cli::CliCommand>) -> 
 
     handle.shutdown().await;
     Ok(())
-}
-
-fn cli_open_target(config: &Config, args: &[String]) -> Option<FileTarget> {
-    let mut index = 0;
-    while index < args.len() {
-        match args[index].as_str() {
-            "--open" => {
-                index += 1;
-                return args
-                    .get(index)
-                    .map(|target| FileTarget::parse(target, &config.working_directory));
-            }
-            "--review-backend" => {
-                index += 2;
-            }
-            _ => index += 1,
-        }
-    }
-
-    None
 }

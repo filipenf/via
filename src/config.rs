@@ -121,33 +121,6 @@ impl Config {
             .unwrap_or(false)
     }
 
-    pub fn apply_cli_args<I, S>(&mut self, args: I)
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let mut args = args.into_iter();
-        while let Some(arg) = args.next() {
-            let arg = arg.as_ref();
-            if let Some(value) = arg.strip_prefix("--review-backend=") {
-                self.apply_review_backend(value);
-                continue;
-            }
-
-            if arg == "--review-backend" {
-                if let Some(value) = args.next() {
-                    self.apply_review_backend(value.as_ref());
-                }
-            }
-        }
-    }
-
-    fn apply_review_backend(&mut self, value: &str) {
-        match value.parse() {
-            Ok(review_backend) => self.review_backend = review_backend,
-            Err(error) => tracing::warn!(%error, "ignoring invalid review backend"),
-        }
-    }
 }
 
 fn default_nvim_socket_path() -> PathBuf {
@@ -231,21 +204,4 @@ mod tests {
         assert_eq!("vimdiff".parse::<ReviewBackend>(), Ok(ReviewBackend::Nvim));
     }
 
-    #[test]
-    fn cli_review_backend_overrides_existing_value() {
-        let mut config = Config {
-            nvim_command: "nvim".to_string(),
-            agent_command: None,
-            review_backend: ReviewBackend::Nvim,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/repo"),
-        };
-
-        config.apply_cli_args(["--review-backend", "hunk"]);
-
-        assert_eq!(config.review_backend, ReviewBackend::Hunk);
-    }
 }

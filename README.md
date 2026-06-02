@@ -30,7 +30,7 @@ it has some rough edges still. Some things I have planned:
 - Review process: make it easier to switch between agent/review and send
   feedback to the agent directly from the vim pane (may use some existing nvim
   plugin for this)
-- Diagnostics integration: `via session diagnostics --repo . --json` and `via agent skill show`
+- Diagnostics integration: `via session diagnostics --json`; global agent skill auto-install (`via agent skill install` / `status`)
 - Better use of LSP: the symbol search could be further updated to highlight
   known symbols on the agent pane
 
