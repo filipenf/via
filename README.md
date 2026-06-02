@@ -19,8 +19,8 @@ them.
 
 **Agent to nvim**
 
-- Clicking on a file name will open that file in nvim
-- Clicking on a symbol will open the Symbol search pane in neovim
+- Shift+click on a file name will open that file in nvim and focus the nvim pane (fullscreen nvim if the agent was fullscreen, otherwise keep the split)
+- Shift+click on a symbol will open the Symbol search pane in neovim with the same focus behavior
 
 ## Work in progress
 

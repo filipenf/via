@@ -1,19 +1,16 @@
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tracing::info;
 use winit::event::{ElementState, MouseButton};
 
 use super::input::{
-    copy_requested, forward_special_keys, forward_text_input, paste_requested, try_clipboard_paste,
-    Key, Modifiers,
+    Key, Modifiers, copy_requested, forward_special_keys, forward_text_input, paste_requested,
+    try_clipboard_paste,
 };
 use super::links::ReferenceTarget;
 use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
-
-const DOUBLE_CLICK_THRESHOLD: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PaneRole {
@@ -40,17 +37,9 @@ pub(super) enum PaneCommand {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-struct ReferenceClick {
-    at: Instant,
-    row: usize,
-    column: usize,
-}
-
 #[derive(Default)]
 struct MouseState {
     held_button: Option<PaneMouseButton>,
-    last_reference_click: Option<ReferenceClick>,
 }
 
 pub(super) struct TerminalPaneController {
@@ -210,6 +199,7 @@ impl TerminalPaneController {
                 button,
                 local_x,
                 local_y,
+                modifiers,
                 working_directory,
             )),
         }
@@ -354,6 +344,7 @@ impl TerminalPaneController {
         button: MouseButton,
         local_x: usize,
         local_y: usize,
+        modifiers: Modifiers,
         working_directory: &Path,
     ) -> PaneEventOutcome {
         if button != MouseButton::Left {
@@ -371,8 +362,11 @@ impl TerminalPaneController {
 
         let mut outcome = PaneEventOutcome::default();
         if just_pressed {
-            outcome.dirty |= self.start_selection(local_x, local_y);
-            if self.role == PaneRole::AgentTerminal {
+            let is_reference_click = self.role == PaneRole::AgentTerminal && modifiers.shift;
+            if !is_reference_click {
+                outcome.dirty |= self.start_selection(local_x, local_y);
+            }
+            if is_reference_click {
                 outcome.dirty |= self.forward_reference_click(
                     local_x,
                     local_y,
@@ -404,17 +398,6 @@ impl TerminalPaneController {
         let metrics = self.pane.metrics();
         let row = local_y / metrics.cell_height;
         let column = local_x / metrics.cell_width;
-        let click = ReferenceClick {
-            at: Instant::now(),
-            row,
-            column,
-        };
-        let is_double_click = is_double_click(
-            self.mouse.last_reference_click.as_ref(),
-            &click,
-            DOUBLE_CLICK_THRESHOLD,
-        );
-        self.mouse.last_reference_click = Some(click);
 
         let Some(target) = self.pane.reference_at(row, column, working_directory) else {
             return false;
@@ -422,14 +405,10 @@ impl TerminalPaneController {
 
         match target {
             ReferenceTarget::File(target) => {
-                if !is_double_click {
-                    return false;
-                }
-
                 info!(
                     path = %target.path.display(),
                     line = ?target.line,
-                    "file reference double clicked"
+                    "file reference shift-clicked"
                 );
                 *command = Some(PaneCommand::OpenRequested {
                     path: target.path,
@@ -438,11 +417,7 @@ impl TerminalPaneController {
                 true
             }
             ReferenceTarget::Symbol(symbol) => {
-                if is_double_click {
-                    return false;
-                }
-
-                info!(symbol = %symbol, "symbol reference clicked");
+                info!(symbol = %symbol, "symbol reference shift-clicked");
                 *command = Some(PaneCommand::SymbolOpenRequested { symbol });
                 true
             }
@@ -511,18 +486,6 @@ fn pane_mouse_modifiers(modifiers: Modifiers) -> PaneMouseModifiers {
     }
 }
 
-fn is_double_click(
-    previous: Option<&ReferenceClick>,
-    current: &ReferenceClick,
-    threshold: Duration,
-) -> bool {
-    previous.is_some_and(|previous| {
-        previous.row == current.row
-            && previous.column == current.column
-            && current.at.saturating_duration_since(previous.at) <= threshold
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -530,44 +493,11 @@ mod tests {
     use super::super::config::{TerminalMetrics, TerminalTheme};
     use super::*;
 
-    #[test]
-    fn classifies_double_click_when_same_cell_within_threshold() {
-        let first = ReferenceClick {
-            at: Instant::now(),
-            row: 3,
-            column: 12,
-        };
-        let second = ReferenceClick {
-            at: first.at + Duration::from_millis(120),
-            row: 3,
-            column: 12,
-        };
-
-        assert!(is_double_click(
-            Some(&first),
-            &second,
-            Duration::from_millis(300)
-        ));
-    }
-
-    #[test]
-    fn rejects_double_click_when_cell_differs() {
-        let first = ReferenceClick {
-            at: Instant::now(),
-            row: 3,
-            column: 12,
-        };
-        let different_cell = ReferenceClick {
-            at: first.at + Duration::from_millis(120),
-            row: 4,
-            column: 12,
-        };
-
-        assert!(!is_double_click(
-            Some(&first),
-            &different_cell,
-            Duration::from_millis(300)
-        ));
+    fn shift_modifiers() -> Modifiers {
+        Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        }
     }
 
     #[test]
@@ -633,9 +563,30 @@ mod tests {
     }
 
     #[test]
-    fn agent_role_opens_symbol_references() {
+    fn agent_role_opens_symbol_references_on_shift_click() {
         let mut pane = test_controller(PaneRole::AgentTerminal);
         pane.process_for_test(b"see Foo::bar here", true);
+
+        let without_shift = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                5 * test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                Path::new("/repo"),
+            )
+            .unwrap();
+        assert!(without_shift.command.is_none());
+        pane.handle_mouse_input(
+            ElementState::Released,
+            MouseButton::Left,
+            5 * test_metrics().cell_width,
+            0,
+            Modifiers::default(),
+            Path::new("/repo"),
+        )
+        .unwrap();
 
         let outcome = pane
             .handle_mouse_input(
@@ -643,7 +594,7 @@ mod tests {
                 MouseButton::Left,
                 5 * test_metrics().cell_width,
                 0,
-                Modifiers::default(),
+                shift_modifiers(),
                 Path::new("/repo"),
             )
             .unwrap();
@@ -674,12 +625,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_role_opens_file_references_on_double_click() {
+    fn agent_role_opens_file_references_on_shift_click() {
         let mut pane = test_controller(PaneRole::AgentTerminal);
         pane.process_for_test(b"open src/main.rs:42", true);
         let x = 6 * test_metrics().cell_width;
 
-        let first = pane
+        let without_shift = pane
             .handle_mouse_input(
                 ElementState::Pressed,
                 MouseButton::Left,
@@ -689,6 +640,7 @@ mod tests {
                 Path::new("/repo"),
             )
             .unwrap();
+        assert!(without_shift.command.is_none());
         pane.handle_mouse_input(
             ElementState::Released,
             MouseButton::Left,
@@ -698,20 +650,20 @@ mod tests {
             Path::new("/repo"),
         )
         .unwrap();
-        let second = pane
+
+        let outcome = pane
             .handle_mouse_input(
                 ElementState::Pressed,
                 MouseButton::Left,
                 x,
                 0,
-                Modifiers::default(),
+                shift_modifiers(),
                 Path::new("/repo"),
             )
             .unwrap();
 
-        assert!(first.command.is_none());
         assert!(matches!(
-            second.command,
+            outcome.command,
             Some(PaneCommand::OpenRequested { ref path, line })
                 if path == Path::new("/repo/src/main.rs") && line == Some(42)
         ));

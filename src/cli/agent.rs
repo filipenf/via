@@ -14,7 +14,7 @@ pub enum AgentCommand {
     },
 }
 
-#[derive(Subcommand, Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Subcommand)]
 pub enum SkillCommand {
     /// Print the skill to stdout (default).
     Show,

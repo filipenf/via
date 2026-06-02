@@ -222,6 +222,31 @@ fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FocusNvimAfterReference {
+    pub(super) relayout_needed: bool,
+    pub(super) focus_changed: bool,
+}
+
+/// Focus the Neovim pane after navigating from a Shift+click on a file or symbol in the
+/// agent pane. When the agent was fullscreen, switch to fullscreen Neovim; otherwise keep
+/// the split layout and only change the active pane.
+pub(super) fn focus_nvim_after_agent_reference(
+    mode: &mut PaneLayoutMode,
+    active_pane: &mut usize,
+) -> FocusNvimAfterReference {
+    let relayout_needed = *mode == PaneLayoutMode::AgentMaximized;
+    if relayout_needed {
+        *mode = PaneLayoutMode::NvimMaximized;
+    }
+    let focus_changed = *active_pane != 0;
+    *active_pane = 0;
+    FocusNvimAfterReference {
+        relayout_needed,
+        focus_changed,
+    }
+}
+
 pub(super) fn pane_navigation_shortcut(key: Key) -> Option<usize> {
     match key {
         Key::Left => Some(0),
@@ -289,5 +314,49 @@ fn horizontal_split_layout(width: usize, height: usize) -> SplitLayout {
                 height: bottom_height,
             },
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reference_navigation_from_agent_fullscreen_maximizes_nvim() {
+        let mut mode = PaneLayoutMode::AgentMaximized;
+        let mut active_pane = 1;
+
+        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+
+        assert_eq!(mode, PaneLayoutMode::NvimMaximized);
+        assert_eq!(active_pane, 0);
+        assert!(focus.relayout_needed);
+        assert!(focus.focus_changed);
+    }
+
+    #[test]
+    fn reference_navigation_from_split_keeps_split_and_focuses_nvim() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active_pane = 1;
+
+        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 0);
+        assert!(!focus.relayout_needed);
+        assert!(focus.focus_changed);
+    }
+
+    #[test]
+    fn reference_navigation_when_nvim_already_active_in_split() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active_pane = 0;
+
+        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active_pane, 0);
+        assert!(!focus.relayout_needed);
+        assert!(!focus.focus_changed);
     }
 }

@@ -37,7 +37,10 @@ use acp_pane::AcpPane;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers, paste_requested, read_clipboard_text};
-use layout::{PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, handle_layout_shortcuts};
+use layout::{
+    PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, focus_nvim_after_agent_reference,
+    handle_layout_shortcuts,
+};
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
 use render::{DamageRect, draw_ratatui_buffer};
@@ -825,10 +828,9 @@ impl WinitGhosttyApp {
         let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
             return Ok(());
         };
-        let pane_changed = self.active_pane != pane_index;
-        self.active_pane = pane_index;
         if pane_index >= self.panes.len() {
-            if pane_changed {
+            if state == ElementState::Pressed && self.active_pane != pane_index {
+                self.active_pane = pane_index;
                 self.dirty = true;
             }
             return Ok(());
@@ -847,9 +849,21 @@ impl WinitGhosttyApp {
             self.modifiers,
             &self.config.working_directory,
         )?;
-        self.dirty |= pane_changed;
+        let reference_navigation = Self::is_reference_navigation_command(&outcome.command);
         self.apply_pane_outcome(outcome);
+        if state == ElementState::Pressed && !reference_navigation && self.active_pane != pane_index
+        {
+            self.active_pane = pane_index;
+            self.dirty = true;
+        }
         Ok(())
+    }
+
+    fn is_reference_navigation_command(command: &Option<PaneCommand>) -> bool {
+        matches!(
+            command,
+            Some(PaneCommand::OpenRequested { .. } | PaneCommand::SymbolOpenRequested { .. })
+        )
     }
 
     fn handle_mouse_motion(&mut self) -> Result<()> {
@@ -886,14 +900,29 @@ impl WinitGhosttyApp {
         if let Some(command) = outcome.command {
             match command {
                 PaneCommand::OpenRequested { path, line } => {
+                    self.focus_nvim_after_reference_navigation();
                     self.events
                         .try_send(Event::Ui(UiEvent::OpenRequested { path, line }));
                 }
                 PaneCommand::SymbolOpenRequested { symbol } => {
+                    self.focus_nvim_after_reference_navigation();
                     self.events
                         .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
                 }
             }
+        }
+    }
+
+    fn focus_nvim_after_reference_navigation(&mut self) {
+        let focus = focus_nvim_after_agent_reference(
+            &mut self.pane_layout_mode,
+            &mut self.active_pane,
+        );
+        if focus.relayout_needed {
+            self.relayout();
+        } else if focus.focus_changed {
+            self.dirty = true;
+            self.force_redraw = true;
         }
     }
 
