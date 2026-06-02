@@ -40,7 +40,7 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
    via session get
    ```
 
-2. Pull diagnostics (JSON on stdout):
+2. Pull diagnostics (JSON on stdout). This refreshes unchanged Neovim buffers from disk with `:checktime` before reading diagnostics:
 
    ```bash
    via session diagnostics --json
@@ -60,7 +60,7 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
 |---------|---------|
 | `via session list` | List all running via sessions |
 | `via session get` | Show the session resolved from `VIA_SESSION` |
-| `via session diagnostics [--file PATH] --json` | Export Neovim diagnostics |
+| `via session diagnostics [--file PATH] --json` | Refresh unchanged Neovim buffers with `:checktime`, then export diagnostics |
 | `via agent skill install` | Install or update the global via-editor skill |
 | `via agent skill status` | Show global install paths and state |
 | `via agent skill cleanup` | Remove the skill from every known global location |

@@ -426,7 +426,10 @@ impl Mediator {
                     } else {
                         format!("@{}\n", display_path.display())
                     };
-                    self.send_ui_command(UiCommand::AgentInput { payload });
+                    self.send_ui_command(UiCommand::AgentInput {
+                        payload,
+                        focus_agent: true,
+                    });
                 }
             }
         }
@@ -461,7 +464,10 @@ impl Mediator {
             };
 
             if let Some(response) = self.handle_tool_command(payload).await {
-                self.send_ui_command(UiCommand::AgentInput { payload: response });
+                self.send_ui_command(UiCommand::AgentInput {
+                    payload: response,
+                    focus_agent: false,
+                });
             }
         }
     }

@@ -427,4 +427,9 @@ mod tests {
         assert_eq!(report.items.len(), 1);
         assert_eq!(report.items[0].severity, "error");
     }
+
+    #[test]
+    fn diagnostics_refreshes_buffers_before_reading() {
+        assert!(DIAGNOSTICS_LUA_TEMPLATE.contains("checktime"));
+    }
 }

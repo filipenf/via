@@ -1,5 +1,9 @@
 local file_arg = __FILE_PATH__
 
+-- Pick up external edits before reading diagnostics. Agents often edit files
+-- outside Neovim, and rust-analyzer reports diagnostics for Neovim buffers.
+vim.cmd("checktime")
+
 local function severity_name(severity)
   if severity == vim.diagnostic.severity.ERROR then
     return "error"

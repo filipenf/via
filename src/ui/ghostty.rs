@@ -924,6 +924,16 @@ impl WinitGhosttyApp {
         }
     }
 
+    fn focus_agent_after_editor_input(&mut self) {
+        if self.pane_layout_mode == PaneLayoutMode::NvimMaximized {
+            self.pane_layout_mode = PaneLayoutMode::AgentMaximized;
+            self.active_pane = 1;
+            self.relayout();
+        } else {
+            self.set_active_pane(1);
+        }
+    }
+
     fn drain_background_work(&mut self) -> Result<()> {
         // Clear the coalescing flag *before* draining so that any PTY data arriving
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
@@ -1160,12 +1170,21 @@ impl WinitGhosttyApp {
                         bytes: update.into_bytes(),
                     });
                 }
-                UiCommand::AgentInput { payload } => {
-                    let Some(agent_pane) = self.panes.get_mut(1) else {
-                        continue;
-                    };
-                    debug!("forwarding tool response to agent");
-                    agent_pane.write_all(payload.as_bytes())?;
+                UiCommand::AgentInput {
+                    payload,
+                    focus_agent,
+                } => {
+                    if focus_agent {
+                        self.focus_agent_after_editor_input();
+                    }
+
+                    {
+                        let Some(agent_pane) = self.panes.get_mut(1) else {
+                            continue;
+                        };
+                        debug!("forwarding input to agent");
+                        agent_pane.write_all(payload.as_bytes())?;
+                    }
                     self.pending_agent_write = None;
                 }
                 UiCommand::AcpTranscriptChunk { kind, text } => {

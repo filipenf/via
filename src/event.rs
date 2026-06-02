@@ -62,6 +62,7 @@ pub enum UiCommand {
     },
     AgentInput {
         payload: String,
+        focus_agent: bool,
     },
     AcpTranscriptChunk {
         kind: String,
