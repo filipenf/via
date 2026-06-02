@@ -21,7 +21,7 @@ use super::layout::PaneRect;
 use super::links::{
     Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri,
 };
-use super::render::{DamageRect, SelectionRange, draw_pane_border, draw_screen};
+use super::render::{DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
 const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
@@ -231,6 +231,7 @@ impl TerminalPane {
         rect: PaneRect,
         active: bool,
         force_redraw: bool,
+        redraw_chrome: bool,
         damage: &mut Vec<DamageRect>,
     ) -> bool {
         if rect.width == 0 || rect.height == 0 {
@@ -247,15 +248,21 @@ impl TerminalPane {
             force_redraw,
             damage,
         );
-        if redrawn || force_redraw {
-            let border_color = if active {
-                self.view.theme.palette[12]
-            } else {
-                self.view.theme.palette[8]
-            };
-            draw_pane_border(buffer, buffer_width, buffer_height, rect, border_color);
-        }
-        redrawn
+        let chrome_drawn = if redrawn || force_redraw || redraw_chrome {
+            draw_pane_focus_chrome(
+                buffer,
+                buffer_width,
+                buffer_height,
+                rect,
+                active,
+                &self.view.theme,
+                damage,
+            );
+            true
+        } else {
+            false
+        };
+        redrawn || chrome_drawn
     }
 
     pub(super) fn reference_at(

@@ -5,12 +5,14 @@ use libghostty_vt::style::RgbColor;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 
-use super::config::TerminalMetrics;
+use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 
 const SELECTION_BACKGROUND: u32 = 0x4f6480;
 const SELECTION_FOREGROUND: u32 = 0xfbf1c7;
+/// Subtle wash toward the theme background on inactive panes (~12%).
+const INACTIVE_PANE_DIM_ALPHA: u8 = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DamageRect {
@@ -26,6 +28,50 @@ pub(super) struct SelectionRange {
     pub(super) start_col: usize,
     pub(super) end_row: usize,
     pub(super) end_col: usize,
+}
+
+pub(super) fn pane_focus_border_color(active: bool, theme: &TerminalTheme) -> u32 {
+    if active {
+        lerp_color(theme.foreground, theme.cursor, 96)
+    } else {
+        lerp_color(theme.foreground, theme.background, 210)
+    }
+}
+
+pub(super) fn draw_pane_focus_chrome(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    rect: PaneRect,
+    active: bool,
+    theme: &TerminalTheme,
+    damage: &mut Vec<DamageRect>,
+) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+
+    let border_color = pane_focus_border_color(active, theme);
+    draw_pane_border(buffer, width, height, rect, border_color);
+
+    if !active {
+        let inset = 1;
+        if rect.width > inset * 2 && rect.height > inset * 2 {
+            draw_pane_tint(
+                buffer,
+                width,
+                height,
+                rect.x + inset,
+                rect.y + inset,
+                rect.width - inset * 2,
+                rect.height - inset * 2,
+                theme.background,
+                INACTIVE_PANE_DIM_ALPHA,
+            );
+        }
+    }
+
+    push_damage(damage, rect.x, rect.y, rect.width, rect.height, width, height);
 }
 
 pub(super) fn draw_pane_border(
@@ -845,6 +891,30 @@ fn try_draw_block_char(
     true
 }
 
+fn draw_pane_tint(
+    buffer: &mut [u32],
+    buf_w: usize,
+    buf_h: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    tint: u32,
+    alpha: u8,
+) {
+    draw_shade(buffer, buf_w, buf_h, x, y, rect_width, rect_height, tint, alpha);
+}
+
+fn lerp_color(from: u32, to: u32, amount: u8) -> u32 {
+    let amount = amount as u32;
+    let inv = 255 - amount;
+    let r = ((((from >> 16) & 0xff) * inv) + (((to >> 16) & 0xff) * amount)) / 255;
+    let g = ((((from >> 8) & 0xff) * inv) + (((to >> 8) & 0xff) * amount)) / 255;
+    let b = (((from & 0xff) * inv) + ((to & 0xff) * amount)) / 255;
+
+    (r << 16) | (g << 8) | b
+}
+
 fn draw_shade(
     buffer: &mut [u32],
     buf_w: usize,
@@ -918,12 +988,15 @@ pub(super) fn blend_pixel(
     }
 
     let index = y * width + x;
+    let Some(pixel) = buffer.get_mut(index) else {
+        return;
+    };
     if alpha == 255 {
-        buffer[index] = color;
+        *pixel = color;
         return;
     }
 
-    let dst = buffer[index];
+    let dst = *pixel;
     let alpha = alpha as u32;
     let inv_alpha = 255 - alpha;
 
@@ -931,7 +1004,7 @@ pub(super) fn blend_pixel(
     let g = (((color >> 8) & 0xff) * alpha + ((dst >> 8) & 0xff) * inv_alpha) / 255;
     let b = ((color & 0xff) * alpha + (dst & 0xff) * inv_alpha) / 255;
 
-    buffer[index] = (r << 16) | (g << 8) | b;
+    *pixel = (r << 16) | (g << 8) | b;
 }
 
 fn is_selected_cell(row: usize, col: usize, selection: Option<SelectionRange>) -> bool {
@@ -974,4 +1047,44 @@ fn dim_toward(color: u32, background: u32) -> u32 {
     let b = (((color & 0xff) + (background & 0xff)) / 2) & 0xff;
 
     (r << 16) | (g << 8) | b
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::ghostty::config::TerminalTheme;
+
+    #[test]
+    fn active_border_is_brighter_than_inactive_border() {
+        let theme = TerminalTheme::default();
+        let active = pane_focus_border_color(true, &theme);
+        let inactive = pane_focus_border_color(false, &theme);
+
+        assert_ne!(active, inactive);
+        assert!(color_luminance(active) > color_luminance(inactive));
+    }
+
+    #[test]
+    fn inactive_border_is_closer_to_background_than_foreground() {
+        let theme = TerminalTheme::default();
+        let inactive = pane_focus_border_color(false, &theme);
+        let dist_to_bg = color_distance(inactive, theme.background);
+        let dist_to_fg = color_distance(inactive, theme.foreground);
+
+        assert!(dist_to_bg < dist_to_fg);
+    }
+
+    fn color_luminance(color: u32) -> u32 {
+        let r = (color >> 16) & 0xff;
+        let g = (color >> 8) & 0xff;
+        let b = color & 0xff;
+        r + g + b
+    }
+
+    fn color_distance(a: u32, b: u32) -> u32 {
+        let dr = ((a >> 16) & 0xff).abs_diff((b >> 16) & 0xff);
+        let dg = ((a >> 8) & 0xff).abs_diff((b >> 8) & 0xff);
+        let db = (a & 0xff).abs_diff(b & 0xff);
+        dr + dg + db
+    }
 }

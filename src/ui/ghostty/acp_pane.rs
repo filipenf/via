@@ -10,7 +10,7 @@ use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
 use super::input::{Key, Modifiers};
 use super::layout::PaneRect;
-use super::render::{DamageRect, draw_pane_border, draw_ratatui_buffer};
+use super::render::{DamageRect, draw_pane_focus_chrome, draw_ratatui_buffer};
 
 const TURN_PROGRESS_ID: &str = "__turn";
 
@@ -311,6 +311,7 @@ impl AcpPane {
         rect: PaneRect,
         active: bool,
         force_redraw: bool,
+        redraw_chrome: bool,
         damage: &mut Vec<DamageRect>,
     ) -> bool {
         if rect.width == 0 || rect.height == 0 || self.size.cols == 0 || self.size.rows == 0 {
@@ -335,16 +336,22 @@ impl AcpPane {
             damage,
         );
 
-        if redrawn || force_redraw {
-            let border_color = if active {
-                self.theme.palette[12]
-            } else {
-                self.theme.palette[8]
-            };
-            draw_pane_border(buffer, buffer_width, buffer_height, rect, border_color);
-        }
+        let chrome_drawn = if redrawn || force_redraw || redraw_chrome {
+            draw_pane_focus_chrome(
+                buffer,
+                buffer_width,
+                buffer_height,
+                rect,
+                active,
+                &self.theme,
+                damage,
+            );
+            true
+        } else {
+            false
+        };
         self.dirty = false;
-        redrawn
+        redrawn || chrome_drawn
     }
 
     fn render_into_buffer(&mut self, buffer: &mut Buffer) {

@@ -552,6 +552,7 @@ impl WinitGhosttyApp {
         if layout_shortcut_consumed {
             self.relayout();
             self.dirty = true;
+            self.force_redraw = true;
         }
         if self.active_pane >= self.panes.len() {
             if !layout_shortcut_consumed {
@@ -829,9 +830,8 @@ impl WinitGhosttyApp {
             return Ok(());
         };
         if pane_index >= self.panes.len() {
-            if state == ElementState::Pressed && self.active_pane != pane_index {
-                self.active_pane = pane_index;
-                self.dirty = true;
+            if state == ElementState::Pressed {
+                self.set_active_pane(pane_index);
             }
             return Ok(());
         }
@@ -851,10 +851,8 @@ impl WinitGhosttyApp {
         )?;
         let reference_navigation = Self::is_reference_navigation_command(&outcome.command);
         self.apply_pane_outcome(outcome);
-        if state == ElementState::Pressed && !reference_navigation && self.active_pane != pane_index
-        {
-            self.active_pane = pane_index;
-            self.dirty = true;
+        if state == ElementState::Pressed && !reference_navigation {
+            self.set_active_pane(pane_index);
         }
         Ok(())
     }
@@ -988,6 +986,19 @@ impl WinitGhosttyApp {
         Ok(true)
     }
 
+    fn set_active_pane(&mut self, pane_index: usize) {
+        if self.active_pane != pane_index {
+            self.active_pane = pane_index;
+            self.dirty = true;
+            self.force_redraw = true;
+        }
+    }
+
+    fn show_pane_focus_chrome(&self) -> bool {
+        matches!(self.pane_layout_mode, PaneLayoutMode::Split)
+            && (self.panes.len() > 1 || self.acp_pane.is_some())
+    }
+
     fn render(&mut self) -> Result<()> {
         let render_started_at = Instant::now();
         if self.width == 0 || self.height == 0 {
@@ -997,15 +1008,17 @@ impl WinitGhosttyApp {
         let Some(window) = self.window.as_ref() else {
             return Ok(());
         };
-        let Some(surface) = self.surface.as_mut() else {
-            return Ok(());
-        };
 
         if self.force_redraw {
             self.buffer.fill(self.terminal_config.theme.background);
         }
         self.damage.clear();
         let mut redrawn = self.force_redraw;
+        let redraw_chrome = self.show_pane_focus_chrome() && (self.dirty || self.force_redraw);
+
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
 
         if self.review_active {
             if let Some(review_pane) = &mut self.review_pane {
@@ -1017,6 +1030,7 @@ impl WinitGhosttyApp {
                     full_window_rect(self.width, self.height),
                     true,
                     self.force_redraw,
+                    false,
                     &mut self.damage,
                 );
             } else {
@@ -1032,6 +1046,7 @@ impl WinitGhosttyApp {
                     self.layout.pane(index),
                     index == self.active_pane,
                     self.force_redraw,
+                    redraw_chrome,
                     &mut self.damage,
                 );
             }
@@ -1044,6 +1059,7 @@ impl WinitGhosttyApp {
                     self.layout.pane(1),
                     self.active_pane == 1,
                     self.force_redraw,
+                    redraw_chrome,
                     &mut self.damage,
                 );
             }
