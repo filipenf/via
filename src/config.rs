@@ -42,10 +42,17 @@ pub fn ensure_runtime_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(runtime_base_dir())
 }
 
+pub const DEFAULT_AGENT_PANE_MIN_COLS: u16 = 80;
+pub const DEFAULT_AGENT_PANE_MAX_COLS: u16 = 100;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub nvim_command: String,
     pub agent_command: Option<String>,
+    /// Minimum agent pane width in terminal columns (vertical split only).
+    pub agent_pane_min_cols: Option<u16>,
+    /// Maximum agent pane width in terminal columns (vertical split only).
+    pub agent_pane_max_cols: Option<u16>,
     pub review_backend: ReviewBackend,
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
@@ -82,6 +89,8 @@ impl Config {
     pub fn from_env() -> Self {
         let nvim_command = env::var("VIA_NVIM").unwrap_or_else(|_| "nvim".to_owned());
         let agent_command = env::var("VIA_AGENT").ok();
+        let agent_pane_min_cols = env_u16("VIA_AGENT_PANE_MIN_COLS");
+        let agent_pane_max_cols = env_u16("VIA_AGENT_PANE_MAX_COLS");
         let review_backend = env::var("VIA_REVIEW_BACKEND")
             .ok()
             .and_then(|value| value.parse().ok())
@@ -103,6 +112,8 @@ impl Config {
         Self {
             nvim_command,
             agent_command,
+            agent_pane_min_cols,
+            agent_pane_max_cols,
             review_backend,
             nvim_socket_path,
             editor_socket_path,
@@ -121,6 +132,29 @@ impl Config {
             .unwrap_or(false)
     }
 
+    /// Column bounds for the agent pane in vertical split mode (PTY agent only).
+    pub fn agent_pane_col_limits(&self) -> Option<(u16, u16)> {
+        if self.agent_command.is_none() || self.is_acp_agent() {
+            return None;
+        }
+
+        let min = self
+            .agent_pane_min_cols
+            .unwrap_or(DEFAULT_AGENT_PANE_MIN_COLS);
+        let max = self
+            .agent_pane_max_cols
+            .unwrap_or(DEFAULT_AGENT_PANE_MAX_COLS);
+        let (min, max) = if min <= max { (min, max) } else { (max, min) };
+        Some((min, max))
+    }
+
+}
+
+fn env_u16(key: &str) -> Option<u16> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|value| *value > 0)
 }
 
 fn default_nvim_socket_path() -> PathBuf {
@@ -202,6 +236,42 @@ mod tests {
         assert_eq!("hunk".parse::<ReviewBackend>(), Ok(ReviewBackend::Hunk));
         assert_eq!("nvim".parse::<ReviewBackend>(), Ok(ReviewBackend::Nvim));
         assert_eq!("vimdiff".parse::<ReviewBackend>(), Ok(ReviewBackend::Nvim));
+    }
+
+    #[test]
+    fn agent_pane_col_limits_default_to_eighty_and_one_hundred() {
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("agent".to_string()),
+            agent_pane_min_cols: None,
+            agent_pane_max_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+        };
+
+        assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
+    }
+
+    #[test]
+    fn agent_pane_col_limits_normalizes_bounds() {
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("agent".to_string()),
+            agent_pane_min_cols: Some(100),
+            agent_pane_max_cols: Some(80),
+            review_backend: ReviewBackend::Nvim,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+        };
+
+        assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
     }
 
 }

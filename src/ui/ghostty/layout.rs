@@ -1,6 +1,24 @@
 use super::input::Key;
+use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
 
 const SPLIT_GAP: usize = 2;
+/// Minimum leading (editor) pane width in columns for vertical split mode.
+pub(super) const MIN_EDITOR_PANE_COLS: u16 = 80;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SplitLayoutOptions {
+    pub(super) cell_width: usize,
+    pub(super) agent_pane_cols: Option<(u16, u16)>,
+}
+
+impl SplitLayoutOptions {
+    pub(super) fn unbounded() -> Self {
+        Self {
+            cell_width: 1,
+            agent_pane_cols: None,
+        }
+    }
+}
 
 /// Require one dimension to be at least 20% larger than the other before treating the
 /// window as clearly tall (`height >= width * 6/5`) or clearly wide (`width >= height * 6/5`).
@@ -95,6 +113,7 @@ impl SplitLayout {
         pane_count: usize,
         mode: PaneLayoutMode,
         split_direction: PaneSplitDirection,
+        options: SplitLayoutOptions,
     ) -> Self {
         if pane_count <= 1 {
             return Self {
@@ -146,7 +165,9 @@ impl SplitLayout {
         }
 
         match split_direction {
-            PaneSplitDirection::Vertical => vertical_split_layout(width, height),
+            PaneSplitDirection::Vertical => {
+                vertical_split_layout(width, height, options.cell_width, options.agent_pane_cols)
+            }
             PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
         }
     }
@@ -271,27 +292,79 @@ pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
     }
 }
 
-fn vertical_split_layout(width: usize, height: usize) -> SplitLayout {
-    let left_width = width.saturating_sub(SPLIT_GAP) / 2;
-    let right_x = left_width + SPLIT_GAP;
-    let right_width = width.saturating_sub(right_x);
+fn vertical_split_layout(
+    width: usize,
+    height: usize,
+    cell_width: usize,
+    agent_pane_cols: Option<(u16, u16)>,
+) -> SplitLayout {
+    let (min_cols, max_cols) = agent_pane_cols
+        .unwrap_or((DEFAULT_AGENT_PANE_MIN_COLS, DEFAULT_AGENT_PANE_MAX_COLS));
+    let cell_width = cell_width.max(1);
+    let trailing_cols = trailing_pane_cols(
+        width,
+        cell_width,
+        min_cols,
+        max_cols,
+        MIN_EDITOR_PANE_COLS,
+    );
+
+    let trailing_pixel_width = trailing_cols as usize * cell_width;
+    let leading_width = width
+        .saturating_sub(SPLIT_GAP)
+        .saturating_sub(trailing_pixel_width);
+    let trailing_x = leading_width + SPLIT_GAP;
+    let trailing_width = width.saturating_sub(trailing_x);
 
     SplitLayout {
         panes: vec![
             PaneRect {
                 x: 0,
                 y: 0,
-                width: left_width,
+                width: leading_width,
                 height,
             },
             PaneRect {
-                x: right_x,
+                x: trailing_x,
                 y: 0,
-                width: right_width,
+                width: trailing_width,
                 height,
             },
         ],
     }
+}
+
+pub(super) fn window_col_count(width: usize, cell_width: usize) -> u16 {
+    let cell_width = cell_width.max(1);
+    ((width.saturating_sub(SPLIT_GAP)) / cell_width).min(u16::MAX as usize) as u16
+}
+
+/// True when the window can fit both the editor minimum and the agent minimum.
+pub(super) fn vertical_split_fits(
+    width: usize,
+    cell_width: usize,
+    agent_min_cols: u16,
+) -> bool {
+    window_col_count(width, cell_width) >= MIN_EDITOR_PANE_COLS.saturating_add(agent_min_cols)
+}
+
+/// Column count for the trailing (right) pane in a vertical split. Keeps the agent at
+/// `min_cols` when both minimums fit so extra width goes to the editor; shrinks the agent
+/// below `min_cols` only when the window cannot satisfy `min_editor_cols` + `min_cols`.
+fn trailing_pane_cols(
+    width: usize,
+    cell_width: usize,
+    min_cols: u16,
+    max_cols: u16,
+    min_editor_cols: u16,
+) -> u16 {
+    let total_cols = window_col_count(width, cell_width);
+
+    if total_cols >= min_editor_cols.saturating_add(min_cols) {
+        return min_cols.min(max_cols);
+    }
+
+    total_cols.saturating_sub(min_editor_cols).min(max_cols)
 }
 
 fn horizontal_split_layout(width: usize, height: usize) -> SplitLayout {
@@ -358,5 +431,43 @@ mod tests {
         assert_eq!(active_pane, 0);
         assert!(!focus.relayout_needed);
         assert!(!focus.focus_changed);
+    }
+
+    #[test]
+    fn vertical_split_gives_extra_columns_to_editor() {
+        let cell_width = 10;
+        let width = cell_width * 200 + SPLIT_GAP;
+        let layout = vertical_split_layout(width, 50, cell_width, Some((80, 100)));
+
+        assert_eq!(layout.pane(0).width / cell_width, 120);
+        assert_eq!(layout.pane(1).width / cell_width, 80);
+    }
+
+    #[test]
+    fn vertical_split_reserves_editor_minimum() {
+        let cell_width = 10;
+        let width = cell_width * 165 + SPLIT_GAP;
+        let layout = vertical_split_layout(width, 50, cell_width, Some((80, 100)));
+
+        assert_eq!(layout.pane(0).width / cell_width, 85);
+        assert_eq!(layout.pane(1).width / cell_width, 80);
+    }
+
+    #[test]
+    fn vertical_split_fits_requires_editor_and_agent_minimums() {
+        assert!(!vertical_split_fits(10 * 159 + SPLIT_GAP, 10, 80));
+        assert!(vertical_split_fits(10 * 160 + SPLIT_GAP, 10, 80));
+    }
+
+    #[test]
+    fn trailing_pane_cols_keeps_agent_at_minimum_when_both_fit() {
+        assert_eq!(
+            trailing_pane_cols(10 * 150 + SPLIT_GAP, 10, 80, 100, MIN_EDITOR_PANE_COLS),
+            70
+        );
+        assert_eq!(
+            trailing_pane_cols(10 * 200 + SPLIT_GAP, 10, 80, 100, MIN_EDITOR_PANE_COLS),
+            80
+        );
     }
 }

@@ -8,18 +8,22 @@ description: >-
 
 # via editor skill
 
-Use this skill when working in a repository where **via** is running with Neovim (live editor pane). via exposes a small CLI so agents can inspect editor state without scraping the terminal UI.
+Use this skill when working in a repository where **via** is running with Neovim
+(live editor pane). via exposes a small CLI so agents can inspect editor state
+without scraping the terminal UI.
 
 ## When to use
 
 - At the start of a via-backed session (when `VIA_SESSION` is set)
 - Before saying work is done or handing control back to the user
 - After editing files that Neovim may still have open
-- When you need to confirm there are no remaining errors or warnings from LSP, treesitter, or other diagnostic sources
+- When you need to confirm there are no remaining errors or warnings from LSP,
+  treesitter, or other diagnostic sources
 
 ## Setup
 
-via installs this skill under your home directory for the configured agent when a session starts. You can refresh or inspect paths with:
+via installs this skill under your home directory for the configured agent when
+a session starts. You can refresh or inspect paths with:
 
 ```bash
 via agent skill install

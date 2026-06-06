@@ -38,8 +38,8 @@ use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers, paste_requested, read_clipboard_text};
 use layout::{
-    PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, focus_nvim_after_agent_reference,
-    handle_layout_shortcuts,
+    PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
+    focus_nvim_after_agent_reference, handle_layout_shortcuts, vertical_split_fits,
 };
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
@@ -132,6 +132,8 @@ struct WinitGhosttyApp {
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
+    /// Split was auto-collapsed because the window is too narrow; restore on widen.
+    split_collapsed_for_width: bool,
     layout: SplitLayout,
     width: usize,
     height: usize,
@@ -160,6 +162,7 @@ impl WinitGhosttyApp {
             pane_count,
             PaneLayoutMode::Split,
             pane_split_direction,
+            SplitLayoutOptions::unbounded(),
         );
 
         Ok(Self {
@@ -184,6 +187,7 @@ impl WinitGhosttyApp {
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
+            split_collapsed_for_width: false,
             layout,
             width: INITIAL_WIDTH,
             height: INITIAL_HEIGHT,
@@ -272,6 +276,7 @@ impl WinitGhosttyApp {
             pane_count(&self.config),
             PaneLayoutMode::Split,
             PaneSplitDirection::for_window(width, height),
+            self.split_layout_options(),
         );
         let mut panes = vec![TerminalPaneController::new(
             PaneRole::Editor,
@@ -346,6 +351,7 @@ impl WinitGhosttyApp {
         }
 
         self.font_renderer = FontRenderer::new(&self.terminal_config)?;
+        self.relayout();
         self.resize_panes();
         self.dirty = true;
         self.force_redraw = true;
@@ -369,10 +375,51 @@ impl WinitGhosttyApp {
         self.relayout();
     }
 
+    fn split_layout_options(&self) -> SplitLayoutOptions {
+        SplitLayoutOptions {
+            cell_width: self.terminal_config.metrics.cell_width,
+            agent_pane_cols: self.config.agent_pane_col_limits(),
+        }
+    }
+
+    fn adjust_layout_mode_for_width(&mut self) {
+        if pane_count(&self.config) < 2 {
+            return;
+        }
+
+        let fits = match (
+            self.config.agent_pane_col_limits(),
+            self.pane_split_direction,
+        ) {
+            (Some((agent_min, _)), PaneSplitDirection::Vertical) => vertical_split_fits(
+                self.width,
+                self.terminal_config.metrics.cell_width,
+                agent_min,
+            ),
+            _ => true,
+        };
+
+        if self.pane_layout_mode == PaneLayoutMode::Split && !fits {
+            self.pane_layout_mode = PaneLayoutMode::NvimMaximized;
+            self.split_collapsed_for_width = true;
+            return;
+        }
+
+        if self.pane_layout_mode == PaneLayoutMode::NvimMaximized
+            && self.split_collapsed_for_width
+            && fits
+        {
+            self.pane_layout_mode = PaneLayoutMode::Split;
+            self.split_collapsed_for_width = false;
+        }
+    }
+
     fn relayout(&mut self) {
         if self.panes.is_empty() {
             return;
         }
+
+        self.adjust_layout_mode_for_width();
 
         let new_layout = SplitLayout::for_window(
             self.width,
@@ -380,6 +427,7 @@ impl WinitGhosttyApp {
             pane_count(&self.config),
             self.pane_layout_mode,
             self.pane_split_direction,
+            self.split_layout_options(),
         );
         if new_layout == self.layout {
             return;
@@ -550,6 +598,7 @@ impl WinitGhosttyApp {
             &mut self.active_pane,
         );
         if layout_shortcut_consumed {
+            self.split_collapsed_for_width = false;
             self.relayout();
             self.dirty = true;
             self.force_redraw = true;
@@ -1574,6 +1623,7 @@ mod tests {
             1,
             PaneLayoutMode::Split,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(
@@ -1589,35 +1639,28 @@ mod tests {
 
     #[test]
     fn creates_vertical_split_layout_for_agent() {
+        let cell_width = 10;
+        let width = cell_width * 200 + 2;
         let layout = SplitLayout::for_window(
-            100,
+            width,
             50,
             2,
             PaneLayoutMode::Split,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions {
+                cell_width,
+                agent_pane_cols: Some((80, 100)),
+            },
         );
 
-        assert_eq!(
-            layout.pane(0),
-            PaneRect {
-                x: 0,
-                y: 0,
-                width: 49,
-                height: 50,
-            }
-        );
-        assert_eq!(
-            layout.pane(1),
-            PaneRect {
-                x: 51,
-                y: 0,
-                width: 49,
-                height: 50,
-            }
-        );
+        assert_eq!(layout.pane(0).width / cell_width, 120);
+        assert_eq!(layout.pane(1).width / cell_width, 80);
         assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
-        assert_eq!(layout.pane_at(60, 10).map(|(index, _)| index), Some(1));
-        assert_eq!(layout.pane_at(50, 10), None);
+        assert_eq!(
+            layout.pane_at(layout.pane(1).x + 10, 10).map(|(index, _)| index),
+            Some(1)
+        );
+        assert_eq!(layout.pane_at(layout.pane(0).width + 1, 10), None);
     }
 
     #[test]
@@ -1628,6 +1671,7 @@ mod tests {
             2,
             PaneLayoutMode::Split,
             PaneSplitDirection::Horizontal,
+            SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(
@@ -1718,6 +1762,7 @@ mod tests {
             2,
             PaneLayoutMode::NvimMaximized,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(
@@ -1749,6 +1794,7 @@ mod tests {
             2,
             PaneLayoutMode::AgentMaximized,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(
@@ -1780,6 +1826,7 @@ mod tests {
             2,
             PaneLayoutMode::NvimMaximized,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions::unbounded(),
         );
         let agent_layout = SplitLayout::for_window(
             100,
@@ -1787,6 +1834,7 @@ mod tests {
             2,
             PaneLayoutMode::AgentMaximized,
             PaneSplitDirection::Vertical,
+            SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(nvim_layout.pane(1).width, 0);
@@ -1920,6 +1968,8 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: None,
+            agent_pane_min_cols: None,
+            agent_pane_max_cols: None,
             review_backend: ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),

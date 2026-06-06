@@ -85,6 +85,21 @@ The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip
 detaching and keep the terminal attached (for example during development), set
 `VIA_FOREGROUND` to any value.
 
+## Agent pane width
+
+With a PTY agent, vertical split mode keeps the agent at its minimum width
+(default 80 columns, up to 100) and gives any extra columns to the editor.
+Override with:
+
+```sh
+VIA_AGENT_PANE_MIN_COLS=60 VIA_AGENT_PANE_MAX_COLS=120 cargo run
+```
+
+The editor pane keeps at least 80 columns. When the window cannot fit both that
+and the agent minimum (default 80 + 80 = 160 columns total), via collapses to
+editor fullscreen. Widening enough to fit both restores the split unless you
+chose fullscreen manually (Alt+Shift+1).
+
 ## Font Rendering Tweaks
 
 via follows the window scale factor reported by winit/Wayland when converting
