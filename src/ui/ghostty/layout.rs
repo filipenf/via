@@ -298,16 +298,11 @@ fn vertical_split_layout(
     cell_width: usize,
     agent_pane_cols: Option<(u16, u16)>,
 ) -> SplitLayout {
-    let (min_cols, max_cols) = agent_pane_cols
-        .unwrap_or((DEFAULT_AGENT_PANE_MIN_COLS, DEFAULT_AGENT_PANE_MAX_COLS));
+    let (min_cols, max_cols) =
+        agent_pane_cols.unwrap_or((DEFAULT_AGENT_PANE_MIN_COLS, DEFAULT_AGENT_PANE_MAX_COLS));
     let cell_width = cell_width.max(1);
-    let trailing_cols = trailing_pane_cols(
-        width,
-        cell_width,
-        min_cols,
-        max_cols,
-        MIN_EDITOR_PANE_COLS,
-    );
+    let trailing_cols =
+        trailing_pane_cols(width, cell_width, min_cols, max_cols, MIN_EDITOR_PANE_COLS);
 
     let trailing_pixel_width = trailing_cols as usize * cell_width;
     let leading_width = width
@@ -340,11 +335,7 @@ pub(super) fn window_col_count(width: usize, cell_width: usize) -> u16 {
 }
 
 /// True when the window can fit both the editor minimum and the agent minimum.
-pub(super) fn vertical_split_fits(
-    width: usize,
-    cell_width: usize,
-    agent_min_cols: u16,
-) -> bool {
+pub(super) fn vertical_split_fits(width: usize, cell_width: usize, agent_min_cols: u16) -> bool {
     window_col_count(width, cell_width) >= MIN_EDITOR_PANE_COLS.saturating_add(agent_min_cols)
 }
 

@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-use crate::event::{AgentEvent, AcpPermissionOption, Event};
+use crate::event::{AcpPermissionOption, AgentEvent, Event};
 use crate::mediator::EventSender;
 
 /// Minimal ACP (Agent Client Protocol) client.
@@ -562,10 +562,7 @@ fn log_acp_line(line: &str) -> Option<AgentEvent> {
             None
         }
         JsonRpcMessage::Request {
-            id,
-            method,
-            params,
-            ..
+            id, method, params, ..
         } => match method.as_str() {
             "session/request_permission" => parse_permission_request(id, params),
             "cursor/ask_question" => parse_cursor_ask_question(id, params),

@@ -71,7 +71,15 @@ pub(super) fn draw_pane_focus_chrome(
         }
     }
 
-    push_damage(damage, rect.x, rect.y, rect.width, rect.height, width, height);
+    push_damage(
+        damage,
+        rect.x,
+        rect.y,
+        rect.width,
+        rect.height,
+        width,
+        height,
+    );
 }
 
 pub(super) fn draw_pane_border(
@@ -85,7 +93,16 @@ pub(super) fn draw_pane_border(
         return;
     }
 
-    draw_rect(buffer, width, height, rect.x, rect.y, rect.width, 1, border_color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        rect.width,
+        1,
+        border_color,
+    );
     draw_rect(
         buffer,
         width,
@@ -96,7 +113,16 @@ pub(super) fn draw_pane_border(
         1,
         border_color,
     );
-    draw_rect(buffer, width, height, rect.x, rect.y, 1, rect.height, border_color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        rect.x,
+        rect.y,
+        1,
+        rect.height,
+        border_color,
+    );
     draw_rect(
         buffer,
         width,
@@ -902,7 +928,17 @@ fn draw_pane_tint(
     tint: u32,
     alpha: u8,
 ) {
-    draw_shade(buffer, buf_w, buf_h, x, y, rect_width, rect_height, tint, alpha);
+    draw_shade(
+        buffer,
+        buf_w,
+        buf_h,
+        x,
+        y,
+        rect_width,
+        rect_height,
+        tint,
+        alpha,
+    );
 }
 
 fn lerp_color(from: u32, to: u32, amount: u8) -> u32 {

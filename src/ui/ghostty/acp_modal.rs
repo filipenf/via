@@ -99,7 +99,9 @@ pub fn render_acp_modal_buffer(
     let accent = Color::Indexed(11);
     let text = Color::Indexed(7);
 
-    Block::default().style(Style::default().bg(dim)).render(area, &mut buf);
+    Block::default()
+        .style(Style::default().bg(dim))
+        .render(area, &mut buf);
 
     let modal_w = cols.saturating_sub(8).max(36).min(78);
     let x0 = cols.saturating_sub(modal_w) / 2;

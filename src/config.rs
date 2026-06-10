@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
 
+use anyhow::{Context, Result as AnyResult};
+use serde::Deserialize;
+
 /// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
 /// to a path under the via runtime directory (see `runtime_base_dir`) so Neovim can `luafile` it.
 static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -49,16 +52,86 @@ pub const DEFAULT_AGENT_PANE_MAX_COLS: u16 = 100;
 pub struct Config {
     pub nvim_command: String,
     pub agent_command: Option<String>,
-    /// Minimum agent pane width in terminal columns (vertical split only).
-    pub agent_pane_min_cols: Option<u16>,
-    /// Maximum agent pane width in terminal columns (vertical split only).
-    pub agent_pane_max_cols: Option<u16>,
+    /// Agent pane width bounds in terminal columns (vertical split only).
+    pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: ReviewBackend,
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
     pub lsp_bridge_socket_path: PathBuf,
     pub working_directory: PathBuf,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ConfigOverrides {
+    pub nvim: Option<String>,
+    pub agent: Option<String>,
+    pub agent_pane_cols: Option<AgentPaneCols>,
+    pub review_backend: Option<ReviewBackend>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentPaneCols {
+    pub min: u16,
+    pub max: u16,
+}
+
+impl std::fmt::Display for AgentPaneCols {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.min == self.max {
+            write!(f, "{}", self.min)
+        } else {
+            write!(f, "{}:{}", self.min, self.max)
+        }
+    }
+}
+
+impl FromStr for AgentPaneCols {
+    type Err = String;
+
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
+        let input = input.trim();
+        let parse_col = |value: &str| {
+            value
+                .parse::<u16>()
+                .map_err(|_| format!("invalid agent pane column value `{value}`"))
+                .and_then(|value| {
+                    if value > 0 {
+                        Ok(value)
+                    } else {
+                        Err("agent pane columns must be greater than 0".to_owned())
+                    }
+                })
+        };
+
+        let (min, max) = match input.split_once(':') {
+            Some((min, max)) if !min.is_empty() && !max.is_empty() && !max.contains(':') => {
+                (parse_col(min)?, parse_col(max)?)
+            }
+            Some(_) => return Err(format!("invalid agent pane columns `{input}`")),
+            None => {
+                let cols = parse_col(input)?;
+                (cols, cols)
+            }
+        };
+
+        Ok(if min <= max {
+            Self { min, max }
+        } else {
+            Self { min: max, max: min }
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentPaneCols {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,10 +146,19 @@ impl Default for ReviewBackend {
     }
 }
 
+impl std::fmt::Display for ReviewBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Hunk => f.write_str("hunk"),
+            Self::Nvim => f.write_str("nvim"),
+        }
+    }
+}
+
 impl FromStr for ReviewBackend {
     type Err = String;
 
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
+    fn from_str(input: &str) -> std::result::Result<Self, Self::Err> {
         match input.trim().to_ascii_lowercase().as_str() {
             "hunk" => Ok(Self::Hunk),
             "nvim" | "vim" | "vimdiff" => Ok(Self::Nvim),
@@ -85,16 +167,145 @@ impl FromStr for ReviewBackend {
     }
 }
 
+impl<'de> Deserialize<'de> for ReviewBackend {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer)?
+            .parse()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    nvim: Option<String>,
+    agent: Option<String>,
+    agent_pane_cols: Option<AgentPaneCols>,
+    review_backend: Option<ReviewBackend>,
+}
+
+impl From<FileConfig> for ConfigOverrides {
+    fn from(config: FileConfig) -> Self {
+        Self {
+            nvim: config.nvim,
+            agent: config.agent,
+            agent_pane_cols: config.agent_pane_cols,
+            review_backend: config.review_backend,
+        }
+    }
+}
+
+impl ConfigOverrides {
+    fn from_env() -> Self {
+        Self {
+            nvim: env::var("VIA_NVIM").ok(),
+            agent: env::var("VIA_AGENT").ok(),
+            agent_pane_cols: env::var("VIA_AGENT_PANE_COLS")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+            review_backend: env::var("VIA_REVIEW_BACKEND")
+                .ok()
+                .and_then(|value| value.parse().ok()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedUserConfig {
+    nvim_command: String,
+    agent_command: Option<String>,
+    agent_pane_cols: AgentPaneCols,
+    review_backend: ReviewBackend,
+}
+
+fn resolve_user_config_from_sources(
+    cli: ConfigOverrides,
+    env: ConfigOverrides,
+    file: ConfigOverrides,
+) -> ResolvedUserConfig {
+    let nvim_command = cli
+        .nvim
+        .or(env.nvim)
+        .or(file.nvim)
+        .unwrap_or_else(|| "nvim".to_owned());
+    let agent_command = cli.agent.or(env.agent).or(file.agent);
+    let agent_pane_cols = cli
+        .agent_pane_cols
+        .or(env.agent_pane_cols)
+        .or(file.agent_pane_cols);
+    let review_backend = cli
+        .review_backend
+        .or(env.review_backend)
+        .or(file.review_backend)
+        .unwrap_or_default();
+
+    ResolvedUserConfig {
+        nvim_command,
+        agent_command,
+        agent_pane_cols: agent_pane_cols.unwrap_or(AgentPaneCols {
+            min: DEFAULT_AGENT_PANE_MIN_COLS,
+            max: DEFAULT_AGENT_PANE_MAX_COLS,
+        }),
+        review_backend,
+    }
+}
+
+fn resolve_user_config(cli: ConfigOverrides) -> AnyResult<ResolvedUserConfig> {
+    let file = config_file_overrides()?;
+    let env = ConfigOverrides::from_env();
+    Ok(resolve_user_config_from_sources(cli, env, file))
+}
+
+pub fn persist_resolved(cli: ConfigOverrides) -> AnyResult<PathBuf> {
+    let path = config_file_path()
+        .context("cannot determine via config path; set XDG_CONFIG_HOME or HOME")?;
+    let config = resolve_user_config(cli)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
+    }
+    std::fs::write(&path, render_user_config(&config))
+        .with_context(|| format!("failed to write config file {}", path.display()))?;
+    Ok(path)
+}
+
+fn render_user_config(config: &ResolvedUserConfig) -> String {
+    let mut output = String::new();
+    output.push_str(&format!(
+        "nvim = \"{}\"\n",
+        toml_escape_string(&config.nvim_command)
+    ));
+    if let Some(agent) = &config.agent_command {
+        output.push_str(&format!("agent = \"{}\"\n", toml_escape_string(agent)));
+    }
+    output.push_str(&format!(
+        "agent_pane_cols = \"{}\"\n",
+        config.agent_pane_cols
+    ));
+    output.push_str(&format!("review_backend = \"{}\"\n", config.review_backend));
+    output
+}
+
+fn toml_escape_string(value: &str) -> String {
+    value
+        .chars()
+        .flat_map(|ch| match ch {
+            '\\' => "\\\\".chars().collect::<Vec<_>>(),
+            '"' => "\\\"".chars().collect(),
+            '\n' => "\\n".chars().collect(),
+            '\r' => "\\r".chars().collect(),
+            '\t' => "\\t".chars().collect(),
+            ch => vec![ch],
+        })
+        .collect()
+}
+
 impl Config {
-    pub fn from_env() -> Self {
-        let nvim_command = env::var("VIA_NVIM").unwrap_or_else(|_| "nvim".to_owned());
-        let agent_command = env::var("VIA_AGENT").ok();
-        let agent_pane_min_cols = env_u16("VIA_AGENT_PANE_MIN_COLS");
-        let agent_pane_max_cols = env_u16("VIA_AGENT_PANE_MAX_COLS");
-        let review_backend = env::var("VIA_REVIEW_BACKEND")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_default();
+    pub fn load(cli: ConfigOverrides) -> AnyResult<Self> {
+        let user_config = resolve_user_config(cli)?;
         let nvim_socket_path = env::var_os("VIA_NVIM_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_socket_path);
@@ -109,18 +320,17 @@ impl Config {
             .unwrap_or_else(default_lsp_bridge_socket_path);
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-        Self {
-            nvim_command,
-            agent_command,
-            agent_pane_min_cols,
-            agent_pane_max_cols,
-            review_backend,
+        Ok(Self {
+            nvim_command: user_config.nvim_command,
+            agent_command: user_config.agent_command,
+            agent_pane_cols: Some(user_config.agent_pane_cols),
+            review_backend: user_config.review_backend,
             nvim_socket_path,
             editor_socket_path,
             nvim_context_bridge_path,
             lsp_bridge_socket_path,
             working_directory,
-        }
+        })
     }
 
     /// Returns true if the `VIA_AGENT` command ends with the `acp` subcommand.
@@ -138,23 +348,37 @@ impl Config {
             return None;
         }
 
-        let min = self
-            .agent_pane_min_cols
-            .unwrap_or(DEFAULT_AGENT_PANE_MIN_COLS);
-        let max = self
-            .agent_pane_max_cols
-            .unwrap_or(DEFAULT_AGENT_PANE_MAX_COLS);
-        let (min, max) = if min <= max { (min, max) } else { (max, min) };
-        Some((min, max))
+        let cols = self.agent_pane_cols.unwrap_or(AgentPaneCols {
+            min: DEFAULT_AGENT_PANE_MIN_COLS,
+            max: DEFAULT_AGENT_PANE_MAX_COLS,
+        });
+        Some((cols.min, cols.max))
     }
-
 }
 
-fn env_u16(key: &str) -> Option<u16> {
-    env::var(key)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|value| *value > 0)
+fn config_file_overrides() -> AnyResult<ConfigOverrides> {
+    let Some(path) = config_file_path() else {
+        return Ok(ConfigOverrides::default());
+    };
+    if !path.exists() {
+        return Ok(ConfigOverrides::default());
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed to read config file {}", path.display()))?;
+    let config: FileConfig = toml::from_str(&contents)
+        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    Ok(config.into())
+}
+
+fn config_file_path() -> Option<PathBuf> {
+    if let Some(dir) = env::var_os("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(dir);
+        if dir.is_absolute() {
+            return Some(dir.join("via/via.conf"));
+        }
+    }
+    env::var_os("HOME").map(|home| PathBuf::from(home).join(".config/via/via.conf"))
 }
 
 fn default_nvim_socket_path() -> PathBuf {
@@ -171,7 +395,10 @@ fn default_nvim_context_bridge_path() -> PathBuf {
             let dir = runtime_base_dir();
             let path = dir.join(format!("via-context-bridge-{}.lua", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!("failed to create via runtime directory {}: {err}", dir.display());
+                panic!(
+                    "failed to create via runtime directory {}: {err}",
+                    dir.display()
+                );
             });
             std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
                 |err| {
@@ -239,12 +466,141 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_pane_cols() {
+        assert_eq!(
+            "100".parse::<AgentPaneCols>(),
+            Ok(AgentPaneCols { min: 100, max: 100 })
+        );
+        assert_eq!(
+            "80:120".parse::<AgentPaneCols>(),
+            Ok(AgentPaneCols { min: 80, max: 120 })
+        );
+        assert_eq!(
+            "120:80".parse::<AgentPaneCols>(),
+            Ok(AgentPaneCols { min: 80, max: 120 })
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_agent_pane_cols() {
+        for value in ["0", "80:", ":120", "80:120:140", "abc"] {
+            assert!(value.parse::<AgentPaneCols>().is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn cli_overrides_env_and_file_config() {
+        let file = ConfigOverrides {
+            nvim: Some("file-nvim".to_string()),
+            agent: Some("file-agent".to_string()),
+            agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
+            review_backend: Some(ReviewBackend::Nvim),
+        };
+        let env = ConfigOverrides {
+            nvim: Some("env-nvim".to_string()),
+            agent: Some("env-agent".to_string()),
+            agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
+            review_backend: Some(ReviewBackend::Hunk),
+        };
+        let cli = ConfigOverrides {
+            nvim: Some("cli-nvim".to_string()),
+            agent: Some("cli-agent".to_string()),
+            agent_pane_cols: Some(AgentPaneCols { min: 90, max: 110 }),
+            review_backend: Some(ReviewBackend::Nvim),
+        };
+
+        let config = resolve_user_config_from_sources(cli, env, file);
+
+        assert_eq!(config.nvim_command, "cli-nvim");
+        assert_eq!(config.agent_command.as_deref(), Some("cli-agent"));
+        assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 90, max: 110 });
+        assert_eq!(config.review_backend, ReviewBackend::Nvim);
+    }
+
+    #[test]
+    fn env_overrides_file_config() {
+        let file = ConfigOverrides {
+            nvim: Some("file-nvim".to_string()),
+            agent: Some("file-agent".to_string()),
+            agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
+            review_backend: Some(ReviewBackend::Nvim),
+        };
+        let env = ConfigOverrides {
+            nvim: Some("env-nvim".to_string()),
+            agent: Some("env-agent".to_string()),
+            agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
+            review_backend: Some(ReviewBackend::Hunk),
+        };
+
+        let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
+
+        assert_eq!(config.nvim_command, "env-nvim");
+        assert_eq!(config.agent_command.as_deref(), Some("env-agent"));
+        assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 80, max: 100 });
+        assert_eq!(config.review_backend, ReviewBackend::Hunk);
+    }
+
+    #[test]
+    fn user_config_defaults_are_resolved() {
+        let config = resolve_user_config_from_sources(
+            ConfigOverrides::default(),
+            ConfigOverrides::default(),
+            ConfigOverrides::default(),
+        );
+
+        assert_eq!(config.nvim_command, "nvim");
+        assert_eq!(config.agent_command, None);
+        assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 80, max: 100 });
+        assert_eq!(config.review_backend, ReviewBackend::Nvim);
+    }
+
+    #[test]
+    fn renders_resolved_user_config() {
+        let output = render_user_config(&ResolvedUserConfig {
+            nvim_command: "nvim-nightly".to_string(),
+            agent_command: Some("opencode acp".to_string()),
+            agent_pane_cols: AgentPaneCols { min: 80, max: 120 },
+            review_backend: ReviewBackend::Hunk,
+        });
+
+        assert_eq!(
+            output,
+            concat!(
+                "nvim = \"nvim-nightly\"\n",
+                "agent = \"opencode acp\"\n",
+                "agent_pane_cols = \"80:120\"\n",
+                "review_backend = \"hunk\"\n",
+            )
+        );
+    }
+
+    #[test]
+    fn parses_file_config() {
+        let config: FileConfig = toml::from_str(
+            r#"
+nvim = "nvim-nightly"
+agent = "opencode acp"
+agent_pane_cols = "80:120"
+review_backend = "hunk"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.nvim.as_deref(), Some("nvim-nightly"));
+        assert_eq!(config.agent.as_deref(), Some("opencode acp"));
+        assert_eq!(
+            config.agent_pane_cols,
+            Some(AgentPaneCols { min: 80, max: 120 })
+        );
+        assert_eq!(config.review_backend, Some(ReviewBackend::Hunk));
+    }
+
+    #[test]
     fn agent_pane_col_limits_default_to_eighty_and_one_hundred() {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
-            agent_pane_min_cols: None,
-            agent_pane_max_cols: None,
+            agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
@@ -261,8 +617,7 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
-            agent_pane_min_cols: Some(100),
-            agent_pane_max_cols: Some(80),
+            agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
@@ -273,5 +628,4 @@ mod tests {
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
     }
-
 }

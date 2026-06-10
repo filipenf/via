@@ -30,16 +30,17 @@ pub enum SkillCommand {
 
 pub fn run(command: AgentCommand) -> Result<()> {
     match command {
-        AgentCommand::Skill { command } => {
-            run_skill(command.unwrap_or(SkillCommand::Show))
-        }
+        AgentCommand::Skill { command } => run_skill(command.unwrap_or(SkillCommand::Show)),
     }
 }
 
 fn run_skill(mode: SkillCommand) -> Result<()> {
     match mode {
         SkillCommand::Path => {
-            println!("{}", agent_skill::primary_skill_path(current_family())?.display());
+            println!(
+                "{}",
+                agent_skill::primary_skill_path(current_family())?.display()
+            );
         }
         SkillCommand::Show => {
             let mut stdout = io::stdout().lock();

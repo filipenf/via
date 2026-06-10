@@ -95,10 +95,7 @@ pub async fn open_symbol(socket_path: &Path, symbol: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn get_diagnostics(
-    socket_path: &Path,
-    file: Option<&Path>,
-) -> Result<DiagnosticsReport> {
+pub async fn get_diagnostics(socket_path: &Path, file: Option<&Path>) -> Result<DiagnosticsReport> {
     if !socket_path.exists() {
         bail!(
             "Neovim RPC socket does not exist at {}. Start via before running session diagnostics.",
@@ -118,9 +115,9 @@ pub async fn get_diagnostics(
         .exec_lua(&code, Vec::new())
         .await
         .map_err(|error| anyhow::anyhow!("failed to query Neovim diagnostics: {error}"))?;
-    let json: String = value
-        .try_unpack()
-        .map_err(|error| anyhow::anyhow!("unexpected diagnostics payload from Neovim: {error:?}"))?;
+    let json: String = value.try_unpack().map_err(|error| {
+        anyhow::anyhow!("unexpected diagnostics payload from Neovim: {error:?}")
+    })?;
 
     io_handle.abort();
 

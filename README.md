@@ -64,6 +64,39 @@ cargo build --release
 `libghostty-vt` is statically linked into the binary, so no runtime library
 search path setup is needed.
 
+## Configuration
+
+User-facing settings can be provided as CLI flags, environment variables, or in
+`~/.config/via/via.conf` using TOML syntax. Precedence is:
+
+```text
+CLI flags > environment variables > via.conf > built-in defaults
+```
+
+Example config:
+
+```toml
+nvim = "nvim"
+agent = "opencode acp"
+agent_pane_cols = "80:120"
+review_backend = "nvim"
+```
+
+Equivalent CLI/env names:
+
+- `--nvim` / `VIA_NVIM`
+- `--agent` / `VIA_AGENT`
+- `--agent-pane-cols` / `VIA_AGENT_PANE_COLS`
+- `--review-backend` / `VIA_REVIEW_BACKEND`
+
+Use `--persist` to write the resolved user-facing config to `via.conf` before
+running. For example, this writes `agent = "opencode"` plus the resolved defaults
+for the other user-facing settings:
+
+```sh
+via --agent opencode --persist
+```
+
 Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
 bridge is written to via's data directory (`$XDG_DATA_HOME/via`, or
 `~/.local/share/via`) when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
@@ -92,8 +125,11 @@ With a PTY agent, vertical split mode keeps the agent at its minimum width
 Override with:
 
 ```sh
-VIA_AGENT_PANE_MIN_COLS=60 VIA_AGENT_PANE_MAX_COLS=120 cargo run
+VIA_AGENT_PANE_COLS=60:120 cargo run
+cargo run -- --agent-pane-cols 100
 ```
+
+A single value pins the agent pane to that width; `min:max` gives a range.
 
 The editor pane keeps at least 80 columns. When the window cannot fit both that
 and the agent minimum (default 80 + 80 = 160 columns total), via collapses to

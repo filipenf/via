@@ -617,8 +617,7 @@ mod tests {
         Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("echo agent".to_string()),
-            agent_pane_min_cols: None,
-            agent_pane_max_cols: None,
+            agent_pane_cols: None,
             review_backend: crate::config::ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),

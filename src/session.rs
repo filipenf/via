@@ -100,7 +100,10 @@ pub fn resolve_session() -> Result<SessionManifest> {
 
     let path = PathBuf::from(value);
     let manifest = read_manifest(&path).with_context(|| {
-        format!("read session manifest from {VIA_SESSION_ENV} ({})", path.display())
+        format!(
+            "read session manifest from {VIA_SESSION_ENV} ({})",
+            path.display()
+        )
     })?;
 
     if !manifest.is_live() {

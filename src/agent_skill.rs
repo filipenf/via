@@ -188,10 +188,7 @@ mod tests {
 
     #[test]
     fn detects_cursor() {
-        assert_eq!(
-            detect_agent_family("cursor-agent acp"),
-            AgentFamily::Cursor
-        );
+        assert_eq!(detect_agent_family("cursor-agent acp"), AgentFamily::Cursor);
     }
 
     #[test]
@@ -236,7 +233,13 @@ mod tests {
     fn all_known_dirs_are_unique() {
         let dirs = all_known_skill_dirs();
         assert_eq!(dirs.len(), 5);
-        assert!(dirs.iter().any(|p| p.ends_with(".cursor/skills/via-editor")));
-        assert!(dirs.iter().any(|p| p.ends_with(".config/opencode/skills/via-editor")));
+        assert!(
+            dirs.iter()
+                .any(|p| p.ends_with(".cursor/skills/via-editor"))
+        );
+        assert!(
+            dirs.iter()
+                .any(|p| p.ends_with(".config/opencode/skills/via-editor"))
+        );
     }
 }

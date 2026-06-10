@@ -508,11 +508,7 @@ fn estimate_wrapped_line_rows(line: &Line, width: usize) -> usize {
             }
         }
     }
-    if has_content {
-        rows
-    } else {
-        1
-    }
+    if has_content { rows } else { 1 }
 }
 
 fn transcript_wrapped_rows(lines: &[Line], width: u16) -> usize {

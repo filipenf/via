@@ -18,13 +18,17 @@ use clap::Parser;
 use tracing::info;
 
 use crate::cli::Cli;
-use crate::config::Config;
 use crate::mediator::Mediator;
 use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    if cli.persist {
+        let path = config::persist_resolved(cli.config_overrides())?;
+        eprintln!("wrote {}", path.display());
+    }
 
     if cli.command.is_some() {
         return tokio::runtime::Builder::new_multi_thread()
@@ -58,10 +62,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     logging::init();
     config::ensure_runtime_dir()?;
 
-    let mut config = Config::from_env();
-    if let Some(review_backend) = cli.review_backend {
-        config.review_backend = review_backend;
-    }
+    let config = config::Config::load(cli.config_overrides())?;
     info!(?config, "starting via");
 
     if let Some(open) = cli.open {

@@ -961,10 +961,8 @@ impl WinitGhosttyApp {
     }
 
     fn focus_nvim_after_reference_navigation(&mut self) {
-        let focus = focus_nvim_after_agent_reference(
-            &mut self.pane_layout_mode,
-            &mut self.active_pane,
-        );
+        let focus =
+            focus_nvim_after_agent_reference(&mut self.pane_layout_mode, &mut self.active_pane);
         if focus.relayout_needed {
             self.relayout();
         } else if focus.focus_changed {
@@ -1657,7 +1655,9 @@ mod tests {
         assert_eq!(layout.pane(1).width / cell_width, 80);
         assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
         assert_eq!(
-            layout.pane_at(layout.pane(1).x + 10, 10).map(|(index, _)| index),
+            layout
+                .pane_at(layout.pane(1).x + 10, 10)
+                .map(|(index, _)| index),
             Some(1)
         );
         assert_eq!(layout.pane_at(layout.pane(0).width + 1, 10), None);
@@ -1968,8 +1968,7 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: None,
-            agent_pane_min_cols: None,
-            agent_pane_max_cols: None,
+            agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
