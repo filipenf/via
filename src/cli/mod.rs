@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long = "review-backend")]
     pub review_backend: Option<crate::config::ReviewBackend>,
 
+    /// Mouse wheel sensitivity multiplier (higher scrolls faster).
+    #[arg(long = "scroll-sensitivity")]
+    pub scroll_sensitivity: Option<f32>,
+
     /// Write the resolved user-facing configuration to via.conf before running.
     #[arg(long = "persist")]
     pub persist: bool,
@@ -46,6 +50,7 @@ impl Cli {
             agent: self.agent.clone(),
             agent_pane_cols: self.agent_pane_cols,
             review_backend: self.review_backend,
+            scroll_sensitivity: self.scroll_sensitivity,
         }
     }
 }

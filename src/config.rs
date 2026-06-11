@@ -47,6 +47,7 @@ pub fn ensure_runtime_dir() -> std::io::Result<()> {
 
 pub const DEFAULT_AGENT_PANE_MIN_COLS: u16 = 80;
 pub const DEFAULT_AGENT_PANE_MAX_COLS: u16 = 100;
+pub const DEFAULT_SCROLL_SENSITIVITY: f32 = 3.0;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -55,6 +56,8 @@ pub struct Config {
     /// Agent pane width bounds in terminal columns (vertical split only).
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: ReviewBackend,
+    /// Mouse wheel sensitivity multiplier; higher scrolls faster, lower slower.
+    pub scroll_sensitivity: f32,
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
@@ -68,6 +71,7 @@ pub struct ConfigOverrides {
     pub agent: Option<String>,
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: Option<ReviewBackend>,
+    pub scroll_sensitivity: Option<f32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -185,6 +189,7 @@ struct FileConfig {
     agent: Option<String>,
     agent_pane_cols: Option<AgentPaneCols>,
     review_backend: Option<ReviewBackend>,
+    scroll_sensitivity: Option<f32>,
 }
 
 impl From<FileConfig> for ConfigOverrides {
@@ -194,6 +199,7 @@ impl From<FileConfig> for ConfigOverrides {
             agent: config.agent,
             agent_pane_cols: config.agent_pane_cols,
             review_backend: config.review_backend,
+            scroll_sensitivity: config.scroll_sensitivity,
         }
     }
 }
@@ -209,16 +215,20 @@ impl ConfigOverrides {
             review_backend: env::var("VIA_REVIEW_BACKEND")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            scroll_sensitivity: env::var("VIA_SCROLL_SENSITIVITY")
+                .ok()
+                .and_then(|value| value.parse().ok()),
         }
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct ResolvedUserConfig {
     nvim_command: String,
     agent_command: Option<String>,
     agent_pane_cols: AgentPaneCols,
     review_backend: ReviewBackend,
+    scroll_sensitivity: f32,
 }
 
 fn resolve_user_config_from_sources(
@@ -241,6 +251,12 @@ fn resolve_user_config_from_sources(
         .or(env.review_backend)
         .or(file.review_backend)
         .unwrap_or_default();
+    let scroll_sensitivity = cli
+        .scroll_sensitivity
+        .or(env.scroll_sensitivity)
+        .or(file.scroll_sensitivity)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .unwrap_or(DEFAULT_SCROLL_SENSITIVITY);
 
     ResolvedUserConfig {
         nvim_command,
@@ -250,6 +266,7 @@ fn resolve_user_config_from_sources(
             max: DEFAULT_AGENT_PANE_MAX_COLS,
         }),
         review_backend,
+        scroll_sensitivity,
     }
 }
 
@@ -286,6 +303,10 @@ fn render_user_config(config: &ResolvedUserConfig) -> String {
         config.agent_pane_cols
     ));
     output.push_str(&format!("review_backend = \"{}\"\n", config.review_backend));
+    output.push_str(&format!(
+        "scroll_sensitivity = {}\n",
+        config.scroll_sensitivity
+    ));
     output
 }
 
@@ -325,6 +346,7 @@ impl Config {
             agent_command: user_config.agent_command,
             agent_pane_cols: Some(user_config.agent_pane_cols),
             review_backend: user_config.review_backend,
+            scroll_sensitivity: user_config.scroll_sensitivity,
             nvim_socket_path,
             editor_socket_path,
             nvim_context_bridge_path,
@@ -495,18 +517,21 @@ mod tests {
             agent: Some("file-agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
+            scroll_sensitivity: Some(0.5),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
             agent: Some("env-agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
+            scroll_sensitivity: Some(0.75),
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
             agent: Some("cli-agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 90, max: 110 }),
             review_backend: Some(ReviewBackend::Nvim),
+            scroll_sensitivity: Some(2.0),
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -515,6 +540,7 @@ mod tests {
         assert_eq!(config.agent_command.as_deref(), Some("cli-agent"));
         assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 90, max: 110 });
         assert_eq!(config.review_backend, ReviewBackend::Nvim);
+        assert_eq!(config.scroll_sensitivity, 2.0);
     }
 
     #[test]
@@ -524,12 +550,14 @@ mod tests {
             agent: Some("file-agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
+            scroll_sensitivity: Some(0.5),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
             agent: Some("env-agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
+            scroll_sensitivity: Some(0.75),
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -538,6 +566,7 @@ mod tests {
         assert_eq!(config.agent_command.as_deref(), Some("env-agent"));
         assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 80, max: 100 });
         assert_eq!(config.review_backend, ReviewBackend::Hunk);
+        assert_eq!(config.scroll_sensitivity, 0.75);
     }
 
     #[test]
@@ -552,6 +581,7 @@ mod tests {
         assert_eq!(config.agent_command, None);
         assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 80, max: 100 });
         assert_eq!(config.review_backend, ReviewBackend::Nvim);
+        assert_eq!(config.scroll_sensitivity, DEFAULT_SCROLL_SENSITIVITY);
     }
 
     #[test]
@@ -561,6 +591,7 @@ mod tests {
             agent_command: Some("opencode acp".to_string()),
             agent_pane_cols: AgentPaneCols { min: 80, max: 120 },
             review_backend: ReviewBackend::Hunk,
+            scroll_sensitivity: 1.5,
         });
 
         assert_eq!(
@@ -570,6 +601,7 @@ mod tests {
                 "agent = \"opencode acp\"\n",
                 "agent_pane_cols = \"80:120\"\n",
                 "review_backend = \"hunk\"\n",
+                "scroll_sensitivity = 1.5\n",
             )
         );
     }
@@ -582,6 +614,7 @@ nvim = "nvim-nightly"
 agent = "opencode acp"
 agent_pane_cols = "80:120"
 review_backend = "hunk"
+scroll_sensitivity = 1.5
 "#,
         )
         .unwrap();
@@ -593,6 +626,7 @@ review_backend = "hunk"
             Some(AgentPaneCols { min: 80, max: 120 })
         );
         assert_eq!(config.review_backend, Some(ReviewBackend::Hunk));
+        assert_eq!(config.scroll_sensitivity, Some(1.5));
     }
 
     #[test]
@@ -602,6 +636,7 @@ review_backend = "hunk"
             agent_command: Some("agent".to_string()),
             agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
@@ -619,6 +654,7 @@ review_backend = "hunk"
             agent_command: Some("agent".to_string()),
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),

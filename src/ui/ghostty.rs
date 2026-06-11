@@ -287,6 +287,7 @@ impl WinitGhosttyApp {
                 metrics,
                 &self.terminal_config.theme,
             )?,
+            self.config.scroll_sensitivity,
         )];
 
         if self.config.agent_command.is_some() && !self.config.is_acp_agent() {
@@ -303,7 +304,11 @@ impl WinitGhosttyApp {
                     &self.config.working_directory,
                     self.output_notifier.clone(),
                 )?;
-                panes.push(TerminalPaneController::new(PaneRole::AgentTerminal, pane));
+                panes.push(TerminalPaneController::new(
+                    PaneRole::AgentTerminal,
+                    pane,
+                    self.config.scroll_sensitivity,
+                ));
             }
         }
 
@@ -707,7 +712,12 @@ impl WinitGhosttyApp {
                 &self.config.working_directory,
                 self.output_notifier.clone(),
             )?;
-            self.review_pane = Some(TerminalPaneController::new(PaneRole::ReviewTerminal, pane));
+            let controller = TerminalPaneController::new(
+                PaneRole::ReviewTerminal,
+                pane,
+                self.config.scroll_sensitivity,
+            );
+            self.review_pane = Some(controller);
         } else {
             self.reload_hunk_review();
         }
@@ -1970,6 +1980,7 @@ mod tests {
             agent_command: None,
             agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),

@@ -40,20 +40,35 @@ pub(super) enum PaneCommand {
 #[derive(Default)]
 struct MouseState {
     held_button: Option<PaneMouseButton>,
+    /// Carried-over fractional scroll input. Pixel-precise devices (touchpads, hi-res wheels) send
+    /// many small deltas per notch; we accumulate them and only emit whole wheel steps so programs
+    /// (and local scrollback) move one line per notch instead of a burst per event.
+    scroll_accumulator: f32,
 }
+
+/// Raw scroll units that make up one wheel step (one line / one notch). Winit `LineDelta` is scaled
+/// to this in [`super::ghostty`], so a single notch is exactly one step.
+const WHEEL_STEP_UNITS: f32 = 40.0;
 
 pub(super) struct TerminalPaneController {
     role: PaneRole,
     pane: TerminalPane,
     mouse: MouseState,
+    scroll_sensitivity: f32,
 }
 
 impl TerminalPaneController {
-    pub(super) fn new(role: PaneRole, pane: TerminalPane) -> Self {
+    pub(super) fn new(role: PaneRole, pane: TerminalPane, scroll_sensitivity: f32) -> Self {
+        let scroll_sensitivity = if scroll_sensitivity.is_finite() && scroll_sensitivity > 0.0 {
+            scroll_sensitivity
+        } else {
+            1.0
+        };
         Self {
             role,
             pane,
             mouse: MouseState::default(),
+            scroll_sensitivity,
         }
     }
 
@@ -157,21 +172,23 @@ impl TerminalPaneController {
         local_y: usize,
         modifiers: Modifiers,
     ) -> Result<PaneEventOutcome> {
+        let steps = self.accumulate_wheel_steps(scroll_delta);
+        if steps == 0 {
+            return Ok(PaneEventOutcome::default());
+        }
+
         match self.role {
             PaneRole::ReviewTerminal => {
-                self.forward_terminal_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
+                self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)
             }
             PaneRole::Editor | PaneRole::AgentTerminal => {
                 let forwarded =
-                    self.forward_terminal_mouse_wheel(scroll_delta, local_x, local_y, modifiers)?;
+                    self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)?;
                 if forwarded.dirty {
                     return Ok(forwarded);
                 }
 
-                let Some(delta_y) = viewport_scroll_delta(scroll_delta) else {
-                    return Ok(PaneEventOutcome::default());
-                };
-                self.pane.scroll_viewport(delta_y);
+                self.pane.scroll_viewport(-steps);
                 Ok(PaneEventOutcome {
                     dirty: true,
                     force_redraw: true,
@@ -179,6 +196,30 @@ impl TerminalPaneController {
                 })
             }
         }
+    }
+
+    /// Fold raw scroll deltas into whole wheel steps. Positive result means scroll up (matching
+    /// winit's positive `y`). Fractional input is carried in `scroll_accumulator` and a direction
+    /// reversal drops the carry so the gesture feels responsive.
+    fn accumulate_wheel_steps(&mut self, scroll_delta: (f32, f32)) -> isize {
+        let (sx, sy) = scroll_delta;
+        let raw = (sy + sx) * self.scroll_sensitivity;
+        if raw.abs() <= 1e-4 {
+            return 0;
+        }
+
+        if self.mouse.scroll_accumulator != 0.0
+            && self.mouse.scroll_accumulator.signum() != raw.signum()
+        {
+            self.mouse.scroll_accumulator = 0.0;
+        }
+        self.mouse.scroll_accumulator += raw;
+
+        let steps = (self.mouse.scroll_accumulator / WHEEL_STEP_UNITS).trunc();
+        if steps != 0.0 {
+            self.mouse.scroll_accumulator -= steps * WHEEL_STEP_UNITS;
+        }
+        steps.clamp(-64.0, 64.0) as isize
     }
 
     pub(super) fn handle_mouse_input(
@@ -247,34 +288,27 @@ impl TerminalPaneController {
         }
     }
 
-    fn forward_terminal_mouse_wheel(
+    fn forward_terminal_wheel_steps(
         &mut self,
-        scroll_delta: (f32, f32),
+        steps: isize,
         local_x: usize,
         local_y: usize,
         modifiers: Modifiers,
     ) -> Result<PaneEventOutcome> {
-        let (sx, sy) = scroll_delta;
-        let sy = sy + sx;
-        if sy.abs() <= 1e-4 {
+        if steps == 0 {
             return Ok(PaneEventOutcome::default());
         }
 
-        let scaled = (sy / 40.0).round();
-        let steps = if scaled == 0.0 {
-            1
-        } else {
-            scaled.abs().min(64.0) as usize
-        };
-        let button = if sy > 0.0 {
+        let button = if steps > 0 {
             PaneMouseButton::WheelUp
         } else {
             PaneMouseButton::WheelDown
         };
+        let count = steps.unsigned_abs().min(64);
         let modifiers = pane_mouse_modifiers(modifiers);
         let mut dirty = false;
 
-        for _ in 0..steps {
+        for _ in 0..count {
             dirty |= self.pane.forward_mouse_event(
                 PaneMouseAction::Press,
                 Some(button),
@@ -440,32 +474,18 @@ impl DerefMut for TerminalPaneController {
 }
 
 impl TerminalPaneController {
-    /// Agent panes always use Page/Home/End for scrollback. Editor/review panes forward those
-    /// keys to the running program (e.g. Neovim) while pinned to the live bottom; after the user
-    /// scrolls into history, the same keys move the viewport again.
+    /// Agent panes use Page/Home/End for scrollback while on the primary screen; once a full-screen
+    /// program takes over the alternate screen (e.g. opencode) those keys are forwarded so the
+    /// program does its own paging. Editor/review panes forward those keys to the running program
+    /// (e.g. Neovim) while pinned to the live bottom; after the user scrolls into history, the same
+    /// keys move the viewport again.
     fn intercepts_viewport_navigation_keys(&self) -> bool {
         match self.role {
-            PaneRole::AgentTerminal => true,
+            PaneRole::AgentTerminal => !self.pane.is_alt_screen(),
             PaneRole::ReviewTerminal => false,
             PaneRole::Editor => !self.pane.is_viewport_at_bottom(),
         }
     }
-}
-
-fn viewport_scroll_delta(scroll_delta: (f32, f32)) -> Option<isize> {
-    let (sx, sy) = scroll_delta;
-    let sy = sy + sx;
-
-    if sy.abs() <= 1e-4 {
-        return None;
-    }
-
-    let scaled = -sy / 40.0;
-    let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
-    if delta_y == 0 {
-        delta_y = -sy.signum() as isize;
-    }
-    Some(delta_y)
 }
 
 fn pane_mouse_button(button: MouseButton) -> Option<PaneMouseButton> {
@@ -517,6 +537,26 @@ mod tests {
     }
 
     #[test]
+    fn agent_forwards_page_keys_on_alt_screen() {
+        let mut pane = test_controller(PaneRole::AgentTerminal);
+        pane.process_for_test(b"\x1b[?1049h", true);
+        assert!(pane.is_alt_screen());
+
+        let outcome = pane
+            .handle_terminal_key(
+                &[Key::PageUp],
+                Some(Key::PageUp),
+                None,
+                false,
+                Modifiers::default(),
+                false,
+            )
+            .unwrap();
+        assert!(outcome.dirty);
+        assert!(!outcome.force_redraw);
+    }
+
+    #[test]
     fn editor_forwards_page_keys_at_live_bottom() {
         let mut pane = test_controller(PaneRole::Editor);
         let outcome = pane
@@ -556,10 +596,37 @@ mod tests {
     }
 
     #[test]
-    fn converts_scroll_wheel_to_viewport_delta() {
-        assert_eq!(viewport_scroll_delta((0.0, 40.0)), Some(-1));
-        assert_eq!(viewport_scroll_delta((0.0, -40.0)), Some(1));
-        assert_eq!(viewport_scroll_delta((0.0, 0.0)), None);
+    fn single_notch_scrolls_one_line() {
+        let mut pane = test_controller(PaneRole::AgentTerminal);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 0.0)), 0);
+    }
+
+    #[test]
+    fn small_pixel_deltas_accumulate_into_one_step() {
+        let mut pane = test_controller(PaneRole::AgentTerminal);
+        // Four sub-threshold pixel events that together cross one step.
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 1);
+    }
+
+    #[test]
+    fn direction_reversal_drops_carry() {
+        let mut pane = test_controller(PaneRole::AgentTerminal);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 30.0)), 0);
+        // Reversing direction should not have to "pay back" the prior carry.
+        assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
+    }
+
+    #[test]
+    fn scroll_sensitivity_scales_steps() {
+        let mut pane = test_controller_with_sensitivity(PaneRole::AgentTerminal, 0.5);
+        // Half sensitivity needs two notches for one step.
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 0);
+        assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
     }
 
     #[test]
@@ -749,9 +816,17 @@ mod tests {
     }
 
     fn test_controller(role: PaneRole) -> TerminalPaneController {
+        test_controller_with_sensitivity(role, 1.0)
+    }
+
+    fn test_controller_with_sensitivity(
+        role: PaneRole,
+        scroll_sensitivity: f32,
+    ) -> TerminalPaneController {
         TerminalPaneController::new(
             role,
             TerminalPane::new("test", 400, 100, test_metrics(), &TerminalTheme::default()).unwrap(),
+            scroll_sensitivity,
         )
     }
 

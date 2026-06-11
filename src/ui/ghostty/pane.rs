@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
 use libghostty_vt::style::RgbColor;
+use libghostty_vt::screen::Screen;
 use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 
@@ -294,6 +295,10 @@ impl TerminalPane {
 
     pub(super) fn is_viewport_at_bottom(&self) -> bool {
         self.view.is_viewport_at_bottom()
+    }
+
+    pub(super) fn is_alt_screen(&self) -> bool {
+        self.view.is_alt_screen()
     }
 }
 
@@ -605,6 +610,13 @@ impl TerminalView {
             .scrollbar()
             .map(|scrollbar| scrollbar.offset.saturating_add(scrollbar.len) >= scrollbar.total)
             .unwrap_or(true)
+    }
+
+    fn is_alt_screen(&self) -> bool {
+        self.terminal
+            .active_screen()
+            .map(|screen| screen == Screen::Alternate)
+            .unwrap_or(false)
     }
 
     pub(super) fn draw(
