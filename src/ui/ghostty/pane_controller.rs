@@ -387,6 +387,19 @@ impl TerminalPaneController {
 
         let is_down = state == ElementState::Pressed;
         let just_pressed = is_down && self.mouse.held_button != Some(PaneMouseButton::Left);
+        if just_pressed {
+            let metrics = self.pane.metrics();
+            let row = local_y / metrics.cell_height;
+            let column = local_x / metrics.cell_width;
+            if let Some(overlay) = self.pane.overlay_at(row, column) {
+                return PaneEventOutcome {
+                    dirty: self.pane.handle_overlay_action(overlay.action),
+                    force_redraw: false,
+                    command: None,
+                };
+            }
+        }
+
         let just_released = !is_down && self.mouse.held_button == Some(PaneMouseButton::Left);
         if is_down {
             self.mouse.held_button = Some(PaneMouseButton::Left);

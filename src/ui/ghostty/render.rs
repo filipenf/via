@@ -289,6 +289,58 @@ pub(super) fn draw_screen(
     true
 }
 
+pub(super) fn draw_overlay_label(
+    label: &str,
+    font_renderer: &mut FontRenderer,
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    metrics: TerminalMetrics,
+    foreground: u32,
+    background: u32,
+    damage: &mut Vec<DamageRect>,
+) {
+    let label_width = label.chars().count() * metrics.cell_width;
+    draw_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y,
+        label_width,
+        metrics.cell_height,
+        background,
+    );
+    push_damage(
+        damage,
+        x,
+        y,
+        label_width,
+        metrics.cell_height,
+        width,
+        height,
+    );
+
+    for (index, ch) in label.chars().enumerate() {
+        if ch == ' ' {
+            continue;
+        }
+        font_renderer.draw_char(
+            buffer,
+            width,
+            height,
+            x + index * metrics.cell_width,
+            y,
+            ch,
+            foreground,
+            true,
+            false,
+        );
+    }
+}
+
 pub(super) fn draw_ratatui_buffer(
     ratatui_buffer: &Buffer,
     font_renderer: &mut FontRenderer,

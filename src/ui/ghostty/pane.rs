@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
-use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
-use libghostty_vt::style::RgbColor;
+use libghostty_vt::render::{CellIterator, RenderState, RowIterator};
 use libghostty_vt::screen::Screen;
+use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 
@@ -22,15 +22,38 @@ use super::layout::PaneRect;
 use super::links::{
     Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri,
 };
-use super::render::{DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
+use super::render::{
+    DamageRect, SelectionRange, draw_overlay_label, draw_pane_focus_chrome, draw_screen,
+};
 
 const SCROLLBACK_ROWS: usize = 10_000;
 const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
+const CODE_BLOCK_COPY_LABEL: &str = "⧉";
 
 pub(super) struct TerminalPane {
     pub(super) title: &'static str,
     view: TerminalView,
     pty: Option<Rc<RefCell<PtySession>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OverlayAction {
+    CopyCodeBlock { start_row: usize, end_row: usize },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Overlay {
+    pub(super) row: usize,
+    pub(super) start_col: usize,
+    pub(super) end_col: usize,
+    label: &'static str,
+    pub(super) action: OverlayAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodeBlockRange {
+    start_row: usize,
+    end_row: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +272,20 @@ impl TerminalPane {
             force_redraw,
             damage,
         );
-        let chrome_drawn = if redrawn || force_redraw || redraw_chrome {
+        let overlay_drawn = if self.title == "agent" && (redrawn || force_redraw) {
+            self.view.draw_overlays(
+                font_renderer,
+                buffer,
+                buffer_width,
+                buffer_height,
+                rect.x,
+                rect.y,
+                damage,
+            )
+        } else {
+            false
+        };
+        let chrome_drawn = if redrawn || overlay_drawn || force_redraw || redraw_chrome {
             draw_pane_focus_chrome(
                 buffer,
                 buffer_width,
@@ -263,7 +299,18 @@ impl TerminalPane {
         } else {
             false
         };
-        redrawn || chrome_drawn
+        redrawn || overlay_drawn || chrome_drawn
+    }
+
+    pub(super) fn overlay_at(&mut self, row: usize, column: usize) -> Option<Overlay> {
+        if self.title != "agent" {
+            return None;
+        }
+        self.view.overlay_at(row, column)
+    }
+
+    pub(super) fn handle_overlay_action(&mut self, action: OverlayAction) -> bool {
+        self.view.handle_overlay_action(action)
     }
 
     pub(super) fn reference_at(
@@ -544,23 +591,18 @@ impl TerminalView {
         let Some(text) = self.selection_text() else {
             return false;
         };
-        if text.trim().is_empty() {
-            return false;
-        }
+        write_text_to_clipboard(text)
+    }
 
-        let mut clipboard = match arboard::Clipboard::new() {
-            Ok(clipboard) => clipboard,
-            Err(error) => {
-                warn!(%error, "clipboard open failed");
-                return false;
+    fn handle_overlay_action(&mut self, action: OverlayAction) -> bool {
+        match action {
+            OverlayAction::CopyCodeBlock { start_row, end_row } => {
+                let Some(text) = self.code_block_text(CodeBlockRange { start_row, end_row }) else {
+                    return false;
+                };
+                write_text_to_clipboard(text)
             }
-        };
-        if let Err(error) = clipboard.set_text(text) {
-            warn!(%error, "clipboard write failed");
-            return false;
         }
-
-        true
     }
 
     fn selection_text(&self) -> Option<String> {
@@ -649,6 +691,55 @@ impl TerminalView {
         )
     }
 
+    fn draw_overlays(
+        &mut self,
+        font_renderer: &mut FontRenderer,
+        buffer: &mut [u32],
+        width: usize,
+        height: usize,
+        origin_x: usize,
+        origin_y: usize,
+        damage: &mut Vec<DamageRect>,
+    ) -> bool {
+        let overlays = self.overlays();
+        if overlays.is_empty() {
+            return false;
+        }
+
+        let foreground = self.theme.background;
+        let background = self.theme.cursor;
+        for overlay in overlays {
+            draw_overlay_label(
+                overlay.label,
+                font_renderer,
+                buffer,
+                width,
+                height,
+                origin_x + overlay.start_col * self.metrics.cell_width,
+                origin_y + overlay.row * self.metrics.cell_height,
+                self.metrics,
+                foreground,
+                background,
+                damage,
+            );
+        }
+
+        true
+    }
+
+    fn overlay_at(&mut self, row: usize, column: usize) -> Option<Overlay> {
+        self.overlays().into_iter().find(|overlay| {
+            row == overlay.row && column >= overlay.start_col && column < overlay.end_col
+        })
+    }
+
+    fn overlays(&mut self) -> Vec<Overlay> {
+        self.code_block_ranges()
+            .into_iter()
+            .map(|range| self.code_block_copy_overlay(range))
+            .collect()
+    }
+
     pub(super) fn reference_at(
         &mut self,
         row: usize,
@@ -661,6 +752,61 @@ impl TerminalView {
 
         let row_text = self.row_text(row)?;
         reference_target_from_row(&row_text, column, working_directory)
+    }
+
+    fn code_block_ranges(&mut self) -> Vec<CodeBlockRange> {
+        let mut ranges = Vec::new();
+        let mut open_fence = None;
+        for row in 0..self.size.rows as usize {
+            let Some(text) = self.row_text(row) else {
+                continue;
+            };
+            let Some(fence) = code_fence(&text) else {
+                continue;
+            };
+
+            if let Some((start_row, open_marker)) = open_fence {
+                if fence.marker == open_marker && row > start_row + 1 {
+                    ranges.push(CodeBlockRange {
+                        start_row,
+                        end_row: row,
+                    });
+                    open_fence = None;
+                }
+            } else {
+                open_fence = Some((row, fence.marker));
+            }
+        }
+        ranges
+    }
+
+    fn code_block_copy_overlay(&self, range: CodeBlockRange) -> Overlay {
+        let label_cols = CODE_BLOCK_COPY_LABEL.chars().count();
+        let pane_cols = self.size.cols as usize;
+        let start_col = pane_cols.saturating_sub(label_cols + 1);
+
+        Overlay {
+            row: range.start_row,
+            start_col,
+            end_col: start_col + label_cols,
+            label: CODE_BLOCK_COPY_LABEL,
+            action: OverlayAction::CopyCodeBlock {
+                start_row: range.start_row,
+                end_row: range.end_row,
+            },
+        }
+    }
+
+    fn code_block_text(&mut self, range: CodeBlockRange) -> Option<String> {
+        let mut lines = Vec::new();
+        for row in range.start_row + 1..range.end_row {
+            lines.push(self.row_text(row)?.trim_end_matches(' ').to_owned());
+        }
+        let text = lines.join("\n");
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(text)
     }
 
     fn hyperlink_target_at(
@@ -678,37 +824,70 @@ impl TerminalView {
     }
 
     fn row_text(&mut self, row: usize) -> Option<String> {
-        let snapshot = self.render_state.update(&self.terminal).ok()?;
-        let cols = snapshot.cols().ok()? as usize;
-        let mut row_iter = self.rows.update(&snapshot).ok()?;
-
-        let mut row_ref = None;
-        for _ in 0..=row {
-            row_ref = row_iter.next();
-            if row_ref.is_none() {
-                return None;
-            }
+        if row >= self.size.rows as usize {
+            return None;
         }
 
-        let mut cell_iter = self.cells.update(row_ref?).ok()?;
+        let cols = self.size.cols as usize;
         let mut text = String::with_capacity(cols);
-        let mut col = 0usize;
-
-        while let Some(cell_ref) = cell_iter.next() {
-            if col >= cols {
-                break;
-            }
-
-            text.push(first_grapheme(&cell_ref).unwrap_or(' '));
-            col += 1;
-        }
-
-        if col < cols {
-            text.extend(std::iter::repeat_n(' ', cols - col));
+        for col in 0..cols {
+            let point = Point::Viewport(PointCoordinate {
+                x: col as u16,
+                y: row as u32,
+            });
+            let grid_ref = self.terminal.grid_ref(point).ok()?;
+            let cell = grid_ref.cell().ok()?;
+            let ch = if cell.has_text().ok()? {
+                cell.codepoint()
+                    .ok()
+                    .and_then(char::from_u32)
+                    .filter(|ch| *ch != '\0')
+                    .unwrap_or(' ')
+            } else {
+                ' '
+            };
+            text.push(ch);
         }
 
         Some(text)
     }
+}
+
+fn write_text_to_clipboard(text: String) -> bool {
+    if text.trim().is_empty() {
+        return false;
+    }
+
+    let mut clipboard = match arboard::Clipboard::new() {
+        Ok(clipboard) => clipboard,
+        Err(error) => {
+            warn!(%error, "clipboard open failed");
+            return false;
+        }
+    };
+    if let Err(error) = clipboard.set_text(text) {
+        warn!(%error, "clipboard write failed");
+        return false;
+    }
+
+    true
+}
+
+#[derive(Clone, Copy)]
+struct CodeFence {
+    marker: char,
+}
+
+fn code_fence(text: &str) -> Option<CodeFence> {
+    let trimmed = text.trim_start();
+    let marker = trimmed.chars().next()?;
+    if marker != '`' && marker != '~' {
+        return None;
+    }
+    if trimmed.chars().take_while(|ch| *ch == marker).count() < 3 {
+        return None;
+    }
+    Some(CodeFence { marker })
 }
 
 fn drain_pty_output(
@@ -886,16 +1065,6 @@ impl OscTerminator {
     }
 }
 
-fn first_grapheme(cell: &CellIteration<'static, '_>) -> Option<char> {
-    if cell.graphemes_len().ok()? == 0 {
-        return None;
-    }
-
-    let mut graphemes = ['\0'];
-    cell.graphemes_buf(&mut graphemes).ok()?;
-    Some(graphemes[0])
-}
-
 fn rgb_from_u32(color: u32) -> RgbColor {
     RgbColor {
         r: ((color >> 16) & 0xff) as u8,
@@ -980,6 +1149,52 @@ mod tests {
                 path: PathBuf::from("/repo/src/lib.rs"),
                 line: Some(9),
             }))
+        );
+    }
+
+    #[test]
+    fn code_block_ranges_detect_fenced_blocks() {
+        let mut view = test_view_with_size(40, 6);
+        view.process(b"intro\r\n```rust\r\nfn main() {}\r\n```\r\noutro", true);
+
+        let ranges = view.code_block_ranges();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_row, 1);
+        assert_eq!(ranges[0].end_row, 3);
+        assert_eq!(
+            view.code_block_text(ranges[0]).as_deref(),
+            Some("fn main() {}")
+        );
+    }
+
+    #[test]
+    fn overlay_matches_label_hitbox() {
+        let mut view = test_view_with_size(40, 5);
+        view.process(b"```\r\nlet answer = 42;\r\n```", true);
+        let overlay = view.overlays().remove(0);
+
+        assert_eq!(overlay.start_col, 38);
+        assert_eq!(
+            view.overlay_at(overlay.row, overlay.start_col),
+            Some(overlay.clone())
+        );
+        assert_eq!(view.overlay_at(overlay.row, overlay.end_col), None);
+    }
+
+    #[test]
+    fn code_block_ranges_match_same_fence_marker() {
+        let mut view = test_view_with_size(40, 6);
+        view.process(b"~~~text\r\nnot code fence ```\r\nbody\r\n~~~", true);
+
+        let ranges = view.code_block_ranges();
+
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start_row, 0);
+        assert_eq!(ranges[0].end_row, 3);
+        assert_eq!(
+            view.code_block_text(ranges[0]).as_deref(),
+            Some("not code fence ```\nbody")
         );
     }
 
