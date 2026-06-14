@@ -1,0 +1,241 @@
+# Architecture of via
+
+via is a native Rust GUI/terminal hybrid that places a running Neovim instance
+and an AI coding agent (or reviewer) into the same window, using a
+high-performance terminal emulator surface. The goal is zero-jank navigation and
+explicit, structured context sharing instead of scraping or fragile PTY
+injection.
+
+## High-level goals (from the original brief)
+
+- Unified environment: one programmatically controlled window with split panes.
+- Semantic navigation: OSC 8 hyperlinks let you click file paths / symbols in
+  agent output and instantly focus the right location in Neovim.
+- Shared context without manual shuffling: explicit buffer/selection/diagnostics
+  hand-off from editor to agent (and back via links + review flows).
+- Low overhead: the coordination layer should be invisible once you're in flow.
+
+Success criteria called out early:
+
+- Clicking a filename in the agent pane focuses Neovim in <50 ms.
+- Adding another "agent-like" surface (reviewer, etc.) should only require a new
+  entry in the message router.
+
+Design philosophy: "The editor is the heart, the agent is the brain, and the
+terminal wrapper is the nervous system."
+
+## Core components and data flow
+
+```
++------------------+          Unix socket / RPC           +------------------+
+|   Neovim         | <----------------------------------> |   via (Rust)     |
+| (editor pane)    |   (nvim-rs + embedded Lua bridges)   |                  |
++------------------+                                      |   Mediator       |
+                                                          |   (tokio mpsc)   |
++------------------+          PTY (normal mode) or        |                  |
+|   Agent          | <----------------------------------> |   - editor_state |
+| (claude, etc.)   |   stdio JSON-RPC (ACP mode)          |   - acp_client   |
++------------------+                                      |   - lsp bridge   |
+                                                          +--------+---------+
+                                                                   |
+                                                                   | UiCommand / Event
+                                                                   v
+                                                          +------------------+
+                                                          |  GhosttyUi       |
+                                                          |  (winit +        |
+                                                          |   libghostty-vt) |
+                                                          |                  |
+                                                          |  - TerminalPanes |
+                                                          |    (editor, agent|
+                                                          |     , review)    |
+                                                          |  - layout/split  |
+                                                          |  - font + render |
+                                                          |  - link handling |
+                                                          |  - ACP ratatui   |
+                                                          |    sub-pane      |
+                                                          +------------------+
+```
+
+### Mediator (src/mediator.rs)
+
+The central async coordinator. It owns:
+
+- A `Config`.
+- `EditorState` (current buffer, diagnostics per path, visual selection, LSP
+  client summaries).
+- Optional `AcpClient` (when `VIA_AGENT` ends with `acp`).
+- PTY sessions for agents in normal mode and the review backend.
+- Listeners for Neovim RPC (editor events, diagnostics, LSP clients) and the LSP
+  socket bridge.
+- Channels to drive the UI (`EventSender`, `UiCommand` receiver).
+
+Key paths:
+
+- On `BufferSendRequested` (from `:ViaBufferSend` / `<leader>ab` or explicit
+  CLI): if ACP client is connected, sends a structured `context/update`;
+  otherwise falls back to writing the content into the PTY (normal mode).
+- Incoming Neovim events (active buffer, diagnostics, visual selection, LSP
+  client list) update `editor_state` and are forwarded where relevant.
+- Reference navigation (file or symbol clicks) results in `nvim::open_file` /
+  `open_symbol` RPC calls and a focus change command back to the UI.
+- ACP tool results and session updates are turned into `@tool_result ...` lines
+  for the (still-light) ACP UI surface.
+
+The mediator is spawned once; `MediatorHandle` gives the UI the sending side and
+a shutdown future.
+
+### Ghostty UI layer (src/ui/ghostty.rs and submodules)
+
+This is the "native window host". It owns the winit event loop, softbuffer
+surface, and libghostty-vt `Terminal` instances (one per pane).
+
+Major submodules:
+
+- `layout.rs`: split vs maximized modes, `vertical_split_layout`,
+  `vertical_split_fits`, `trailing_pane_cols`, focus-after-reference helpers.
+  All the math that keeps the editor at ≥80 columns and respects the agent's
+  `min:max` pane width preference.
+- `pane_controller.rs` + `pane.rs`: wraps a `TerminalPane` (the libghostty
+  surface), handles mouse (shift-click for OSC 8, drag for selection, wheel),
+  key forwarding, alt-screen detection for paging behavior, and review pane
+  special cases.
+- `links.rs`: the OSC 8 / "reference target" scanner.
+  `reference_target_from_row` and URI forms turn `src/main.rs:42` or
+  `` `Foo::bar` `` or `symbol://...` into `FileTarget` or `Symbol` that the
+  mediator then resolves via Neovim RPC. This runs on visible rows; performance
+  matters.
+- `render.rs`: pixel buffer drawing, borders, inactive dim, selection highlight,
+  damage tracking, color helpers. Also hosts a few color/luminance tests.
+- `font.rs`: cosmic-text + swash based glyph rasterization with tunable
+  hinting/shaping/coverage/boost. The actual terminal cells come from
+  libghostty-vt; via renders the glyph bitmaps.
+- `acp_pane.rs` / `acp_modal.rs`: Ratatui-backed read/write surface for ACP
+  agents (prompt box that grows, transcript, basic tool state). Still evolving.
+- `input.rs`: key and clipboard normalization.
+
+Layout modes (Alt+1/2/Shift variants + Alt+Shift+3 for split direction) live in
+the `WinitGhosttyApp`. The UI also owns an optional review pane (either a `nvim`
+review command or the `hunk` tool).
+
+Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
+`SymbolOpenRequested` which the mediator turns into Neovim RPC + focus commands.
+
+### Agent side: Normal mode (PTY) vs ACP mode (src/acp.rs + mediator + pty.rs)
+
+- Normal mode (PTY, e.g. `VIA_AGENT="claude"` etc.): a `PtySession` is spawned
+  for the agent. Output is fed to a libghostty `Terminal` in the agent pane.
+  Context is injected by writing text into the PTY.
+- ACP mode (e.g. `VIA_AGENT="opencode acp"` etc.): `AcpClient` spawns the agent
+  as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, context is
+  sent as `context/update` messages. The UI for this path is the Ratatui ACP
+  pane (not a raw PTY). Tool permissions and results flow through the mediator.
+
+`AcpClient` is intentionally minimal (handshake, session create, context,
+prompt, tool result serialization). It is not a full agent SDK.
+
+`src/pty.rs` also provides `CoalescedOutputNotifier` so that bursty PTY readers
+don't flood the UI thread with redraw events.
+
+### Neovim integration (src/nvim.rs + nvim/\*.lua)
+
+via embeds several small Lua files at compile time via `include_str!`:
+
+- `context_bridge.lua`: the heart of editor → via notifications. Sets up
+  autocmds for `DiagnosticChanged`, visual selection tracking,
+  `LspAttach/Detach`, and the `<leader>ab` mapping. Pushes JSON over a Unix
+  socket (`via_editor_socket`). Also listens on an LSP bridge socket so agents
+  can drive real LSP requests (`textDocument/definition` etc.) inside the live
+  Neovim session.
+- `open_file.lua`, `open_symbol.lua`, `review.lua`, `diagnostics.lua`: small
+  RPC-invoked scripts for jumping and for `via session diagnostics`.
+
+The Rust side (`nvim.rs`) uses `nvim-rs` over the nvim socket to execute these
+(or dynamic commands) and to parse diagnostics JSON.
+
+Session discovery for CLI tools (`via session diagnostics`, the agent skill) is
+done exclusively via the `VIA_SESSION` environment variable (written into child
+envs by the main process and pointing at a small JSON manifest under the runtime
+dir). There is deliberately no "guess the newest socket" fallback.
+
+### Config, sessions, and CLI (src/config.rs, src/session.rs, src/cli/\*)
+
+Config resolution is strict precedence: CLI > env (`VIA_*`) >
+`~/.config/via/via.conf` (TOML) > built-in defaults. `--persist` writes the
+resolved user-facing values.
+
+`SessionGuard` writes (and removes on drop) a per-pid manifest so that
+`via session ...` subcommands and agents running inside the session can find the
+right sockets without extra flags.
+
+CLI subcommands live under `via session` (list, get, diagnostics) and
+`via agent skill` (install/status the global via-editor skill).
+
+### Other notable pieces
+
+- `src/lsp_bridge.rs`: the socket side of the LSP request forwarding (agents
+  ask, via forwards to Neovim's real clients, responses come back).
+- `src/editor.rs`: the in-memory `EditorState` updated by the Lua bridge events.
+- `src/event.rs`: the enum of all cross-layer messages (EditorEvent, AgentEvent,
+  UiCommand, etc.).
+- `build.rs`: currently a no-op (just rerun-if-changed). The real compile-time
+  work happens inside the `libghostty-vt` crate's build script.
+
+## Performance-sensitive surfaces (why we benchmark these)
+
+1. Layout (`src/ui/ghostty/layout.rs`): `vertical_split_layout`, fit checks, and
+   focus-after-reflow. These run on every resize and on navigation that changes
+   split/max state. Bad math = jank or collapsed panes.
+2. Link/reference scanning (`src/ui/ghostty/links.rs`):
+   `reference_target_from_row` (and the URI variant) is conceptually per-row of
+   agent output. It must be fast even when the agent dumps hundreds of lines
+   containing paths and `` `symbols` ``.
+
+We use Criterion for these (see `benches/`) so that changes have a regression
+signal before they land.
+
+Other hot-ish paths (font glyph rasterization, libghostty cell iteration +
+damage, the render loop at ~60 fps) are harder to micro-benchmark in isolation
+and are mitigated by the native + GPU nature of the stack.
+
+## Current state and evolution notes (as of mid-2026)
+
+- Hybrid support for normal mode (PTY) and ACP mode is live. Normal mode agents
+  get the classic two-pane (or review) layout with raw terminal; ACP mode agents
+  get the single-pane (editor-only) layout + a Ratatui transcript/prompt
+  surface.
+- Context is explicit (`:ViaBufferSend`) on both paths; auto-push of the active
+  buffer was removed to reduce noise.
+- The review backend can be `nvim` (opens a Neovim diff/review layout) or
+  `hunk`.
+- A "via-editor" skill is auto-installed for ACP agents so they can pull
+  diagnostics without hallucinating file state.
+- The vendored Ghostty VT bits are pinned to a specific git rev of a
+  libghostty-rs wrapper. This gives a single static binary but makes clean
+  builds heavy (Zig + git).
+
+See [acp.md](acp.md) for more on the ACP direction and open questions (prompt
+editing, model selection, tool rendering, styling).
+
+## Testing philosophy
+
+- Unit tests are colocated and cover the pure/logic parts heavily (layout table,
+  link regex-ish scanning, config precedence, CLI parsing, session manifest
+  roundtrips, color math, pane mouse state machines, etc.).
+- We are expanding Criterion benches for the two surfaces above.
+- Full GUI + Neovim + real agent E2E is done manually today. A future hermetic
+  harness (headless nvim + fake ACP agent + controlled window size) would be
+  valuable
+
+## Further reading
+
+- [README.md](README.md) — user-facing usage, config, font knobs, detached mode,
+  agent pane width rules.
+- [CONTRIBUTING.md](CONTRIBUTING.md) — how to build, test, and submit.
+- [project.md](project.md) — the original "lean roadmap" brief.
+- [acp.md](acp.md) — ACP status and design spikes.
+- Source files have targeted comments on invariants (e.g., coalescing,
+  alt-screen paging, inactive dim, etc.).
+
+If you're about to change layout math, the link scanner, or the mediator's
+ACP/PTY routing, please look at the existing tests in those modules and consider
+whether a new or updated benchmark is warranted.

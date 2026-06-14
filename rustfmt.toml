@@ -1,0 +1,6 @@
+edition = "2024"
+max_width = 100
+use_small_heuristics = "Default"
+# The following are nicer but require nightly rustfmt today:
+# group_imports = "StdExternalCrate"
+# imports_granularity = "Module"

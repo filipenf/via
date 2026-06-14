@@ -3,7 +3,9 @@ use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
 
 const SPLIT_GAP: usize = 2;
 /// Minimum leading (editor) pane width in columns for vertical split mode.
-pub(super) const MIN_EDITOR_PANE_COLS: u16 = 80;
+/// NOTE: pub so that benches can use `via::ui::ghostty::layout::...` for Criterion
+/// regression testing. Not part of via's public library API.
+pub const MIN_EDITOR_PANE_COLS: u16 = 80;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SplitLayoutOptions {
@@ -26,15 +28,15 @@ const SPLIT_ASPECT_NUM: usize = 5;
 const SPLIT_ASPECT_DEN: usize = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PaneRect {
-    pub(super) x: usize,
-    pub(super) y: usize,
-    pub(super) width: usize,
-    pub(super) height: usize,
+pub struct PaneRect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum PaneLayoutMode {
+pub enum PaneLayoutMode {
     NvimMaximized,
     Split,
     AgentMaximized,
@@ -102,7 +104,7 @@ impl PaneSplitDirection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct SplitLayout {
+pub struct SplitLayout {
     panes: Vec<PaneRect>,
 }
 
@@ -172,7 +174,7 @@ impl SplitLayout {
         }
     }
 
-    pub(super) fn pane(&self, index: usize) -> PaneRect {
+    pub fn pane(&self, index: usize) -> PaneRect {
         self.panes[index]
     }
 
@@ -244,15 +246,15 @@ fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct FocusNvimAfterReference {
-    pub(super) relayout_needed: bool,
-    pub(super) focus_changed: bool,
+pub struct FocusNvimAfterReference {
+    pub relayout_needed: bool,
+    pub focus_changed: bool,
 }
 
 /// Focus the Neovim pane after navigating from a Shift+click on a file or symbol in the
 /// agent pane. When the agent was fullscreen, switch to fullscreen Neovim; otherwise keep
 /// the split layout and only change the active pane.
-pub(super) fn focus_nvim_after_agent_reference(
+pub fn focus_nvim_after_agent_reference(
     mode: &mut PaneLayoutMode,
     active_pane: &mut usize,
 ) -> FocusNvimAfterReference {
@@ -292,7 +294,7 @@ pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
     }
 }
 
-fn vertical_split_layout(
+pub fn vertical_split_layout(
     width: usize,
     height: usize,
     cell_width: usize,
@@ -329,20 +331,20 @@ fn vertical_split_layout(
     }
 }
 
-pub(super) fn window_col_count(width: usize, cell_width: usize) -> u16 {
+pub fn window_col_count(width: usize, cell_width: usize) -> u16 {
     let cell_width = cell_width.max(1);
     ((width.saturating_sub(SPLIT_GAP)) / cell_width).min(u16::MAX as usize) as u16
 }
 
 /// True when the window can fit both the editor minimum and the agent minimum.
-pub(super) fn vertical_split_fits(width: usize, cell_width: usize, agent_min_cols: u16) -> bool {
+pub fn vertical_split_fits(width: usize, cell_width: usize, agent_min_cols: u16) -> bool {
     window_col_count(width, cell_width) >= MIN_EDITOR_PANE_COLS.saturating_add(agent_min_cols)
 }
 
 /// Column count for the trailing (right) pane in a vertical split. Keeps the agent at
 /// `min_cols` when both minimums fit so extra width goes to the editor; shrinks the agent
 /// below `min_cols` only when the window cannot satisfy `min_editor_cols` + `min_cols`.
-fn trailing_pane_cols(
+pub fn trailing_pane_cols(
     width: usize,
     cell_width: usize,
     min_cols: u16,
@@ -460,5 +462,22 @@ mod tests {
             trailing_pane_cols(10 * 200 + SPLIT_GAP, 10, 80, 100, MIN_EDITOR_PANE_COLS),
             80
         );
+    }
+
+    #[test]
+    fn window_col_count_is_floor_div_minus_gap() {
+        assert_eq!(window_col_count(10 * 80 + SPLIT_GAP, 10), 80);
+        assert_eq!(window_col_count(10 * 81 + SPLIT_GAP, 10), 81);
+    }
+
+    #[test]
+    fn focus_nvim_from_agent_split_only_changes_active_pane() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 1;
+        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active);
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active, 0);
+        assert!(!focus.relayout_needed);
+        assert!(focus.focus_changed);
     }
 }

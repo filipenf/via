@@ -667,4 +667,30 @@ mod tests {
                 .contains("unsupported tool method")
         );
     }
+
+    #[test]
+    fn serialize_tool_response_roundtrips_success_and_error() {
+        let ok = serialize_tool_response(AgentToolResponse {
+            id: Some("t1".into()),
+            ok: true,
+            result: Some(serde_json::json!({"ok": true})),
+            error: None,
+        });
+        assert!(ok.starts_with("@tool_result "));
+        let parsed: serde_json::Value =
+            serde_json::from_str(ok.trim_start_matches("@tool_result ").trim()).unwrap();
+        assert_eq!(parsed["id"], "t1");
+        assert_eq!(parsed["ok"], true);
+
+        let err = serialize_tool_response(AgentToolResponse {
+            id: None,
+            ok: false,
+            result: None,
+            error: Some("boom".into()),
+        });
+        let parsed_err: serde_json::Value =
+            serde_json::from_str(err.trim_start_matches("@tool_result ").trim()).unwrap();
+        assert_eq!(parsed_err["ok"], false);
+        assert!(parsed_err["error"].as_str().unwrap().contains("boom"));
+    }
 }

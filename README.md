@@ -15,7 +15,7 @@ them.
 
 **neovim to Agent**
 
-- You can send the current selection or buffer with <leader>a,b
+- Send the current selection or buffer with `<leader>ab` (or `:ViaBufferSend`)
 
 **Agent to nvim**
 
@@ -36,12 +36,15 @@ it has some rough edges still. Some things I have planned:
 
 ## Runtime requirements
 
-Both my work and personal laptops are Omarchy Linux (so hyprland/wayland). I
-haven't tried it in other linux distros and/or other operating systems
+via is primarily developed and tested on Linux (Wayland compositors such as
+Hyprland on Omarchy, with an X11 fallback via winit). Other Linux distributions
+and operating systems (macOS, Windows) are not regularly tested; you will
+likely need to build from source. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+prerequisites and platform notes.
 
 ## Build requirements
 
-- Rust (stable)
+- Rust 
 - [Zig 0.15.2](https://ziglang.org) — required by the vendored `libghostty-vt` build.
 - `git` (used by the `libghostty-vt-sys` build script to fetch ghostty sources).
 
@@ -63,6 +66,23 @@ cargo build --release
 
 `libghostty-vt` is statically linked into the binary, so no runtime library
 search path setup is needed.
+
+### Development
+
+```sh
+cargo test                 # unit tests live next to the code
+cargo fmt -- --check
+cargo clippy -- -D warnings
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development guide
+(prerequisites, how to run a local session, good first areas, benchmarks, etc.)
+and [ARCHITECTURE.md](ARCHITECTURE.md) for an overview of the Mediator/UI/ACP
+data flows and performance-sensitive surfaces.
+
+`cargo test` is the primary regression guard today; we are expanding Criterion
+micro-benchmarks for layout calculations and link/OSC 8 scanning (the two most
+user-visible hot paths).
 
 ## Configuration
 
@@ -161,3 +181,15 @@ Possible tweaks:
 - `VIA_FONT_HINTING`: sets cosmic-text metrics hinting. Values: `enabled` or `disabled`.
 - `VIA_FONT_COVERAGE_BOOST`: controls via's glyph coverage boost. Default: `0.2`; use `0` to disable.
 - `VIA_FONT_SHAPING`: selects cosmic-text shaping. Values: `advanced` or `basic`.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing,
+architecture pointers, and how to submit changes. Issues and PRs are welcome
+— small, focused contributions (layout, links, ACP surface, review backends,
+diagnostics, docs, tests) are especially appreciated.
+
+## License
+
+Licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file
+for details.

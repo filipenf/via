@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossbeam_channel::Receiver;
 use libghostty_vt::render::{CellIteration, CellIterator, RenderState, RowIterator};
-use libghostty_vt::style::RgbColor;
 use libghostty_vt::screen::Screen;
+use libghostty_vt::style::RgbColor;
 use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 

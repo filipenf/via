@@ -1,7 +1,9 @@
 [package]
 name = "via"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
+# MSRV. Keep this in sync with clippy.toml and CI expectations.
+rust-version = "1.85"
 
 [dependencies]
 anyhow = "1.0.100"
@@ -11,6 +13,11 @@ clap = { version = "4.5", features = ["derive"] }
 arboard = { version = "3", features = ["wayland-data-control"] }
 crossbeam-channel = "0.5.15"
 cosmic-text = "0.19.0"
+# Vendored terminal engine (Ghostty VT core) built via Zig at compile time.
+# First clean builds are slow (git checkout of ghostty sources + Zig compile of the
+# static vt lib). Results are cached under target/. Requires Zig 0.15.2 + git on PATH.
+# See CONTRIBUTING.md "Build requirements" and the release workflow for the full
+# list of system -dev packages needed on Linux.
 libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "5ac47e9eb166add2c00c432bc65c279133629712", features = [
   "link-static",
 ] }
@@ -37,3 +44,14 @@ unicode-width = "0.2.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "layout"
+harness = false
+
+[[bench]]
+name = "links"
+harness = false

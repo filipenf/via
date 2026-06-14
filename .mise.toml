@@ -1,3 +1,35 @@
 [tools]
 rust-analyzer = "latest"
 zig = "0.15.2"
+
+# Development tasks. Run with `mise <task>` or `mise run <task>`.
+# These activate the pinned tools (especially Zig) automatically.
+# First run `mise install` (or `mise i`) to fetch the pinned versions.
+[tasks]
+# Check formatting (matches CI)
+fmt = { run = "cargo fmt -- --check", description = "Check formatting (cargo fmt -- --check)" }
+
+# Apply formatting
+"fmt-fix" = { run = "cargo fmt", description = "Format code with rustfmt" }
+
+# Linting (matches CI)
+clippy = { run = "cargo clippy -- -D warnings", description = "Run clippy with warnings as errors" }
+
+# Unit tests
+test = { run = "cargo test", description = "Run unit tests" }
+
+# Criterion benchmarks for layout + link hot paths.
+# Use full `cargo bench` locally for real measurements; CI runs a quick sample.
+bench = { run = "cargo bench", description = "Run Criterion benchmarks (layout + links)" }
+
+# Run attached (no detach) for local development iteration.
+dev = { run = "cargo run", env = { "VIA_FOREGROUND" = "1" }, description = "Run via in the foreground (VIA_FOREGROUND=1 cargo run)" }
+
+# Release build
+build = { run = "cargo build --release", description = "Build release binary" }
+
+# Clean build artifacts
+clean = { run = "cargo clean", description = "Remove target/ artifacts" }
+
+# One-time (or refresh) tool installation for the project
+setup = { run = "mise install", description = "Install pinned tools from .mise.toml (zig, etc.)" }

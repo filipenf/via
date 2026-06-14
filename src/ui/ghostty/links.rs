@@ -4,12 +4,12 @@ use crate::nvim::FileTarget;
 use crate::pty::TerminalSize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum ReferenceTarget {
+pub enum ReferenceTarget {
     File(FileTarget),
     Symbol(String),
 }
 
-pub(super) fn reference_target_from_row(
+pub fn reference_target_from_row(
     row: &str,
     column: usize,
     working_directory: &Path,
@@ -446,10 +446,7 @@ fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
     (numbers[0], numbers[1])
 }
 
-pub(super) fn reference_target_from_uri(
-    uri: &str,
-    working_directory: &Path,
-) -> Option<ReferenceTarget> {
+pub fn reference_target_from_uri(uri: &str, working_directory: &Path) -> Option<ReferenceTarget> {
     if let Some(target) = file_target_from_uri(uri, working_directory) {
         return Some(ReferenceTarget::File(target));
     }

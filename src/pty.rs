@@ -174,3 +174,59 @@ impl From<TerminalSize> for PtySize {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestNotifier {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TestNotifier {
+        fn new() -> Self {
+            Self {
+                count: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            self.count.load(Ordering::SeqCst)
+        }
+    }
+
+    impl OutputNotifier for TestNotifier {
+        fn notify_output(&self) {
+            self.count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn coalesced_notifier_fires_only_once_until_clear() {
+        let inner = TestNotifier::new();
+        let coalesced = CoalescedOutputNotifier::new(inner);
+
+        coalesced.notify_output();
+        coalesced.notify_output();
+        coalesced.notify_output();
+
+        // Only the first should have propagated
+        assert_eq!(coalesced.notifier.count(), 1);
+
+        coalesced.clear();
+        coalesced.notify_output();
+        assert_eq!(coalesced.notifier.count(), 2);
+    }
+
+    #[test]
+    fn coalesced_clear_allows_subsequent_fire() {
+        let inner = TestNotifier::new();
+        let coalesced = CoalescedOutputNotifier::new(inner);
+
+        coalesced.notify_output();
+        assert_eq!(coalesced.notifier.count(), 1);
+
+        coalesced.clear();
+        coalesced.notify_output();
+        assert_eq!(coalesced.notifier.count(), 2);
+    }
+}
