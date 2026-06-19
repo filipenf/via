@@ -128,6 +128,15 @@ impl SplitLayout {
             };
         }
 
+        // PaneMaximized must be handled before the multi-pane split logic.
+        if let PaneLayoutMode::PaneMaximized(i) = mode {
+            if i < pane_count {
+                let mut panes = vec![PaneRect { x: 0, y: 0, width: 0, height: 0 }; pane_count];
+                panes[i] = PaneRect { x: 0, y: 0, width, height };
+                return Self { panes };
+            }
+        }
+
         // For three or more panes we always produce a flat list of visible rects.
         // The first rect is the editor (computed via the normal two-pane rules),
         // the remaining rects evenly share the secondary area.
@@ -199,14 +208,6 @@ impl SplitLayout {
             let mut all = vec![editor_rect];
             all.extend(agent_rects);
             return Self { panes: all };
-        }
-
-        if let PaneLayoutMode::PaneMaximized(i) = mode {
-            if i < pane_count {
-                let mut panes = vec![PaneRect { x: 0, y: 0, width: 0, height: 0 }; pane_count];
-                panes[i] = PaneRect { x: 0, y: 0, width, height };
-                return Self { panes };
-            }
         }
 
         match split_direction {

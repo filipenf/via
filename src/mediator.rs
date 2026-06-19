@@ -433,11 +433,11 @@ impl Mediator {
                     });
                 }
             }
-            EditorEvent::AgentSend { agent_id, content } => {
+            EditorEvent::AgentSend { agent_id, content, focus } => {
                 // Route to the specific agent pane (by id) if provided.
                 self.send_ui_command(UiCommand::AgentInput {
                     payload: content.clone(),
-                    focus_agent: true,
+                    focus_agent: *focus,
                     target_agent_id: agent_id.clone(),
                 });
             }

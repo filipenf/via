@@ -324,6 +324,16 @@ impl WinitGhosttyApp {
         role: Option<&str>,
         command: Option<&str>,
     ) -> Result<()> {
+        // Deduplicate: if a pane with this id already exists, do nothing.
+        if self
+            .panes
+            .iter()
+            .any(|p| matches!(p.role(), PaneRole::AgentTerminal { id: existing, .. } if existing == id))
+        {
+            info!(%id, "spawn_agent called for existing id – ignoring");
+            return Ok(());
+        }
+
         let metrics = self.terminal_config.metrics;
         // Use current layout dimensions to size the new pane; relayout will adjust.
         let (w, h) = (self.width, self.height);
@@ -1027,16 +1037,6 @@ impl WinitGhosttyApp {
         }
     }
 
-    fn focus_agent_after_editor_input(&mut self) {
-        if self.pane_layout_mode == PaneLayoutMode::PaneMaximized(0) {
-            self.pane_layout_mode = PaneLayoutMode::PaneMaximized(1);
-            self.active_pane = 1;
-            self.relayout();
-        } else {
-            self.set_active_pane(1);
-        }
-    }
-
     fn drain_background_work(&mut self) -> Result<()> {
         // Clear the coalescing flag *before* draining so that any PTY data arriving
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
@@ -1278,11 +1278,7 @@ impl WinitGhosttyApp {
                     focus_agent,
                     target_agent_id,
                 } => {
-                    if focus_agent {
-                        self.focus_agent_after_editor_input();
-                    }
-
-                    // Try to find a specific agent pane by id; fall back to the first AgentTerminal.
+                    // Determine target pane first (specific id or first AgentTerminal).
                     let idx = if let Some(ref want) = target_agent_id {
                         self.panes
                             .iter()
@@ -1295,7 +1291,15 @@ impl WinitGhosttyApp {
                             .iter()
                             .position(|p| matches!(p.role(), PaneRole::AgentTerminal { .. }))
                     });
+
                     if let Some(i) = idx {
+                        if focus_agent {
+                            // Focus the specific target pane (not a hardcoded one).
+                            if matches!(self.pane_layout_mode, PaneLayoutMode::PaneMaximized(_)) {
+                                self.pane_layout_mode = PaneLayoutMode::PaneMaximized(i);
+                            }
+                            self.set_active_pane(i);
+                        }
                         debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
                         self.panes[i].write_all(payload.as_bytes())?;
                     } else {

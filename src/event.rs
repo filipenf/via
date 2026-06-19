@@ -118,6 +118,7 @@ pub enum EditorEvent {
     AgentSend {
         agent_id: Option<String>,
         content: String,
+        focus: bool,
     },
     SpawnAgent {
         id: String,

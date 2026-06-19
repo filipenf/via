@@ -42,11 +42,14 @@ M.agent = {}
 -- Send content to an agent pane.
 -- agent_id: optional string identifier (nil uses the primary/orchestrator)
 -- content: string to send (treated as user input)
-function M.agent.send(agent_id, content)
+-- focus: optional boolean, whether to switch focus to the target pane (default true)
+function M.agent.send(agent_id, content, focus)
+  if focus == nil then focus = true end
   notify({
     type = "agent_send",
     agent_id = agent_id,
     content = content,
+    focus = focus,
   })
 end
 

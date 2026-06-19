@@ -115,6 +115,8 @@ enum WireEditorEvent {
         #[serde(default)]
         agent_id: Option<String>,
         content: String,
+        #[serde(default = "default_true")]
+        focus: bool,
     },
     SpawnAgent {
         id: String,
@@ -123,6 +125,10 @@ enum WireEditorEvent {
         #[serde(default)]
         command: Option<String>,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn spawn_listener(
@@ -241,9 +247,10 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             start_line,
             end_line,
         },
-        WireEditorEvent::AgentSend { agent_id, content } => EditorEvent::AgentSend {
+        WireEditorEvent::AgentSend { agent_id, content, focus } => EditorEvent::AgentSend {
             agent_id,
             content,
+            focus,
         },
         WireEditorEvent::SpawnAgent { id, role, command } => EditorEvent::SpawnAgent {
             id,
