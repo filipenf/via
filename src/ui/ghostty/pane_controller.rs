@@ -12,10 +12,10 @@ use super::input::{
 use super::links::ReferenceTarget;
 use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PaneRole {
     Editor,
-    AgentTerminal,
+    AgentTerminal { id: String, label: String },
     ReviewTerminal,
 }
 
@@ -72,8 +72,8 @@ impl TerminalPaneController {
         }
     }
 
-    pub(super) fn role(&self) -> PaneRole {
-        self.role
+    pub(super) fn role(&self) -> &PaneRole {
+        &self.role
     }
 
     #[cfg(test)]
@@ -181,7 +181,7 @@ impl TerminalPaneController {
             PaneRole::ReviewTerminal => {
                 self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => {
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
                 let forwarded =
                     self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)?;
                 if forwarded.dirty {
@@ -235,7 +235,7 @@ impl TerminalPaneController {
             PaneRole::ReviewTerminal => {
                 self.forward_terminal_mouse_input(state, button, local_x, local_y, modifiers)
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => Ok(self.handle_local_mouse_input(
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => Ok(self.handle_local_mouse_input(
                 state,
                 button,
                 local_x,
@@ -271,7 +271,7 @@ impl TerminalPaneController {
                     command: None,
                 })
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => {
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
                 if self.mouse.held_button != Some(PaneMouseButton::Left) {
                     return Ok(PaneEventOutcome::default());
                 }
@@ -396,7 +396,7 @@ impl TerminalPaneController {
 
         let mut outcome = PaneEventOutcome::default();
         if just_pressed {
-            let is_reference_click = self.role == PaneRole::AgentTerminal && modifiers.shift;
+            let is_reference_click = matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.shift;
             if !is_reference_click {
                 outcome.dirty |= self.start_selection(local_x, local_y);
             }
@@ -481,7 +481,7 @@ impl TerminalPaneController {
     /// keys move the viewport again.
     fn intercepts_viewport_navigation_keys(&self) -> bool {
         match self.role {
-            PaneRole::AgentTerminal => !self.pane.is_alt_screen(),
+            PaneRole::AgentTerminal { .. } => !self.pane.is_alt_screen(),
             PaneRole::ReviewTerminal => false,
             PaneRole::Editor => !self.pane.is_viewport_at_bottom(),
         }

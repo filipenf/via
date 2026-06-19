@@ -10,6 +10,9 @@ use serde::Deserialize;
 /// to a path under the via runtime directory (see `runtime_base_dir`) so Neovim can `luafile` it.
 static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
+/// Embedded copy of `nvim/via.lua`. Written to the runtime dir so Neovim can `require('via')`.
+static EMBEDDED_VIA_MODULE_PATH: OnceLock<PathBuf> = OnceLock::new();
+
 /// Directory for sockets, the context bridge script, and other per-process files.
 ///
 /// After a detached start this is `<data dir>/via-<pid>/` from `VIA_RUNTIME_ROOT`. Otherwise it is
@@ -40,6 +43,13 @@ pub fn via_data_dir() -> PathBuf {
     env::temp_dir().join("via")
 }
 
+/// Stable directory for shared Lua modules that Neovim can require.
+/// Located under the via data directory so it is the same for every via session
+/// and can be shared across all running instances.
+pub fn lua_dir() -> PathBuf {
+    via_data_dir().join("lua")
+}
+
 /// Ensure the runtime directory exists before sockets are bound or scripts are written.
 pub fn ensure_runtime_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(runtime_base_dir())
@@ -61,6 +71,7 @@ pub struct Config {
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
+    pub nvim_via_module_path: PathBuf,
     pub lsp_bridge_socket_path: PathBuf,
     pub working_directory: PathBuf,
 }
@@ -336,6 +347,9 @@ impl Config {
         let nvim_context_bridge_path = env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_context_bridge_path);
+        let nvim_via_module_path = env::var_os("VIA_NVIM_VIA_MODULE")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_nvim_via_module_path);
         let lsp_bridge_socket_path = env::var_os("VIA_LSP_BRIDGE_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_lsp_bridge_socket_path);
@@ -350,6 +364,7 @@ impl Config {
             nvim_socket_path,
             editor_socket_path,
             nvim_context_bridge_path,
+            nvim_via_module_path,
             lsp_bridge_socket_path,
             working_directory,
         })
@@ -414,13 +429,10 @@ fn default_editor_socket_path() -> PathBuf {
 fn default_nvim_context_bridge_path() -> PathBuf {
     EMBEDDED_CONTEXT_BRIDGE_PATH
         .get_or_init(|| {
-            let dir = runtime_base_dir();
-            let path = dir.join(format!("via-context-bridge-{}.lua", std::process::id()));
+            let dir = lua_dir();
+            let path = dir.join("context_bridge.lua");
             std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to create via runtime directory {}: {err}",
-                    dir.display()
-                );
+                panic!("failed to create via lua directory {}: {err}", dir.display());
             });
             std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
                 |err| {
@@ -430,6 +442,25 @@ fn default_nvim_context_bridge_path() -> PathBuf {
                     );
                 },
             );
+            path
+        })
+        .clone()
+}
+
+fn default_nvim_via_module_path() -> PathBuf {
+    EMBEDDED_VIA_MODULE_PATH
+        .get_or_init(|| {
+            let dir = lua_dir();
+            let path = dir.join("via.lua");
+            std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
+                panic!("failed to create via lua directory {}: {err}", dir.display());
+            });
+            std::fs::write(&path, include_str!("../nvim/via.lua")).unwrap_or_else(|err| {
+                panic!(
+                    "failed to write embedded nvim/via.lua to {}: {err}",
+                    path.display()
+                );
+            });
             path
         })
         .clone()
@@ -462,7 +493,7 @@ mod tests {
         let path = default_nvim_context_bridge_path();
 
         assert!(
-            path.ends_with(format!("via-context-bridge-{}.lua", std::process::id())),
+            path.ends_with("context_bridge.lua"),
             "unexpected path: {}",
             path.display()
         );

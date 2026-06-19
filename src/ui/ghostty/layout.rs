@@ -37,9 +37,9 @@ pub struct PaneRect {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLayoutMode {
-    NvimMaximized,
     Split,
-    AgentMaximized,
+    /// One specific pane (by index) is shown full-screen; others have zero size.
+    PaneMaximized(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,42 +128,85 @@ impl SplitLayout {
             };
         }
 
-        if mode == PaneLayoutMode::NvimMaximized {
-            return Self {
-                panes: vec![
-                    PaneRect {
-                        x: 0,
-                        y: 0,
-                        width,
-                        height,
-                    },
-                    PaneRect {
-                        x: width,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    },
-                ],
+        // For three or more panes we always produce a flat list of visible rects.
+        // The first rect is the editor (computed via the normal two-pane rules),
+        // the remaining rects evenly share the secondary area.
+        if pane_count > 2 {
+            // Helper: split a rect into `count` equal sub-rects.
+            fn split_rect(rect: PaneRect, count: usize, horizontal: bool) -> Vec<PaneRect> {
+                if count == 0 {
+                    return vec![];
+                }
+                if count == 1 {
+                    return vec![rect];
+                }
+                let mut out = Vec::with_capacity(count);
+                if horizontal {
+                    let each = rect.height / count;
+                    for i in 0..count {
+                        let h = if i == count - 1 {
+                            rect.height.saturating_sub(i * each)
+                        } else {
+                            each
+                        };
+                        out.push(PaneRect {
+                            x: rect.x,
+                            y: rect.y + i * each,
+                            width: rect.width,
+                            height: h,
+                        });
+                    }
+                } else {
+                    let each = rect.width / count;
+                    for i in 0..count {
+                        let w = if i == count - 1 {
+                            rect.width.saturating_sub(i * each)
+                        } else {
+                            each
+                        };
+                        out.push(PaneRect {
+                            x: rect.x + i * each,
+                            y: rect.y,
+                            width: w,
+                            height: rect.height,
+                        });
+                    }
+                }
+                out
+            }
+
+            // Compute the editor + secondary area split using the normal two-pane rules,
+            // then divide the secondary area among the remaining agent panes.
+            let base = match split_direction {
+                PaneSplitDirection::Vertical => {
+                    vertical_split_layout(width, height, options.cell_width, options.agent_pane_cols)
+                }
+                PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
             };
+            let editor_rect = base.panes[0];
+            let agent_area = base.panes.get(1).copied().unwrap_or(PaneRect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+            });
+            let agent_count = pane_count - 1;
+            let agent_rects = if split_direction == PaneSplitDirection::Vertical {
+                split_rect(agent_area, agent_count, /*horizontal*/ true)
+            } else {
+                split_rect(agent_area, agent_count, /*horizontal*/ false)
+            };
+            let mut all = vec![editor_rect];
+            all.extend(agent_rects);
+            return Self { panes: all };
         }
 
-        if mode == PaneLayoutMode::AgentMaximized {
-            return Self {
-                panes: vec![
-                    PaneRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0,
-                    },
-                    PaneRect {
-                        x: 0,
-                        y: 0,
-                        width,
-                        height,
-                    },
-                ],
-            };
+        if let PaneLayoutMode::PaneMaximized(i) = mode {
+            if i < pane_count {
+                let mut panes = vec![PaneRect { x: 0, y: 0, width: 0, height: 0 }; pane_count];
+                panes[i] = PaneRect { x: 0, y: 0, width, height };
+                return Self { panes };
+            }
         }
 
         match split_direction {
@@ -200,20 +243,25 @@ pub(super) fn handle_layout_shortcuts(
         return false;
     }
 
+    // Alt+J (without Shift) toggles the split direction (replaces the old Alt+Shift+3).
+    for key in pressed_keys {
+        if alt && !shift && *key == Key::J {
+            *mode = PaneLayoutMode::Split;
+            *split_direction = split_direction.toggled();
+            return true;
+        }
+    }
+
     for key in pressed_keys {
         if shift {
-            if *key == Key::Key3 {
-                *mode = PaneLayoutMode::Split;
-                *split_direction = split_direction.toggled();
-                return true;
-            }
-
             let Some(next_mode) = pane_layout_shortcut(*key) else {
                 continue;
             };
 
-            if next_mode == PaneLayoutMode::AgentMaximized && pane_count < 2 {
-                continue;
+            if let PaneLayoutMode::PaneMaximized(i) = next_mode {
+                if i >= pane_count {
+                    continue;
+                }
             }
 
             *mode = next_mode;
@@ -232,15 +280,43 @@ pub(super) fn handle_layout_shortcuts(
                 return true;
             }
         }
+
+        // Alt+2..9 focuses the corresponding agent pane (Alt+2 = first agent = index 1)
+        if alt && !shift {
+            if let Some(digit) = key_to_digit(*key) {
+                if (2..=9).contains(&digit) {
+                    let target = digit - 1; // Alt+2 -> 1, Alt+3 -> 2, ...
+                    if target < pane_count {
+                        *mode = PaneLayoutMode::Split;
+                        *active_pane = target;
+                        return true;
+                    }
+                }
+            }
+        }
     }
 
     false
 }
 
+fn key_to_digit(key: Key) -> Option<usize> {
+    match key {
+        Key::Key1 => Some(1),
+        Key::Key2 => Some(2),
+        Key::Key3 => Some(3),
+        Key::Key4 => Some(4),
+        Key::Key5 => Some(5),
+        Key::Key6 => Some(6),
+        Key::Key7 => Some(7),
+        Key::Key8 => Some(8),
+        Key::Key9 => Some(9),
+        _ => None,
+    }
+}
+
 fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
     match mode {
-        PaneLayoutMode::NvimMaximized => Some(0),
-        PaneLayoutMode::AgentMaximized => Some(1),
+        PaneLayoutMode::PaneMaximized(i) => Some(i),
         PaneLayoutMode::Split => None,
     }
 }
@@ -258,9 +334,11 @@ pub fn focus_nvim_after_agent_reference(
     mode: &mut PaneLayoutMode,
     active_pane: &mut usize,
 ) -> FocusNvimAfterReference {
-    let relayout_needed = *mode == PaneLayoutMode::AgentMaximized;
+    // Any maximized agent pane counts as "agent maximized" for this transition.
+    let was_agent_max = matches!(mode, PaneLayoutMode::PaneMaximized(i) if *i != 0);
+    let relayout_needed = was_agent_max;
     if relayout_needed {
-        *mode = PaneLayoutMode::NvimMaximized;
+        *mode = PaneLayoutMode::PaneMaximized(0);
     }
     let focus_changed = *active_pane != 0;
     *active_pane = 0;
@@ -288,8 +366,15 @@ fn pane_focus_shortcut(key: Key) -> Option<usize> {
 
 pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
     match key {
-        Key::Key1 => Some(PaneLayoutMode::NvimMaximized),
-        Key::Key2 => Some(PaneLayoutMode::AgentMaximized),
+        Key::Key1 => Some(PaneLayoutMode::PaneMaximized(0)),
+        Key::Key2 => Some(PaneLayoutMode::PaneMaximized(1)),
+        Key::Key3 => Some(PaneLayoutMode::PaneMaximized(2)),
+        Key::Key4 => Some(PaneLayoutMode::PaneMaximized(3)),
+        Key::Key5 => Some(PaneLayoutMode::PaneMaximized(4)),
+        Key::Key6 => Some(PaneLayoutMode::PaneMaximized(5)),
+        Key::Key7 => Some(PaneLayoutMode::PaneMaximized(6)),
+        Key::Key8 => Some(PaneLayoutMode::PaneMaximized(7)),
+        Key::Key9 => Some(PaneLayoutMode::PaneMaximized(8)),
         _ => None,
     }
 }
@@ -389,12 +474,12 @@ mod tests {
 
     #[test]
     fn reference_navigation_from_agent_fullscreen_maximizes_nvim() {
-        let mut mode = PaneLayoutMode::AgentMaximized;
+        let mut mode = PaneLayoutMode::PaneMaximized(1);
         let mut active_pane = 1;
 
         let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
 
-        assert_eq!(mode, PaneLayoutMode::NvimMaximized);
+        assert_eq!(mode, PaneLayoutMode::PaneMaximized(0));
         assert_eq!(active_pane, 0);
         assert!(focus.relayout_needed);
         assert!(focus.focus_changed);

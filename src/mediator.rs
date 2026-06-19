@@ -429,8 +429,26 @@ impl Mediator {
                     self.send_ui_command(UiCommand::AgentInput {
                         payload,
                         focus_agent: true,
+                        target_agent_id: None,
                     });
                 }
+            }
+            EditorEvent::AgentSend { agent_id, content } => {
+                // Route to the specific agent pane (by id) if provided.
+                self.send_ui_command(UiCommand::AgentInput {
+                    payload: content.clone(),
+                    focus_agent: true,
+                    target_agent_id: agent_id.clone(),
+                });
+            }
+            EditorEvent::SpawnAgent { id, role, command } => {
+                info!(%id, role = ?role, command = ?command, "spawn agent requested");
+                // Handled in UI layer via UiCommand in a follow-up step.
+                self.send_ui_command(UiCommand::SpawnAgent {
+                    id: id.clone(),
+                    role: role.clone(),
+                    command: command.clone(),
+                });
             }
         }
 
@@ -467,6 +485,7 @@ impl Mediator {
                 self.send_ui_command(UiCommand::AgentInput {
                     payload: response,
                     focus_agent: false,
+                    target_agent_id: None,
                 });
             }
         }

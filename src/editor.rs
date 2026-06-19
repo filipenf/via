@@ -74,6 +74,12 @@ impl EditorState {
             EditorEvent::BufferSendRequested { .. } => {
                 // one-shot request, no state to update
             }
+            EditorEvent::AgentSend { .. } => {
+                // one-shot request, no state to update
+            }
+            EditorEvent::SpawnAgent { .. } => {
+                // one-shot request, handled by mediator/ui
+            }
         }
     }
 }
@@ -104,6 +110,18 @@ enum WireEditorEvent {
         start_line: Option<u32>,
         #[serde(default)]
         end_line: Option<u32>,
+    },
+    AgentSend {
+        #[serde(default)]
+        agent_id: Option<String>,
+        content: String,
+    },
+    SpawnAgent {
+        id: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
     },
 }
 
@@ -222,6 +240,15 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             path: resolve_path(&path, working_directory),
             start_line,
             end_line,
+        },
+        WireEditorEvent::AgentSend { agent_id, content } => EditorEvent::AgentSend {
+            agent_id,
+            content,
+        },
+        WireEditorEvent::SpawnAgent { id, role, command } => EditorEvent::SpawnAgent {
+            id,
+            role,
+            command,
         },
     })
 }

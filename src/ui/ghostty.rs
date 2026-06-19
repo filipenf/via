@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use tokio::sync::mpsc::Receiver as TokioReceiver;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -305,7 +305,10 @@ impl WinitGhosttyApp {
                     self.output_notifier.clone(),
                 )?;
                 panes.push(TerminalPaneController::new(
-                    PaneRole::AgentTerminal,
+                    PaneRole::AgentTerminal {
+                        id: "orchestrator".to_string(),
+                        label: "agent".to_string(),
+                    },
                     pane,
                     self.config.scroll_sensitivity,
                 ));
@@ -313,6 +316,49 @@ impl WinitGhosttyApp {
         }
 
         Ok(panes)
+    }
+
+    fn spawn_agent_pane(
+        &mut self,
+        id: &str,
+        role: Option<&str>,
+        command: Option<&str>,
+    ) -> Result<()> {
+        let metrics = self.terminal_config.metrics;
+        // Use current layout dimensions to size the new pane; relayout will adjust.
+        let (w, h) = (self.width, self.height);
+        let label = role.unwrap_or(id).to_string();
+        // Leak a small string for the static title requirement of TerminalPane.
+        let title: &'static str = Box::leak(label.clone().into_boxed_str());
+        let mut pane = TerminalPane::new(
+            title,
+            w / 2,
+            h / 2,
+            metrics,
+            &self.terminal_config.theme,
+        )?;
+        // Prefer the command passed to SpawnAgent, then the configured agent_command,
+        // finally fall back to $SHELL so the pane is at least usable.
+        let cmd = command
+            .map(|s| s.to_string())
+            .or_else(|| self.config.agent_command.clone())
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+        pane.spawn_shell_command(&cmd, &self.config.working_directory, self.output_notifier.clone())?;
+        self.panes.push(TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: id.to_string(),
+                label,
+            },
+            pane,
+            self.config.scroll_sensitivity,
+        ));
+        // Focus the newly created agent pane and ensure we are in a visible split layout.
+        self.active_pane = self.panes.len() - 1;
+        self.pane_layout_mode = PaneLayoutMode::Split;
+        self.relayout();
+        self.dirty = true;
+        self.force_redraw = true;
+        Ok(())
     }
 
     fn resize_surface(
@@ -405,12 +451,12 @@ impl WinitGhosttyApp {
         };
 
         if self.pane_layout_mode == PaneLayoutMode::Split && !fits {
-            self.pane_layout_mode = PaneLayoutMode::NvimMaximized;
+            self.pane_layout_mode = PaneLayoutMode::PaneMaximized(0);
             self.split_collapsed_for_width = true;
             return;
         }
 
-        if self.pane_layout_mode == PaneLayoutMode::NvimMaximized
+        if self.pane_layout_mode == PaneLayoutMode::PaneMaximized(0)
             && self.split_collapsed_for_width
             && fits
         {
@@ -429,7 +475,7 @@ impl WinitGhosttyApp {
         let new_layout = SplitLayout::for_window(
             self.width,
             self.height,
-            pane_count(&self.config),
+            self.panes.len().max(1),
             self.pane_layout_mode,
             self.pane_split_direction,
             self.split_layout_options(),
@@ -597,7 +643,7 @@ impl WinitGhosttyApp {
             &pressed_keys,
             self.modifiers.alt,
             self.modifiers.shift,
-            pane_count(&self.config),
+            self.panes.len(),
             &mut self.pane_layout_mode,
             &mut self.pane_split_direction,
             &mut self.active_pane,
@@ -744,7 +790,7 @@ impl WinitGhosttyApp {
 
     fn open_nvim_review(&mut self) {
         self.review_active = false;
-        self.pane_layout_mode = PaneLayoutMode::NvimMaximized;
+        self.pane_layout_mode = PaneLayoutMode::PaneMaximized(0);
         self.active_pane = 0;
         self.relayout();
         self.events.try_send(Event::Ui(UiEvent::ReviewRequested));
@@ -982,8 +1028,8 @@ impl WinitGhosttyApp {
     }
 
     fn focus_agent_after_editor_input(&mut self) {
-        if self.pane_layout_mode == PaneLayoutMode::NvimMaximized {
-            self.pane_layout_mode = PaneLayoutMode::AgentMaximized;
+        if self.pane_layout_mode == PaneLayoutMode::PaneMaximized(0) {
+            self.pane_layout_mode = PaneLayoutMode::PaneMaximized(1);
             self.active_pane = 1;
             self.relayout();
         } else {
@@ -997,7 +1043,7 @@ impl WinitGhosttyApp {
         // rather than being silently swallowed.
         self.output_notifier.clear();
         for pane in self.panes.iter_mut() {
-            if pane.role() == PaneRole::AgentTerminal {
+            if matches!(pane.role(), PaneRole::AgentTerminal { .. }) {
                 let chunks = pane.drain_output_chunks();
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
@@ -1230,17 +1276,30 @@ impl WinitGhosttyApp {
                 UiCommand::AgentInput {
                     payload,
                     focus_agent,
+                    target_agent_id,
                 } => {
                     if focus_agent {
                         self.focus_agent_after_editor_input();
                     }
 
-                    {
-                        let Some(agent_pane) = self.panes.get_mut(1) else {
-                            continue;
-                        };
-                        debug!("forwarding input to agent");
-                        agent_pane.write_all(payload.as_bytes())?;
+                    // Try to find a specific agent pane by id; fall back to the first AgentTerminal.
+                    let idx = if let Some(ref want) = target_agent_id {
+                        self.panes
+                            .iter()
+                            .position(|p| matches!(p.role(), PaneRole::AgentTerminal { id, .. } if id == want))
+                    } else {
+                        None
+                    };
+                    let idx = idx.or_else(|| {
+                        self.panes
+                            .iter()
+                            .position(|p| matches!(p.role(), PaneRole::AgentTerminal { .. }))
+                    });
+                    if let Some(i) = idx {
+                        debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
+                        self.panes[i].write_all(payload.as_bytes())?;
+                    } else {
+                        warn!("no agent pane available to receive input");
                     }
                     self.pending_agent_write = None;
                 }
@@ -1268,6 +1327,12 @@ impl WinitGhosttyApp {
                     self.acp_modal = Some(AcpModalState::new(
                         jsonrpc_id, title, message, options, kind,
                     ));
+                }
+                UiCommand::SpawnAgent { id, role, command } => {
+                    info!(%id, role = ?role, command = ?command, "spawning new agent pane");
+                    if let Err(e) = self.spawn_agent_pane(&id, role.as_deref(), command.as_deref()) {
+                        error!(%e, "failed to spawn agent pane");
+                    }
                 }
             }
         }
@@ -1473,6 +1538,20 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
             "lua vim.g.via_lsp_bridge_socket = {}",
             lua_string_literal(&config.lsp_bridge_socket_path)
         )),
+        OsString::from("--cmd"),
+        OsString::from(format!(
+            "lua vim.g.via_module_path = {}",
+            lua_string_literal(&config.nvim_via_module_path)
+        )),
+        OsString::from("--cmd"),
+        {
+            // Stable lua/ directory so require('via') works for every via session.
+            let dir = crate::config::lua_dir();
+            OsString::from(format!(
+                "lua package.path = package.path .. ';{}/?.lua'",
+                dir.to_string_lossy()
+            ))
+        },
         OsString::from("-c"),
         OsString::from(format!(
             "luafile {}",
@@ -1984,6 +2063,7 @@ mod tests {
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
             working_directory: PathBuf::from("/repo"),
         };
