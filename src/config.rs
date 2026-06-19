@@ -432,7 +432,10 @@ fn default_nvim_context_bridge_path() -> PathBuf {
             let dir = lua_dir();
             let path = dir.join("context_bridge.lua");
             std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!("failed to create via lua directory {}: {err}", dir.display());
+                panic!(
+                    "failed to create via lua directory {}: {err}",
+                    dir.display()
+                );
             });
             std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
                 |err| {
@@ -453,7 +456,10 @@ fn default_nvim_via_module_path() -> PathBuf {
             let dir = lua_dir();
             let path = dir.join("via.lua");
             std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!("failed to create via lua directory {}: {err}", dir.display());
+                panic!(
+                    "failed to create via lua directory {}: {err}",
+                    dir.display()
+                );
             });
             std::fs::write(&path, include_str!("../nvim/via.lua")).unwrap_or_else(|err| {
                 panic!(
@@ -671,6 +677,7 @@ scroll_sensitivity = 1.5
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         };
@@ -689,6 +696,7 @@ scroll_sensitivity = 1.5
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         };

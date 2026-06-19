@@ -131,8 +131,21 @@ impl SplitLayout {
         // PaneMaximized must be handled before the multi-pane split logic.
         if let PaneLayoutMode::PaneMaximized(i) = mode {
             if i < pane_count {
-                let mut panes = vec![PaneRect { x: 0, y: 0, width: 0, height: 0 }; pane_count];
-                panes[i] = PaneRect { x: 0, y: 0, width, height };
+                let mut panes = vec![
+                    PaneRect {
+                        x: 0,
+                        y: 0,
+                        width: 0,
+                        height: 0
+                    };
+                    pane_count
+                ];
+                panes[i] = PaneRect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                };
                 return Self { panes };
             }
         }
@@ -187,9 +200,12 @@ impl SplitLayout {
             // Compute the editor + secondary area split using the normal two-pane rules,
             // then divide the secondary area among the remaining agent panes.
             let base = match split_direction {
-                PaneSplitDirection::Vertical => {
-                    vertical_split_layout(width, height, options.cell_width, options.agent_pane_cols)
-                }
+                PaneSplitDirection::Vertical => vertical_split_layout(
+                    width,
+                    height,
+                    options.cell_width,
+                    options.agent_pane_cols,
+                ),
                 PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
             };
             let editor_rect = base.panes[0];

@@ -433,7 +433,11 @@ impl Mediator {
                     });
                 }
             }
-            EditorEvent::AgentSend { agent_id, content, focus } => {
+            EditorEvent::AgentSend {
+                agent_id,
+                content,
+                focus,
+            } => {
                 // Route to the specific agent pane (by id) if provided.
                 self.send_ui_command(UiCommand::AgentInput {
                     payload: content.clone(),
@@ -642,6 +646,7 @@ mod tests {
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         }

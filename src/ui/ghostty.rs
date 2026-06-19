@@ -325,11 +325,9 @@ impl WinitGhosttyApp {
         command: Option<&str>,
     ) -> Result<()> {
         // Deduplicate: if a pane with this id already exists, do nothing.
-        if self
-            .panes
-            .iter()
-            .any(|p| matches!(p.role(), PaneRole::AgentTerminal { id: existing, .. } if existing == id))
-        {
+        if self.panes.iter().any(
+            |p| matches!(p.role(), PaneRole::AgentTerminal { id: existing, .. } if existing == id),
+        ) {
             info!(%id, "spawn_agent called for existing id – ignoring");
             return Ok(());
         }
@@ -340,20 +338,19 @@ impl WinitGhosttyApp {
         let label = role.unwrap_or(id).to_string();
         // Leak a small string for the static title requirement of TerminalPane.
         let title: &'static str = Box::leak(label.clone().into_boxed_str());
-        let mut pane = TerminalPane::new(
-            title,
-            w / 2,
-            h / 2,
-            metrics,
-            &self.terminal_config.theme,
-        )?;
+        let mut pane =
+            TerminalPane::new(title, w / 2, h / 2, metrics, &self.terminal_config.theme)?;
         // Prefer the command passed to SpawnAgent, then the configured agent_command,
         // finally fall back to $SHELL so the pane is at least usable.
         let cmd = command
             .map(|s| s.to_string())
             .or_else(|| self.config.agent_command.clone())
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
-        pane.spawn_shell_command(&cmd, &self.config.working_directory, self.output_notifier.clone())?;
+        pane.spawn_shell_command(
+            &cmd,
+            &self.config.working_directory,
+            self.output_notifier.clone(),
+        )?;
         self.panes.push(TerminalPaneController::new(
             PaneRole::AgentTerminal {
                 id: id.to_string(),
@@ -444,7 +441,7 @@ impl WinitGhosttyApp {
     }
 
     fn adjust_layout_mode_for_width(&mut self) {
-        if pane_count(&self.config) < 2 {
+        if pane_slot_count(self.panes.len(), self.acp_pane.is_some()) < 2 {
             return;
         }
 
@@ -485,7 +482,7 @@ impl WinitGhosttyApp {
         let new_layout = SplitLayout::for_window(
             self.width,
             self.height,
-            self.panes.len().max(1),
+            pane_slot_count(self.panes.len(), self.acp_pane.is_some()),
             self.pane_layout_mode,
             self.pane_split_direction,
             self.split_layout_options(),
@@ -734,7 +731,7 @@ impl WinitGhosttyApp {
         if !self.modifiers.alt || self.modifiers.ctrl || self.modifiers.super_key {
             return Ok(false);
         }
-        if !pressed_keys.iter().any(|key| *key == Key::R) {
+        if !pressed_keys.contains(&Key::R) {
             return Ok(false);
         }
 
@@ -1334,7 +1331,8 @@ impl WinitGhosttyApp {
                 }
                 UiCommand::SpawnAgent { id, role, command } => {
                     info!(%id, role = ?role, command = ?command, "spawning new agent pane");
-                    if let Err(e) = self.spawn_agent_pane(&id, role.as_deref(), command.as_deref()) {
+                    if let Err(e) = self.spawn_agent_pane(&id, role.as_deref(), command.as_deref())
+                    {
                         error!(%e, "failed to spawn agent pane");
                     }
                 }
@@ -1515,6 +1513,10 @@ fn pane_count(config: &Config) -> usize {
     if config.agent_command.is_some() { 2 } else { 1 }
 }
 
+fn pane_slot_count(panes_len: usize, has_acp_pane: bool) -> usize {
+    panes_len.max(if has_acp_pane { 2 } else { 1 })
+}
+
 fn full_window_rect(width: usize, height: usize) -> PaneRect {
     PaneRect {
         x: 0,
@@ -1552,8 +1554,8 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
             // Stable lua/ directory so require('via') works for every via session.
             let dir = crate::config::lua_dir();
             OsString::from(format!(
-                "lua package.path = package.path .. ';{}/?.lua'",
-                dir.to_string_lossy()
+                "lua package.path = package.path .. ';' .. {} .. '/?.lua'",
+                lua_string_literal(&dir)
             ))
         },
         OsString::from("-c"),
@@ -1652,6 +1654,13 @@ mod tests {
         LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks,
         reference_target_from_row,
     };
+
+    #[test]
+    fn pane_slot_count_reserves_acp_pane_index() {
+        assert_eq!(pane_slot_count(1, true), 2);
+        assert_eq!(pane_slot_count(1, false), 1);
+        assert_eq!(pane_slot_count(3, true), 3);
+    }
 
     #[test]
     fn parses_ghostty_config_entries() {
@@ -1853,7 +1862,7 @@ mod tests {
             100,
             50,
             2,
-            PaneLayoutMode::NvimMaximized,
+            PaneLayoutMode::PaneMaximized(0),
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
@@ -1870,7 +1879,7 @@ mod tests {
         assert_eq!(
             layout.pane(1),
             PaneRect {
-                x: 100,
+                x: 0,
                 y: 0,
                 width: 0,
                 height: 0,
@@ -1885,7 +1894,7 @@ mod tests {
             100,
             50,
             2,
-            PaneLayoutMode::AgentMaximized,
+            PaneLayoutMode::PaneMaximized(1),
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
@@ -1917,7 +1926,7 @@ mod tests {
             100,
             50,
             2,
-            PaneLayoutMode::NvimMaximized,
+            PaneLayoutMode::PaneMaximized(0),
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
@@ -1925,7 +1934,7 @@ mod tests {
             100,
             50,
             2,
-            PaneLayoutMode::AgentMaximized,
+            PaneLayoutMode::PaneMaximized(1),
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
@@ -1938,7 +1947,7 @@ mod tests {
 
     #[test]
     fn maps_alt_number_shortcuts_to_active_panes() {
-        let mut mode = PaneLayoutMode::AgentMaximized;
+        let mut mode = PaneLayoutMode::PaneMaximized(1);
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
@@ -1981,7 +1990,7 @@ mod tests {
             &mut split_direction,
             &mut active_pane
         ));
-        assert_eq!(mode, PaneLayoutMode::NvimMaximized);
+        assert_eq!(mode, PaneLayoutMode::PaneMaximized(0));
         assert_eq!(active_pane, 0);
         assert!(handle_layout_shortcuts(
             &[Key::Key2],
@@ -1992,7 +2001,7 @@ mod tests {
             &mut split_direction,
             &mut active_pane
         ));
-        assert_eq!(mode, PaneLayoutMode::AgentMaximized);
+        assert_eq!(mode, PaneLayoutMode::PaneMaximized(1));
         assert_eq!(active_pane, 1);
     }
 
@@ -2028,14 +2037,14 @@ mod tests {
 
     #[test]
     fn maps_alt_shift_3_shortcut_to_split_direction_toggle() {
-        let mut mode = PaneLayoutMode::AgentMaximized;
+        let mut mode = PaneLayoutMode::PaneMaximized(1);
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 0;
 
         assert!(handle_layout_shortcuts(
-            &[Key::Key3],
+            &[Key::J],
             true,
-            true,
+            false,
             2,
             &mut mode,
             &mut split_direction,
@@ -2045,9 +2054,9 @@ mod tests {
         assert_eq!(split_direction, PaneSplitDirection::Horizontal);
         assert_eq!(active_pane, 0);
         assert!(handle_layout_shortcuts(
-            &[Key::Key3],
+            &[Key::J],
             true,
-            true,
+            false,
             2,
             &mut mode,
             &mut split_direction,
@@ -2085,9 +2094,17 @@ mod tests {
             args[5],
             OsString::from(r#"lua vim.g.via_lsp_bridge_socket = "/tmp/via-lsp-bridge.sock""#)
         );
-        assert_eq!(args[6], OsString::from("-c"));
+        assert_eq!(args[8], OsString::from("--cmd"));
         assert_eq!(
-            args[7],
+            args[9],
+            OsString::from(format!(
+                "lua package.path = package.path .. ';' .. {} .. '/?.lua'",
+                lua_string_literal(&crate::config::lua_dir())
+            ))
+        );
+        assert_eq!(args[10], OsString::from("-c"));
+        assert_eq!(
+            args[11],
             OsString::from("luafile /repo/nvim/context\\ bridge.lua")
         );
     }

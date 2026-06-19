@@ -247,16 +247,18 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             start_line,
             end_line,
         },
-        WireEditorEvent::AgentSend { agent_id, content, focus } => EditorEvent::AgentSend {
+        WireEditorEvent::AgentSend {
+            agent_id,
+            content,
+            focus,
+        } => EditorEvent::AgentSend {
             agent_id,
             content,
             focus,
         },
-        WireEditorEvent::SpawnAgent { id, role, command } => EditorEvent::SpawnAgent {
-            id,
-            role,
-            command,
-        },
+        WireEditorEvent::SpawnAgent { id, role, command } => {
+            EditorEvent::SpawnAgent { id, role, command }
+        }
     })
 }
 
