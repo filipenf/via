@@ -4,7 +4,6 @@
 
 local M = {}
 
-local socket = vim.g.via_editor_socket
 local uv = vim.uv or vim.loop
 
 local function encode(payload)
@@ -15,22 +14,29 @@ local function encode(payload)
 end
 
 local function notify(payload)
+  local socket = vim.g.via_editor_socket
   if not socket or socket == "" or not uv then
     vim.notify("via: editor socket not available", vim.log.levels.WARN)
     return
   end
 
+  local message = encode(payload) .. "\n"
   local pipe = uv.new_pipe(false)
   if not pipe then
     return
   end
 
-  pipe:connect(socket, function(err)
-    if err then
+  pipe:connect(socket, function(connect_failure)
+    if connect_failure then
       pipe:close()
       return
     end
-    pipe:write(encode(payload) .. "\n", function()
+    pipe:write(message, function(write_failure)
+      if write_failure then
+        vim.schedule(function()
+          vim.notify("via: failed to write editor notification: " .. tostring(write_failure), vim.log.levels.WARN)
+        end)
+      end
       pipe:close()
     end)
   end)

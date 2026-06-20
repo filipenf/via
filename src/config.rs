@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -6,12 +7,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result as AnyResult};
 use serde::Deserialize;
 
-/// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
-/// to a path under the via runtime directory (see `runtime_base_dir`) so Neovim can `luafile` it.
-static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// Embedded copy of `nvim/via.lua`. Written to the runtime dir so Neovim can `require('via')`.
-static EMBEDDED_VIA_MODULE_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Ensures the embedded Lua files are written to disk exactly once per process.
+static LUA_ASSETS_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 /// Directory for sockets, the context bridge script, and other per-process files.
 ///
@@ -426,50 +423,46 @@ fn default_editor_socket_path() -> PathBuf {
     runtime_base_dir().join(format!("via-editor-{}.sock", std::process::id()))
 }
 
-fn default_nvim_context_bridge_path() -> PathBuf {
-    EMBEDDED_CONTEXT_BRIDGE_PATH
-        .get_or_init(|| {
-            let dir = lua_dir();
-            let path = dir.join("context_bridge.lua");
-            std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to create via lua directory {}: {err}",
-                    dir.display()
-                );
-            });
-            std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
-                |err| {
-                    panic!(
-                        "failed to write embedded nvim/context_bridge.lua to {}: {err}",
-                        path.display()
-                    );
-                },
+fn ensure_lua_assets() {
+    LUA_ASSETS_INITIALIZED.get_or_init(|| {
+        let dir = lua_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create via lua directory {}: {err}",
+                dir.display()
             );
-            path
-        })
-        .clone()
+        });
+        for (filename, content) in [
+            (
+                "context_bridge.lua",
+                include_str!("../nvim/context_bridge.lua"),
+            ),
+            ("via.lua", include_str!("../nvim/via.lua")),
+        ] {
+            let path = dir.join(filename);
+            if !path.exists() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    if f.write_all(content.as_bytes()).is_err() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn default_nvim_context_bridge_path() -> PathBuf {
+    ensure_lua_assets();
+    lua_dir().join("context_bridge.lua")
 }
 
 fn default_nvim_via_module_path() -> PathBuf {
-    EMBEDDED_VIA_MODULE_PATH
-        .get_or_init(|| {
-            let dir = lua_dir();
-            let path = dir.join("via.lua");
-            std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to create via lua directory {}: {err}",
-                    dir.display()
-                );
-            });
-            std::fs::write(&path, include_str!("../nvim/via.lua")).unwrap_or_else(|err| {
-                panic!(
-                    "failed to write embedded nvim/via.lua to {}: {err}",
-                    path.display()
-                );
-            });
-            path
-        })
-        .clone()
+    ensure_lua_assets();
+    lua_dir().join("via.lua")
 }
 
 fn default_lsp_bridge_socket_path() -> PathBuf {

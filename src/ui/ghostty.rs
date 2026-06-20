@@ -50,7 +50,7 @@ const INITIAL_HEIGHT: usize = 540;
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
-const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(20);
+const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(30);
 const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 pub struct GhosttyUi {
@@ -412,7 +412,6 @@ fn handle_acp_key_event(
     if let Some(text) = text.filter(|text| text.chars().all(|ch| !ch.is_control())) {
         outcome.dirty |= pane.handle_text_input(text, modifiers);
     }
-    outcome.dirty = true;
     outcome
 }
 
