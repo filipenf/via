@@ -35,6 +35,9 @@ pub(super) enum PaneCommand {
     SymbolOpenRequested {
         symbol: String,
     },
+    AgentPromptSubmitted {
+        text: String,
+    },
 }
 
 #[derive(Default)]

@@ -124,10 +124,9 @@ struct WinitGhosttyApp {
     font_renderer: FontRenderer,
     buffer: Vec<u32>,
     damage: Vec<DamageRect>,
-    panes: Vec<TerminalPaneController>,
+    panes: Vec<AppPane>,
     review_pane: Option<TerminalPaneController>,
     review_active: bool,
-    acp_pane: Option<AcpPane>,
     acp_modal: Option<AcpModalState>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
@@ -147,6 +146,294 @@ struct WinitGhosttyApp {
     last_arrow_repeat_at: Option<Instant>,
     next_theme_poll_at: Instant,
     error: Option<anyhow::Error>,
+}
+
+enum AppPane {
+    Terminal(TerminalPaneController),
+    Acp(AcpPane),
+}
+
+impl AppPane {
+    fn is_agent_terminal(&self) -> bool {
+        match self {
+            Self::Terminal(pane) => matches!(pane.role(), PaneRole::AgentTerminal { .. }),
+            Self::Acp(_) => false,
+        }
+    }
+
+    fn agent_id_matches(&self, want: &str) -> bool {
+        match self {
+            Self::Terminal(pane) => {
+                matches!(pane.role(), PaneRole::AgentTerminal { id, .. } if id == want)
+            }
+            Self::Acp(_) => false,
+        }
+    }
+
+    fn as_terminal_mut(&mut self) -> Option<&mut TerminalPaneController> {
+        match self {
+            Self::Terminal(pane) => Some(pane),
+            Self::Acp(_) => None,
+        }
+    }
+
+    fn as_acp_mut(&mut self) -> Option<&mut AcpPane> {
+        match self {
+            Self::Terminal(_) => None,
+            Self::Acp(pane) => Some(pane),
+        }
+    }
+
+    fn resize_with_metrics(&mut self, width: usize, height: usize, metrics: TerminalMetrics) {
+        match self {
+            Self::Terminal(pane) => {
+                pane.resize_with_metrics(width, height, metrics);
+            }
+            Self::Acp(pane) => {
+                pane.resize_with_metrics(width, height, metrics);
+            }
+        }
+    }
+
+    fn apply_theme(&mut self, theme: &config::TerminalTheme) {
+        match self {
+            Self::Terminal(pane) => pane.apply_theme(theme),
+            Self::Acp(pane) => pane.apply_theme(theme),
+        }
+    }
+
+    fn clear_selection(&mut self) -> bool {
+        match self {
+            Self::Terminal(pane) => pane.clear_selection(),
+            Self::Acp(_) => false,
+        }
+    }
+
+    fn drain_output(&mut self) -> bool {
+        match self {
+            Self::Terminal(pane) => pane.drain_output(),
+            Self::Acp(_) => false,
+        }
+    }
+
+    fn drain_agent_output_chunks(&mut self) -> Option<Vec<Vec<u8>>> {
+        match self {
+            Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }) => {
+                Some(pane.drain_output_chunks())
+            }
+            _ => None,
+        }
+    }
+
+    fn tick_progress(&mut self) -> bool {
+        match self {
+            Self::Terminal(_) => false,
+            Self::Acp(pane) => pane.tick_progress(),
+        }
+    }
+
+    fn handle_key_event(
+        &mut self,
+        pressed_keys: &[Key],
+        key: Option<Key>,
+        text: Option<&str>,
+        repeat: bool,
+        modifiers: Modifiers,
+        suppress_input: bool,
+    ) -> Result<PaneEventOutcome> {
+        match self {
+            Self::Terminal(pane) => {
+                pane.handle_terminal_key(pressed_keys, key, text, repeat, modifiers, suppress_input)
+            }
+            Self::Acp(pane) => Ok(handle_acp_key_event(
+                pane,
+                pressed_keys,
+                key,
+                text,
+                repeat,
+                modifiers,
+                suppress_input,
+            )),
+        }
+    }
+
+    fn handle_text_commit(&mut self, text: &str, modifiers: Modifiers) -> Result<PaneEventOutcome> {
+        match self {
+            Self::Terminal(pane) => pane.handle_text_commit(text, modifiers),
+            Self::Acp(pane) => Ok(PaneEventOutcome {
+                dirty: pane.handle_text_input(text, modifiers),
+                force_redraw: false,
+                command: None,
+            }),
+        }
+    }
+
+    fn handle_mouse_wheel(
+        &mut self,
+        scroll_delta: (f32, f32),
+        local_x: usize,
+        local_y: usize,
+        modifiers: Modifiers,
+    ) -> Result<PaneEventOutcome> {
+        match self {
+            Self::Terminal(pane) => {
+                pane.handle_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
+            }
+            Self::Acp(pane) => Ok(handle_acp_mouse_wheel(pane, scroll_delta)),
+        }
+    }
+
+    fn handle_mouse_input(
+        &mut self,
+        state: ElementState,
+        button: MouseButton,
+        local_x: usize,
+        local_y: usize,
+        modifiers: Modifiers,
+        working_directory: &Path,
+    ) -> Result<PaneEventOutcome> {
+        match self {
+            Self::Terminal(pane) => pane.handle_mouse_input(
+                state,
+                button,
+                local_x,
+                local_y,
+                modifiers,
+                working_directory,
+            ),
+            Self::Acp(_) => Ok(PaneEventOutcome::default()),
+        }
+    }
+
+    fn handle_mouse_motion(
+        &mut self,
+        local_x: usize,
+        local_y: usize,
+        modifiers: Modifiers,
+    ) -> Result<PaneEventOutcome> {
+        match self {
+            Self::Terminal(pane) => pane.handle_mouse_motion(local_x, local_y, modifiers),
+            Self::Acp(_) => Ok(PaneEventOutcome::default()),
+        }
+    }
+
+    fn draw(
+        &mut self,
+        font_renderer: &mut FontRenderer,
+        buffer: &mut [u32],
+        buffer_width: usize,
+        buffer_height: usize,
+        rect: PaneRect,
+        active: bool,
+        force_redraw: bool,
+        redraw_chrome: bool,
+        damage: &mut Vec<DamageRect>,
+    ) -> bool {
+        match self {
+            Self::Terminal(pane) => pane.draw(
+                font_renderer,
+                buffer,
+                buffer_width,
+                buffer_height,
+                rect,
+                active,
+                force_redraw,
+                redraw_chrome,
+                damage,
+            ),
+            Self::Acp(pane) => pane.draw(
+                font_renderer,
+                buffer,
+                buffer_width,
+                buffer_height,
+                rect,
+                active,
+                force_redraw,
+                redraw_chrome,
+                damage,
+            ),
+        }
+    }
+}
+
+fn handle_acp_key_event(
+    pane: &mut AcpPane,
+    pressed_keys: &[Key],
+    key: Option<Key>,
+    text: Option<&str>,
+    repeat: bool,
+    modifiers: Modifiers,
+    suppress_input: bool,
+) -> PaneEventOutcome {
+    if suppress_input {
+        return PaneEventOutcome::default();
+    }
+
+    let step = pane.transcript_viewport_rows().max(1) as isize;
+    for key in pressed_keys.iter().copied() {
+        let dirty = match key {
+            Key::PageUp => pane.scroll_transcript(step),
+            Key::PageDown => pane.scroll_transcript(-step),
+            Key::Home => pane.scroll_transcript_to_top(),
+            Key::End => pane.scroll_transcript_to_bottom(),
+            _ => false,
+        };
+        if dirty {
+            return PaneEventOutcome {
+                dirty: true,
+                force_redraw: true,
+                command: None,
+            };
+        }
+    }
+
+    let paste_requested = !repeat
+        && key
+            .map(|key| paste_requested(key, modifiers))
+            .unwrap_or(false);
+    if paste_requested {
+        let dirty = read_clipboard_text()
+            .map(|text| pane.paste_text(&text))
+            .unwrap_or(false);
+        return PaneEventOutcome {
+            dirty,
+            force_redraw: false,
+            command: None,
+        };
+    }
+
+    let mut outcome = PaneEventOutcome::default();
+    if let Some(key) = key {
+        if let Some(prompt) = pane.handle_key(key, modifiers) {
+            outcome.command = Some(PaneCommand::AgentPromptSubmitted { text: prompt });
+        }
+    }
+
+    if let Some(text) = text.filter(|text| text.chars().all(|ch| !ch.is_control())) {
+        outcome.dirty |= pane.handle_text_input(text, modifiers);
+    }
+    outcome.dirty = true;
+    outcome
+}
+
+fn handle_acp_mouse_wheel(pane: &mut AcpPane, scroll_delta: (f32, f32)) -> PaneEventOutcome {
+    let (sx, sy) = scroll_delta;
+    let sy = sy + sx;
+    if sy.abs() <= 1e-4 {
+        return PaneEventOutcome::default();
+    }
+
+    let scaled = -sy / 40.0;
+    let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
+    if delta_y == 0 {
+        delta_y = -sy.signum() as isize;
+    }
+    pane.scroll_transcript(delta_y);
+    PaneEventOutcome {
+        dirty: true,
+        force_redraw: true,
+        command: None,
+    }
 }
 
 impl WinitGhosttyApp {
@@ -182,7 +469,6 @@ impl WinitGhosttyApp {
             panes: Vec::new(),
             review_pane: None,
             review_active: false,
-            acp_pane: None,
             acp_modal: None,
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
@@ -235,17 +521,11 @@ impl WinitGhosttyApp {
         if self.panes.is_empty() {
             self.panes =
                 self.create_panes(self.width, self.height, self.terminal_config.metrics)?;
-            if self.config.is_acp_agent() {
-                let rect = self.layout.pane(1);
-                self.acp_pane = Some(AcpPane::new(
-                    rect.width,
-                    rect.height,
-                    self.terminal_config.metrics,
-                    &self.terminal_config.theme,
-                ));
-            }
             let nvim_args = nvim_args(&self.config);
-            self.panes[0].spawn(
+            let Some(editor_pane) = self.panes[0].as_terminal_mut() else {
+                return Err(anyhow!("editor pane is not a terminal"));
+            };
+            editor_pane.spawn(
                 &self.config.nvim_command,
                 nvim_args,
                 &self.config.working_directory,
@@ -269,7 +549,7 @@ impl WinitGhosttyApp {
         width: usize,
         height: usize,
         metrics: TerminalMetrics,
-    ) -> Result<Vec<TerminalPaneController>> {
+    ) -> Result<Vec<AppPane>> {
         let layout = SplitLayout::for_window(
             width,
             height,
@@ -278,7 +558,7 @@ impl WinitGhosttyApp {
             PaneSplitDirection::for_window(width, height),
             self.split_layout_options(),
         );
-        let mut panes = vec![TerminalPaneController::new(
+        let mut panes = vec![AppPane::Terminal(TerminalPaneController::new(
             PaneRole::Editor,
             TerminalPane::new(
                 "nvim",
@@ -288,10 +568,18 @@ impl WinitGhosttyApp {
                 &self.terminal_config.theme,
             )?,
             self.config.scroll_sensitivity,
-        )];
+        ))];
 
-        if self.config.agent_command.is_some() && !self.config.is_acp_agent() {
-            if let Some(agent_command) = self.config.agent_command.as_deref() {
+        if self.config.agent_command.is_some() {
+            if self.config.is_acp_agent() {
+                let rect = layout.pane(1);
+                panes.push(AppPane::Acp(AcpPane::new(
+                    rect.width,
+                    rect.height,
+                    metrics,
+                    &self.terminal_config.theme,
+                )));
+            } else if let Some(agent_command) = self.config.agent_command.as_deref() {
                 let mut pane = TerminalPane::new(
                     "agent",
                     layout.pane(1).width,
@@ -304,14 +592,14 @@ impl WinitGhosttyApp {
                     &self.config.working_directory,
                     self.output_notifier.clone(),
                 )?;
-                panes.push(TerminalPaneController::new(
+                panes.push(AppPane::Terminal(TerminalPaneController::new(
                     PaneRole::AgentTerminal {
                         id: "orchestrator".to_string(),
                         label: "agent".to_string(),
                     },
                     pane,
                     self.config.scroll_sensitivity,
-                ));
+                )));
             }
         }
 
@@ -325,9 +613,7 @@ impl WinitGhosttyApp {
         command: Option<&str>,
     ) -> Result<()> {
         // Deduplicate: if a pane with this id already exists, do nothing.
-        if self.panes.iter().any(
-            |p| matches!(p.role(), PaneRole::AgentTerminal { id: existing, .. } if existing == id),
-        ) {
+        if self.panes.iter().any(|pane| pane.agent_id_matches(id)) {
             info!(%id, "spawn_agent called for existing id – ignoring");
             return Ok(());
         }
@@ -351,14 +637,15 @@ impl WinitGhosttyApp {
             &self.config.working_directory,
             self.output_notifier.clone(),
         )?;
-        self.panes.push(TerminalPaneController::new(
-            PaneRole::AgentTerminal {
-                id: id.to_string(),
-                label,
-            },
-            pane,
-            self.config.scroll_sensitivity,
-        ));
+        self.panes
+            .push(AppPane::Terminal(TerminalPaneController::new(
+                PaneRole::AgentTerminal {
+                    id: id.to_string(),
+                    label,
+                },
+                pane,
+                self.config.scroll_sensitivity,
+            )));
         // Focus the newly created agent pane and ensure we are in a visible split layout.
         self.active_pane = self.panes.len() - 1;
         self.pane_layout_mode = PaneLayoutMode::Split;
@@ -441,7 +728,7 @@ impl WinitGhosttyApp {
     }
 
     fn adjust_layout_mode_for_width(&mut self) {
-        if pane_slot_count(self.panes.len(), self.acp_pane.is_some()) < 2 {
+        if self.panes.len() < 2 {
             return;
         }
 
@@ -482,7 +769,7 @@ impl WinitGhosttyApp {
         let new_layout = SplitLayout::for_window(
             self.width,
             self.height,
-            pane_slot_count(self.panes.len(), self.acp_pane.is_some()),
+            self.panes.len().max(1),
             self.pane_layout_mode,
             self.pane_split_direction,
             self.split_layout_options(),
@@ -506,16 +793,7 @@ impl WinitGhosttyApp {
                 continue;
             }
 
-            if let Some(size) = pane.resize_with_metrics(rect.width, rect.height, metrics) {
-                debug!(pane = pane.title, ?size, "resized terminal pane");
-            }
-        }
-
-        if let Some(acp_pane) = &mut self.acp_pane {
-            let rect = self.layout.pane(1);
-            if rect.width != 0 && rect.height != 0 {
-                acp_pane.resize_with_metrics(rect.width, rect.height, metrics);
-            }
+            pane.resize_with_metrics(rect.width, rect.height, metrics);
         }
 
         if let Some(review_pane) = &mut self.review_pane {
@@ -661,60 +939,10 @@ impl WinitGhosttyApp {
             self.dirty = true;
             self.force_redraw = true;
         }
-        if self.active_pane >= self.panes.len() {
-            if !layout_shortcut_consumed {
-                if let Some(acp_pane) = &mut self.acp_pane {
-                    let step = acp_pane.transcript_viewport_rows().max(1) as isize;
-                    for key in pressed_keys.iter().copied() {
-                        match key {
-                            Key::PageUp => {
-                                acp_pane.scroll_transcript(step);
-                                self.dirty = true;
-                                self.force_redraw = true;
-                                return Ok(());
-                            }
-                            Key::PageDown => {
-                                acp_pane.scroll_transcript(-step);
-                                self.dirty = true;
-                                self.force_redraw = true;
-                                return Ok(());
-                            }
-                            Key::Home => {
-                                acp_pane.scroll_transcript_to_top();
-                                self.dirty = true;
-                                self.force_redraw = true;
-                                return Ok(());
-                            }
-                            Key::End => {
-                                acp_pane.scroll_transcript_to_bottom();
-                                self.dirty = true;
-                                self.force_redraw = true;
-                                return Ok(());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-
-            let paste_requested = !event.repeat
-                && key
-                    .map(|key| paste_requested(key, self.modifiers))
-                    .unwrap_or(false);
-            if paste_requested && !layout_shortcut_consumed {
-                if let Some(text) = read_clipboard_text() {
-                    if let Some(acp_pane) = &mut self.acp_pane {
-                        self.dirty |= acp_pane.paste_text(&text);
-                    }
-                }
-                return Ok(());
-            }
-
-            self.handle_acp_key_event(key, event.text.as_deref(), layout_shortcut_consumed);
+        let Some(active_pane) = self.panes.get_mut(self.active_pane) else {
             return Ok(());
-        }
-
-        let outcome = self.panes[self.active_pane].handle_terminal_key(
+        };
+        let outcome = active_pane.handle_key_event(
             &pressed_keys,
             key,
             event.text.as_deref(),
@@ -803,29 +1031,6 @@ impl WinitGhosttyApp {
         self.events.try_send(Event::Ui(UiEvent::ReviewRequested));
     }
 
-    fn handle_acp_key_event(&mut self, key: Option<Key>, text: Option<&str>, suppress_input: bool) {
-        if suppress_input {
-            return;
-        }
-
-        let Some(acp_pane) = &mut self.acp_pane else {
-            return;
-        };
-
-        if let Some(key) = key {
-            if let Some(prompt) = acp_pane.handle_key(key, self.modifiers) {
-                self.events
-                    .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text: prompt }));
-            }
-        }
-
-        if let Some(text) = text.filter(|text| text.chars().all(|ch| !ch.is_control())) {
-            self.dirty |= acp_pane.handle_text_input(text, self.modifiers);
-        }
-
-        self.dirty = true;
-    }
-
     fn handle_text_commit(&mut self, text: &str) -> Result<()> {
         if self.acp_modal.is_some() {
             return Ok(());
@@ -844,14 +1049,10 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        if self.active_pane >= self.panes.len() {
-            if let Some(acp_pane) = &mut self.acp_pane {
-                self.dirty |= acp_pane.handle_text_input(text, self.modifiers);
-            }
+        let Some(active_pane) = self.panes.get_mut(self.active_pane) else {
             return Ok(());
-        }
-
-        let outcome = self.panes[self.active_pane].handle_text_commit(text, self.modifiers)?;
+        };
+        let outcome = active_pane.handle_text_commit(text, self.modifiers)?;
         self.apply_pane_outcome(outcome);
         Ok(())
     }
@@ -877,28 +1078,6 @@ impl WinitGhosttyApp {
                 }
             }
             return Ok(());
-        }
-
-        if let Some(acp_pane) = &mut self.acp_pane {
-            if let Some((x, y)) = self.cursor_position {
-                if let Some((pane_index, _)) = self.layout.pane_at(x, y) {
-                    if pane_index == 1 {
-                        let (sx, sy) = scroll_delta;
-                        let sy = sy + sx;
-                        if sy.abs() > 1e-4 {
-                            let scaled = -sy / 40.0;
-                            let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
-                            if delta_y == 0 {
-                                delta_y = -sy.signum() as isize;
-                            }
-                            acp_pane.scroll_transcript(delta_y);
-                            self.dirty = true;
-                            self.force_redraw = true;
-                        }
-                        return Ok(());
-                    }
-                }
-            }
         }
 
         let Some((x, y)) = self.cursor_position else {
@@ -1019,6 +1198,10 @@ impl WinitGhosttyApp {
                     self.events
                         .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
                 }
+                PaneCommand::AgentPromptSubmitted { text } => {
+                    self.events
+                        .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text }));
+                }
             }
         }
     }
@@ -1040,8 +1223,7 @@ impl WinitGhosttyApp {
         // rather than being silently swallowed.
         self.output_notifier.clear();
         for pane in self.panes.iter_mut() {
-            if matches!(pane.role(), PaneRole::AgentTerminal { .. }) {
-                let chunks = pane.drain_output_chunks();
+            if let Some(chunks) = pane.drain_agent_output_chunks() {
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
                         self.events
@@ -1052,8 +1234,7 @@ impl WinitGhosttyApp {
                 }
                 self.dirty |= !chunks.is_empty();
             } else {
-                let had_output = pane.drain_output();
-                self.dirty |= had_output;
+                self.dirty |= pane.drain_output();
             }
         }
         if let Some(review_pane) = &mut self.review_pane {
@@ -1062,8 +1243,8 @@ impl WinitGhosttyApp {
         self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.flush_pending_agent_write()?;
-        if let Some(acp_pane) = &mut self.acp_pane {
-            self.dirty |= acp_pane.tick_progress();
+        for pane in self.panes.iter_mut() {
+            self.dirty |= pane.tick_progress();
         }
         Ok(())
     }
@@ -1088,9 +1269,6 @@ impl WinitGhosttyApp {
         if let Some(review_pane) = &mut self.review_pane {
             review_pane.apply_theme(&self.terminal_config.theme);
         }
-        if let Some(acp_pane) = &mut self.acp_pane {
-            acp_pane.apply_theme(&self.terminal_config.theme);
-        }
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
         Ok(true)
@@ -1105,8 +1283,18 @@ impl WinitGhosttyApp {
     }
 
     fn show_pane_focus_chrome(&self) -> bool {
-        matches!(self.pane_layout_mode, PaneLayoutMode::Split)
-            && (self.panes.len() > 1 || self.acp_pane.is_some())
+        matches!(self.pane_layout_mode, PaneLayoutMode::Split) && self.panes.len() > 1
+    }
+
+    fn first_agent_terminal_mut(&mut self) -> Option<&mut TerminalPaneController> {
+        self.panes
+            .iter_mut()
+            .find(|pane| pane.is_agent_terminal())
+            .and_then(AppPane::as_terminal_mut)
+    }
+
+    fn acp_pane_mut(&mut self) -> Option<&mut AcpPane> {
+        self.panes.iter_mut().find_map(AppPane::as_acp_mut)
     }
 
     fn render(&mut self) -> Result<()> {
@@ -1155,19 +1343,6 @@ impl WinitGhosttyApp {
                     self.height,
                     self.layout.pane(index),
                     index == self.active_pane,
-                    self.force_redraw,
-                    redraw_chrome,
-                    &mut self.damage,
-                );
-            }
-            if let Some(acp_pane) = &mut self.acp_pane {
-                redrawn |= acp_pane.draw(
-                    &mut self.font_renderer,
-                    &mut self.buffer,
-                    self.width,
-                    self.height,
-                    self.layout.pane(1),
-                    self.active_pane == 1,
                     self.force_redraw,
                     redraw_chrome,
                     &mut self.damage,
@@ -1238,11 +1413,11 @@ impl WinitGhosttyApp {
             changed = true;
             match command {
                 UiCommand::EditorContextChanged { path, line, column } => {
-                    let Some(agent_pane) = self.panes.get_mut(1) else {
-                        continue;
-                    };
                     let update =
                         format_context_update(&path, line, column, &self.config.working_directory);
+                    let Some(agent_pane) = self.first_agent_terminal_mut() else {
+                        continue;
+                    };
 
                     debug!(path = %path.display(), line, column, "forwarding editor context to agent");
                     agent_pane.write_all(update.as_bytes())?;
@@ -1253,15 +1428,15 @@ impl WinitGhosttyApp {
                     start_line,
                     end_line,
                 } => {
-                    let Some(agent_pane) = self.panes.get_mut(1) else {
-                        continue;
-                    };
                     let update = format_selection_update(
                         &path,
                         start_line,
                         end_line,
                         &self.config.working_directory,
                     );
+                    let Some(agent_pane) = self.first_agent_terminal_mut() else {
+                        continue;
+                    };
 
                     debug!(path = %path.display(), start_line, end_line, "forwarding visual selection to agent");
                     agent_pane.write_all(b"\x15")?;
@@ -1277,17 +1452,12 @@ impl WinitGhosttyApp {
                 } => {
                     // Determine target pane first (specific id or first AgentTerminal).
                     let idx = if let Some(ref want) = target_agent_id {
-                        self.panes
-                            .iter()
-                            .position(|p| matches!(p.role(), PaneRole::AgentTerminal { id, .. } if id == want))
+                        self.panes.iter().position(|p| p.agent_id_matches(want))
                     } else {
                         None
                     };
-                    let idx = idx.or_else(|| {
-                        self.panes
-                            .iter()
-                            .position(|p| matches!(p.role(), PaneRole::AgentTerminal { .. }))
-                    });
+                    let idx =
+                        idx.or_else(|| self.panes.iter().position(AppPane::is_agent_terminal));
 
                     if let Some(i) = idx {
                         if focus_agent {
@@ -1298,21 +1468,23 @@ impl WinitGhosttyApp {
                             self.set_active_pane(i);
                         }
                         debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
-                        self.panes[i].write_all(payload.as_bytes())?;
+                        if let Some(agent_pane) = self.panes[i].as_terminal_mut() {
+                            agent_pane.write_all(payload.as_bytes())?;
+                        }
                     } else {
                         warn!("no agent pane available to receive input");
                     }
                     self.pending_agent_write = None;
                 }
                 UiCommand::AcpTranscriptChunk { kind, text } => {
-                    let Some(acp_pane) = &mut self.acp_pane else {
+                    let Some(acp_pane) = self.acp_pane_mut() else {
                         continue;
                     };
                     debug!(kind, "forwarding ACP transcript chunk to pane");
                     acp_pane.append_transcript_chunk(&kind, &text);
                 }
                 UiCommand::AcpProgress { id, label, active } => {
-                    let Some(acp_pane) = &mut self.acp_pane else {
+                    let Some(acp_pane) = self.acp_pane_mut() else {
                         continue;
                     };
                     debug!(id, label, active, "forwarding ACP progress update to pane");
@@ -1351,15 +1523,14 @@ impl WinitGhosttyApp {
             return Ok(false);
         }
 
-        let Some(agent_pane) = self.panes.get_mut(1) else {
-            self.pending_agent_write = None;
-            return Ok(false);
-        };
         let pending = self
             .pending_agent_write
             .take()
             .expect("pending write exists");
 
+        let Some(agent_pane) = self.first_agent_terminal_mut() else {
+            return Ok(false);
+        };
         agent_pane.write_all(&pending.bytes)?;
         Ok(true)
     }
@@ -1513,10 +1684,6 @@ fn pane_count(config: &Config) -> usize {
     if config.agent_command.is_some() { 2 } else { 1 }
 }
 
-fn pane_slot_count(panes_len: usize, has_acp_pane: bool) -> usize {
-    panes_len.max(if has_acp_pane { 2 } else { 1 })
-}
-
 fn full_window_rect(width: usize, height: usize) -> PaneRect {
     PaneRect {
         x: 0,
@@ -1656,10 +1823,41 @@ mod tests {
     };
 
     #[test]
-    fn pane_slot_count_reserves_acp_pane_index() {
-        assert_eq!(pane_slot_count(1, true), 2);
-        assert_eq!(pane_slot_count(1, false), 1);
-        assert_eq!(pane_slot_count(3, true), 3);
+    fn app_pane_routes_acp_prompt_submission() {
+        let terminal_config = TerminalConfig::default();
+        let mut pane = AppPane::Acp(AcpPane::new(
+            100,
+            50,
+            terminal_config.metrics,
+            &terminal_config.theme,
+        ));
+
+        let no_keys: &[Key] = &[];
+        pane.handle_key_event(
+            no_keys,
+            None,
+            Some("hello"),
+            false,
+            Modifiers::default(),
+            false,
+        )
+        .unwrap();
+        let enter_keys: &[Key] = &[Key::Enter];
+        let outcome = pane
+            .handle_key_event(
+                enter_keys,
+                Some(Key::Enter),
+                None,
+                false,
+                Modifiers::default(),
+                false,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome.command,
+            Some(PaneCommand::AgentPromptSubmitted { ref text }) if text == "hello"
+        ));
     }
 
     #[test]
