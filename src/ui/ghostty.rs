@@ -317,6 +317,7 @@ impl AppPane {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn draw(
         &mut self,
         font_renderer: &mut FontRenderer,

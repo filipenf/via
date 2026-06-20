@@ -1,3 +1,7 @@
+// These rendering helpers operate on a raw pixel buffer plus its geometry and
+// styling parameters, which naturally exceeds the argument-count lint.
+#![allow(clippy::too_many_arguments)]
+
 use libghostty_vt::Terminal;
 use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;

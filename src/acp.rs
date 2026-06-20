@@ -411,22 +411,20 @@ impl AcpClient {
                     id,
                     result,
                     error,
-                } => {
-                    if jsonrpc_id_matches(&id, expected_id) {
-                        if let Some(err) = error {
-                            anyhow::bail!(
-                                "ACP error {}: {}{}",
-                                err.code,
-                                err.message,
-                                err.data
-                                    .map(|data| format!(" data={data}"))
-                                    .unwrap_or_default()
-                            );
-                        }
-                        return Ok(result.unwrap_or(serde_json::Value::Null));
+                } if jsonrpc_id_matches(&id, expected_id) => {
+                    if let Some(err) = error {
+                        anyhow::bail!(
+                            "ACP error {}: {}{}",
+                            err.code,
+                            err.message,
+                            err.data
+                                .map(|data| format!(" data={data}"))
+                                .unwrap_or_default()
+                        );
                     }
-                    // Ignore responses for other IDs (future improvement: queue them)
+                    return Ok(result.unwrap_or(serde_json::Value::Null));
                 }
+                // Ignore responses for other IDs (future improvement: queue them)
                 JsonRpcMessage::Notification {
                     jsonrpc: _,
                     method,

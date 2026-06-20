@@ -61,7 +61,7 @@ fn bench_layout(c: &mut Criterion) {
 
     c.bench_function("layout/focus_after_reference", |b| {
         b.iter(|| {
-            let mut mode = black_box(PaneLayoutMode::AgentMaximized);
+            let mut mode = black_box(PaneLayoutMode::PaneMaximized(1));
             let mut active = black_box(1usize);
             let r: FocusNvimAfterReference =
                 focus_nvim_after_agent_reference(black_box(&mut mode), black_box(&mut active));

@@ -64,8 +64,6 @@ impl PaneSplitDirection {
         }
         if clearly_taller_than_wide(width, height) {
             Self::Horizontal
-        } else if clearly_wider_than_tall(width, height) {
-            Self::Vertical
         } else {
             Self::Vertical
         }

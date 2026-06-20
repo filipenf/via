@@ -103,15 +103,10 @@ pub fn render_acp_modal_buffer(
         .style(Style::default().bg(dim))
         .render(area, &mut buf);
 
-    let modal_w = cols.saturating_sub(8).max(36).min(78);
+    let modal_w = cols.saturating_sub(8).clamp(36, 78);
     let x0 = cols.saturating_sub(modal_w) / 2;
     let inner_w = modal_w.saturating_sub(4).max(8) as usize;
-    let msg_lines = if inner_w > 0 {
-        (modal.message.chars().count() + inner_w - 1) / inner_w
-    } else {
-        1
-    }
-    .max(1);
+    let msg_lines = modal.message.chars().count().div_ceil(inner_w).max(1);
     let body_rows = 1u16 + msg_lines as u16 + 1 + modal.options.len().max(1) as u16 + 2;
     let modal_h = (6u16 + body_rows).min(rows.saturating_sub(4)).max(12);
     let y0 = rows.saturating_sub(modal_h) / 2;

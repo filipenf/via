@@ -146,16 +146,11 @@ impl<'de> Deserialize<'de> for AgentPaneCols {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewBackend {
     Hunk,
+    #[default]
     Nvim,
-}
-
-impl Default for ReviewBackend {
-    fn default() -> Self {
-        Self::Nvim
-    }
 }
 
 impl std::fmt::Display for ReviewBackend {

@@ -124,11 +124,7 @@ impl AcpPane {
         let prefix_width = 2;
         let wrap_width = content_width.saturating_sub(prefix_width).max(1) as usize;
         let char_count = display_text.chars().count();
-        let lines_needed = if wrap_width > 0 {
-            (char_count + wrap_width - 1) / wrap_width
-        } else {
-            1
-        };
+        let lines_needed = char_count.div_ceil(wrap_width);
         let h = (lines_needed as u16 + 2).max(3);
         h.min(self.size.rows.saturating_sub(6)).max(3)
     }
@@ -302,6 +298,7 @@ impl AcpPane {
         self.dirty = true;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &mut self,
         font_renderer: &mut FontRenderer,

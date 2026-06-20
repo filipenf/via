@@ -468,11 +468,7 @@ impl Mediator {
     async fn handle_agent_output(&mut self, chunk: String) {
         self.agent_output_buffer.push_str(&chunk);
 
-        loop {
-            let Some(newline_index) = self.agent_output_buffer.find('\n') else {
-                break;
-            };
-
+        while let Some(newline_index) = self.agent_output_buffer.find('\n') {
             let line = self.agent_output_buffer[..newline_index].trim().to_string();
             self.agent_output_buffer.drain(..=newline_index);
 
