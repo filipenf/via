@@ -84,6 +84,7 @@ impl FontRenderer {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw_char(
         &mut self,
         buffer: &mut [u32],
@@ -162,36 +163,36 @@ impl FontRenderer {
         buffer.set_size(Some(self.cell_width), Some(self.line_height));
         buffer.set_text(&text, &attrs, self.shaping, None);
 
-        for run in buffer.layout_runs() {
-            let Some(glyph) = run.glyphs.first() else {
-                break;
-            };
-            let physical = glyph.physical((0.0, self.baseline - glyph.y), 1.0);
-            let Some(image) = self
+        let physical = {
+            let mut runs = buffer.layout_runs();
+            runs.next()
+                .and_then(|run| run.glyphs.first())
+                .map(|glyph| glyph.physical((0.0, self.baseline - glyph.y), 1.0))
+        };
+        if let Some(physical) = physical {
+            if let Some(image) = self
                 .swash_cache
                 .get_image_uncached(&mut self.font_system, physical.cache_key)
-            else {
-                break;
-            };
+            {
+                let width = image.placement.width as usize;
+                let height = image.placement.height as usize;
+                let mut bitmap: Vec<u8> = match image.content {
+                    SwashContent::Mask => image.data,
+                    SwashContent::Color => image.data.chunks_exact(4).map(|rgba| rgba[3]).collect(),
+                    SwashContent::SubpixelMask => {
+                        image.data.chunks_exact(4).map(|rgba| rgba[1]).collect()
+                    }
+                };
+                boost_glyph_coverage(&mut bitmap, self.coverage_boost);
 
-            let width = image.placement.width as usize;
-            let height = image.placement.height as usize;
-            let mut bitmap: Vec<u8> = match image.content {
-                SwashContent::Mask => image.data,
-                SwashContent::Color => image.data.chunks_exact(4).map(|rgba| rgba[3]).collect(),
-                SwashContent::SubpixelMask => {
-                    image.data.chunks_exact(4).map(|rgba| rgba[1]).collect()
-                }
-            };
-            boost_glyph_coverage(&mut bitmap, self.coverage_boost);
-
-            return GlyphBitmap {
-                left: physical.x + image.placement.left,
-                top: physical.y - image.placement.top,
-                width,
-                height,
-                bitmap,
-            };
+                return GlyphBitmap {
+                    left: physical.x + image.placement.left,
+                    top: physical.y - image.placement.top,
+                    width,
+                    height,
+                    bitmap,
+                };
+            }
         }
 
         GlyphBitmap {

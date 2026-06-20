@@ -1,4 +1,5 @@
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -6,9 +7,8 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result as AnyResult};
 use serde::Deserialize;
 
-/// Embedded copy of `nvim/context_bridge.lua` (see `include_str!` below). At runtime we write it
-/// to a path under the via runtime directory (see `runtime_base_dir`) so Neovim can `luafile` it.
-static EMBEDDED_CONTEXT_BRIDGE_PATH: OnceLock<PathBuf> = OnceLock::new();
+/// Ensures the embedded Lua files are written to disk exactly once per process.
+static LUA_ASSETS_INITIALIZED: OnceLock<()> = OnceLock::new();
 
 /// Directory for sockets, the context bridge script, and other per-process files.
 ///
@@ -40,6 +40,13 @@ pub fn via_data_dir() -> PathBuf {
     env::temp_dir().join("via")
 }
 
+/// Stable directory for shared Lua modules that Neovim can require.
+/// Located under the via data directory so it is the same for every via session
+/// and can be shared across all running instances.
+pub fn lua_dir() -> PathBuf {
+    via_data_dir().join("lua")
+}
+
 /// Ensure the runtime directory exists before sockets are bound or scripts are written.
 pub fn ensure_runtime_dir() -> std::io::Result<()> {
     std::fs::create_dir_all(runtime_base_dir())
@@ -61,6 +68,7 @@ pub struct Config {
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
+    pub nvim_via_module_path: PathBuf,
     pub lsp_bridge_socket_path: PathBuf,
     pub working_directory: PathBuf,
 }
@@ -138,16 +146,11 @@ impl<'de> Deserialize<'de> for AgentPaneCols {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ReviewBackend {
     Hunk,
+    #[default]
     Nvim,
-}
-
-impl Default for ReviewBackend {
-    fn default() -> Self {
-        Self::Nvim
-    }
 }
 
 impl std::fmt::Display for ReviewBackend {
@@ -336,6 +339,9 @@ impl Config {
         let nvim_context_bridge_path = env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_context_bridge_path);
+        let nvim_via_module_path = env::var_os("VIA_NVIM_VIA_MODULE")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_nvim_via_module_path);
         let lsp_bridge_socket_path = env::var_os("VIA_LSP_BRIDGE_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_lsp_bridge_socket_path);
@@ -350,6 +356,7 @@ impl Config {
             nvim_socket_path,
             editor_socket_path,
             nvim_context_bridge_path,
+            nvim_via_module_path,
             lsp_bridge_socket_path,
             working_directory,
         })
@@ -411,28 +418,46 @@ fn default_editor_socket_path() -> PathBuf {
     runtime_base_dir().join(format!("via-editor-{}.sock", std::process::id()))
 }
 
-fn default_nvim_context_bridge_path() -> PathBuf {
-    EMBEDDED_CONTEXT_BRIDGE_PATH
-        .get_or_init(|| {
-            let dir = runtime_base_dir();
-            let path = dir.join(format!("via-context-bridge-{}.lua", std::process::id()));
-            std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
-                panic!(
-                    "failed to create via runtime directory {}: {err}",
-                    dir.display()
-                );
-            });
-            std::fs::write(&path, include_str!("../nvim/context_bridge.lua")).unwrap_or_else(
-                |err| {
-                    panic!(
-                        "failed to write embedded nvim/context_bridge.lua to {}: {err}",
-                        path.display()
-                    );
-                },
+fn ensure_lua_assets() {
+    LUA_ASSETS_INITIALIZED.get_or_init(|| {
+        let dir = lua_dir();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|err| {
+            panic!(
+                "failed to create via lua directory {}: {err}",
+                dir.display()
             );
-            path
-        })
-        .clone()
+        });
+        for (filename, content) in [
+            (
+                "context_bridge.lua",
+                include_str!("../nvim/context_bridge.lua"),
+            ),
+            ("via.lua", include_str!("../nvim/via.lua")),
+        ] {
+            let path = dir.join(filename);
+            if !path.exists() {
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                {
+                    if f.write_all(content.as_bytes()).is_err() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                }
+            }
+        }
+    });
+}
+
+fn default_nvim_context_bridge_path() -> PathBuf {
+    ensure_lua_assets();
+    lua_dir().join("context_bridge.lua")
+}
+
+fn default_nvim_via_module_path() -> PathBuf {
+    ensure_lua_assets();
+    lua_dir().join("via.lua")
 }
 
 fn default_lsp_bridge_socket_path() -> PathBuf {
@@ -462,7 +487,7 @@ mod tests {
         let path = default_nvim_context_bridge_path();
 
         assert!(
-            path.ends_with(format!("via-context-bridge-{}.lua", std::process::id())),
+            path.ends_with("context_bridge.lua"),
             "unexpected path: {}",
             path.display()
         );
@@ -640,6 +665,7 @@ scroll_sensitivity = 1.5
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         };
@@ -658,6 +684,7 @@ scroll_sensitivity = 1.5
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         };

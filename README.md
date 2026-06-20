@@ -6,12 +6,11 @@ VT engine.
 ## why via?
 
 I built via because I didn't like the way most AI plugins for nvim work. The
-fundamental problem is that managing the AI panes inside nvim is tricky, you
-get a lot of flickering, screen incorrectly laid out and hard to navigate, etc.
+fundamental problem is that managing the AI panes inside nvim is tricky, you get
+a lot of flickering, screen incorrectly laid out and hard to navigate, etc.
 
-So via is my attempt to solve those problems by bridging the AI agent with
-nvim. It creates separate panes (libghostty terminals) for each and connects
-them.
+So via is my attempt to solve those problems by bridging the AI agent with nvim.
+It creates separate panes (libghostty terminals) for each and connects them.
 
 **neovim to Agent**
 
@@ -19,8 +18,37 @@ them.
 
 **Agent to nvim**
 
-- Shift+click on a file name will open that file in nvim and focus the nvim pane (fullscreen nvim if the agent was fullscreen, otherwise keep the split)
-- Shift+click on a symbol will open the Symbol search pane in neovim with the same focus behavior
+- Shift+click on a file name will open that file in nvim and focus the nvim pane
+  (fullscreen nvim if the agent was fullscreen, otherwise keep the split)
+- Shift+click on a symbol will open the Symbol search pane in neovim with the
+  same focus behavior
+
+## Multi-agent orchestration
+
+via supports spawning additional named agent panes at runtime. An orchestrator
+agent (or Neovim) can request new panes via the `SpawnAgent` protocol message or
+the Lua API. Spawned panes inherit the configured agent command (or accept an
+override) and appear in the shared secondary area (right column for vertical
+splits, bottom row for horizontal splits).
+
+**Navigation**
+
+- `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent).
+- `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2
+  for the first agent, etc.).
+- `Alt+J` toggles the split direction.
+
+**Lua API for plugins**
+
+`require('via')` is available inside any via-launched Neovim session (the module
+is injected into `~/.local/share/via/lua/` at startup). Example usage:
+
+```lua
+local via = require('via')
+via.agent.spawn("reviewer", "reviewer")                 -- spawn a reviewer pane
+via.agent.send("reviewer", "please review this diff", false) -- send without stealing focus
+via.agent.send(nil, "hello orchestrator")               -- send to the primary agent (focus=true by default)
+```
 
 ## Work in progress
 
@@ -30,7 +58,8 @@ it has some rough edges still. Some things I have planned:
 - Review process: make it easier to switch between agent/review and send
   feedback to the agent directly from the vim pane (may use some existing nvim
   plugin for this)
-- Diagnostics integration: `via session diagnostics --json`; global agent skill auto-install (`via agent skill install` / `status`)
+- Diagnostics integration: `via session diagnostics --json`; global agent skill
+  auto-install (`via agent skill install` / `status`)
 - Better use of LSP: the symbol search could be further updated to highlight
   known symbols on the agent pane
 
@@ -38,14 +67,15 @@ it has some rough edges still. Some things I have planned:
 
 via is primarily developed and tested on Linux (Wayland compositors such as
 Hyprland on Omarchy, with an X11 fallback via winit). Other Linux distributions
-and operating systems (macOS, Windows) are not regularly tested; you will
-likely need to build from source. See [CONTRIBUTING.md](CONTRIBUTING.md) for
+and operating systems (macOS, Windows) are not regularly tested; you will likely
+need to build from source. See [CONTRIBUTING.md](CONTRIBUTING.md) for
 prerequisites and platform notes.
 
 ## Build requirements
 
-- Rust 
-- [Zig 0.15.2](https://ziglang.org) — required by the vendored `libghostty-vt` build.
+- Rust
+- [Zig 0.15.2](https://ziglang.org) — required by the vendored `libghostty-vt`
+  build.
 - `git` (used by the `libghostty-vt-sys` build script to fetch ghostty sources).
 
 If you use [mise](https://mise.jdx.dev/), the project's `.mise.toml` pins the
@@ -110,8 +140,8 @@ Equivalent CLI/env names:
 - `--review-backend` / `VIA_REVIEW_BACKEND`
 
 Use `--persist` to write the resolved user-facing config to `via.conf` before
-running. For example, this writes `agent = "opencode"` plus the resolved defaults
-for the other user-facing settings:
+running. For example, this writes `agent = "opencode"` plus the resolved
+defaults for the other user-facing settings:
 
 ```sh
 via --agent opencode --persist
@@ -119,8 +149,8 @@ via --agent opencode --persist
 
 Neovim bridge scripts (`nvim/*.lua`) are embedded at compile time; the context
 bridge is written to via's data directory (`$XDG_DATA_HOME/via`, or
-`~/.local/share/via`) when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE`
-if you want to load a custom script from disk during development.
+`~/.local/share/via`) when needed. Override with `VIA_NVIM_CONTEXT_BRIDGE` if
+you want to load a custom script from disk during development.
 
 ## Release
 
@@ -173,20 +203,26 @@ VIA_FONT_COVERAGE_BOOST=0 cargo run
 
 Possible tweaks:
 
-- `VIA_FONT_SCALE`: overrides the reported window scale used for font DPI, e.g. `1.33`, `1.6`, or `2.0`.
-- `VIA_FONT_PIXEL_SCALE`: multiplies the computed glyph pixel size after DPI conversion.
+- `VIA_FONT_SCALE`: overrides the reported window scale used for font DPI, e.g.
+  `1.33`, `1.6`, or `2.0`.
+- `VIA_FONT_PIXEL_SCALE`: multiplies the computed glyph pixel size after DPI
+  conversion.
 - `VIA_CELL_WIDTH_SCALE`: multiplies the computed terminal cell width only.
 - `VIA_CELL_HEIGHT_SCALE`: multiplies the computed terminal cell height only.
-- `VIA_BASELINE_RATIO`: controls baseline placement inside each cell. Default: `0.73`.
-- `VIA_FONT_HINTING`: sets cosmic-text metrics hinting. Values: `enabled` or `disabled`.
-- `VIA_FONT_COVERAGE_BOOST`: controls via's glyph coverage boost. Default: `0.2`; use `0` to disable.
-- `VIA_FONT_SHAPING`: selects cosmic-text shaping. Values: `advanced` or `basic`.
+- `VIA_BASELINE_RATIO`: controls baseline placement inside each cell. Default:
+  `0.73`.
+- `VIA_FONT_HINTING`: sets cosmic-text metrics hinting. Values: `enabled` or
+  `disabled`.
+- `VIA_FONT_COVERAGE_BOOST`: controls via's glyph coverage boost. Default:
+  `0.2`; use `0` to disable.
+- `VIA_FONT_SHAPING`: selects cosmic-text shaping. Values: `advanced` or
+  `basic`.
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for build instructions, testing,
-architecture pointers, and how to submit changes. Issues and PRs are welcome
-— small, focused contributions (layout, links, ACP surface, review backends,
+architecture pointers, and how to submit changes. Issues and PRs are welcome —
+small, focused contributions (layout, links, ACP surface, review backends,
 diagnostics, docs, tests) are especially appreciated.
 
 ## License

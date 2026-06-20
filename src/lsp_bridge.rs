@@ -12,6 +12,15 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
+type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>;
+
+type ListenerHandles = (
+    LspBridgeHandle,
+    JoinHandle<()>,
+    Arc<Mutex<LspBridgeState>>,
+    mpsc::Receiver<Vec<LspClientInfo>>,
+);
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LspClientInfo {
     pub id: i32,
@@ -32,6 +41,7 @@ pub struct CapabilitiesSummary {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum LspBridgeMessage {
     LspClients {
         clients: Vec<LspClientInfo>,
@@ -56,14 +66,9 @@ struct OutgoingRequest {
     client_id: Option<i32>,
 }
 
+#[derive(Default)]
 pub struct LspBridgeState {
     pub clients: Vec<LspClientInfo>,
-}
-
-impl Default for LspBridgeState {
-    fn default() -> Self {
-        Self { clients: vec![] }
-    }
 }
 
 #[derive(Clone)]
@@ -71,7 +76,7 @@ impl Default for LspBridgeState {
 pub struct LspBridgeHandle {
     outgoing: mpsc::Sender<OutgoingRequest>,
     state: Arc<Mutex<LspBridgeState>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>,
+    pending: PendingRequests,
     next_request_id: Arc<AtomicU64>,
 }
 
@@ -132,15 +137,7 @@ impl LspBridgeHandle {
     }
 }
 
-pub fn spawn_listener(
-    socket_path: PathBuf,
-    working_directory: PathBuf,
-) -> (
-    LspBridgeHandle,
-    JoinHandle<()>,
-    Arc<Mutex<LspBridgeState>>,
-    mpsc::Receiver<Vec<LspClientInfo>>,
-) {
+pub fn spawn_listener(socket_path: PathBuf, working_directory: PathBuf) -> ListenerHandles {
     let (out_tx, out_rx) = mpsc::channel::<OutgoingRequest>(32);
     let (client_updates_tx, client_updates_rx) = mpsc::channel::<Vec<LspClientInfo>>(16);
     let state = Arc::new(Mutex::new(LspBridgeState::default()));
@@ -177,7 +174,7 @@ async fn run_listener(
     socket_path: PathBuf,
     _working_directory: PathBuf,
     mut out_rx: mpsc::Receiver<OutgoingRequest>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>,
+    pending: PendingRequests,
     state: Arc<Mutex<LspBridgeState>>,
     client_updates: mpsc::Sender<Vec<LspClientInfo>>,
 ) -> Result<()> {
@@ -228,7 +225,7 @@ async fn run_listener(
 async fn reader_loop(
     reader: OwnedReadHalf,
     state: Arc<Mutex<LspBridgeState>>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<serde_json::Value, String>>>>>,
+    pending: PendingRequests,
     client_updates: mpsc::Sender<Vec<LspClientInfo>>,
 ) -> Result<()> {
     let mut lines = BufReader::new(reader).lines();

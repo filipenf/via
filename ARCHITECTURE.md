@@ -209,6 +209,11 @@ and are mitigated by the native + GPU nature of the stack.
   `hunk`.
 - A "via-editor" skill is auto-installed for ACP agents so they can pull
   diagnostics without hallucinating file state.
+- Multi-agent spawning: the orchestrator (primary agent) or Neovim Lua
+  (`require('via').agent.spawn(...)`) can request additional visible agent
+  panes at runtime. Each pane carries a `PaneRole::AgentTerminal { id, label }`
+  and is routed via the same mediator/UI command path. The Lua module talks
+  over the editor Unix socket using the existing JSON event protocol.
 - The vendored Ghostty VT bits are pinned to a specific git rev of a
   libghostty-rs wrapper. This gives a single static binary but makes clean
   builds heavy (Zig + git).

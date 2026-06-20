@@ -223,6 +223,7 @@ impl TerminalPane {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &mut self,
         font_renderer: &mut FontRenderer,
@@ -619,6 +620,7 @@ impl TerminalView {
             .unwrap_or(false)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn draw(
         &mut self,
         font_renderer: &mut FontRenderer,
@@ -685,9 +687,7 @@ impl TerminalView {
         let mut row_ref = None;
         for _ in 0..=row {
             row_ref = row_iter.next();
-            if row_ref.is_none() {
-                return None;
-            }
+            row_ref?;
         }
 
         let mut cell_iter = self.cells.update(row_ref?).ok()?;
@@ -699,7 +699,7 @@ impl TerminalView {
                 break;
             }
 
-            text.push(first_grapheme(&cell_ref).unwrap_or(' '));
+            text.push(first_grapheme(cell_ref).unwrap_or(' '));
             col += 1;
         }
 

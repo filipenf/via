@@ -74,6 +74,12 @@ impl EditorState {
             EditorEvent::BufferSendRequested { .. } => {
                 // one-shot request, no state to update
             }
+            EditorEvent::AgentSend { .. } => {
+                // one-shot request, no state to update
+            }
+            EditorEvent::SpawnAgent { .. } => {
+                // one-shot request, handled by mediator/ui
+            }
         }
     }
 }
@@ -105,6 +111,24 @@ enum WireEditorEvent {
         #[serde(default)]
         end_line: Option<u32>,
     },
+    AgentSend {
+        #[serde(default)]
+        agent_id: Option<String>,
+        content: String,
+        #[serde(default = "default_true")]
+        focus: bool,
+    },
+    SpawnAgent {
+        id: String,
+        #[serde(default)]
+        role: Option<String>,
+        #[serde(default)]
+        command: Option<String>,
+    },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 pub fn spawn_listener(
@@ -223,6 +247,18 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             start_line,
             end_line,
         },
+        WireEditorEvent::AgentSend {
+            agent_id,
+            content,
+            focus,
+        } => EditorEvent::AgentSend {
+            agent_id,
+            content,
+            focus,
+        },
+        WireEditorEvent::SpawnAgent { id, role, command } => {
+            EditorEvent::SpawnAgent { id, role, command }
+        }
     })
 }
 

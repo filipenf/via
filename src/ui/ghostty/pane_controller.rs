@@ -12,10 +12,10 @@ use super::input::{
 use super::links::ReferenceTarget;
 use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PaneRole {
     Editor,
-    AgentTerminal,
+    AgentTerminal { id: String, label: String },
     ReviewTerminal,
 }
 
@@ -34,6 +34,9 @@ pub(super) enum PaneCommand {
     },
     SymbolOpenRequested {
         symbol: String,
+    },
+    AgentPromptSubmitted {
+        text: String,
     },
 }
 
@@ -72,8 +75,8 @@ impl TerminalPaneController {
         }
     }
 
-    pub(super) fn role(&self) -> PaneRole {
-        self.role
+    pub(super) fn role(&self) -> &PaneRole {
+        &self.role
     }
 
     #[cfg(test)]
@@ -181,7 +184,7 @@ impl TerminalPaneController {
             PaneRole::ReviewTerminal => {
                 self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => {
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
                 let forwarded =
                     self.forward_terminal_wheel_steps(steps, local_x, local_y, modifiers)?;
                 if forwarded.dirty {
@@ -235,7 +238,7 @@ impl TerminalPaneController {
             PaneRole::ReviewTerminal => {
                 self.forward_terminal_mouse_input(state, button, local_x, local_y, modifiers)
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => Ok(self.handle_local_mouse_input(
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => Ok(self.handle_local_mouse_input(
                 state,
                 button,
                 local_x,
@@ -271,7 +274,7 @@ impl TerminalPaneController {
                     command: None,
                 })
             }
-            PaneRole::Editor | PaneRole::AgentTerminal => {
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
                 if self.mouse.held_button != Some(PaneMouseButton::Left) {
                     return Ok(PaneEventOutcome::default());
                 }
@@ -396,7 +399,8 @@ impl TerminalPaneController {
 
         let mut outcome = PaneEventOutcome::default();
         if just_pressed {
-            let is_reference_click = self.role == PaneRole::AgentTerminal && modifiers.shift;
+            let is_reference_click =
+                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.shift;
             if !is_reference_click {
                 outcome.dirty |= self.start_selection(local_x, local_y);
             }
@@ -481,7 +485,7 @@ impl TerminalPaneController {
     /// keys move the viewport again.
     fn intercepts_viewport_navigation_keys(&self) -> bool {
         match self.role {
-            PaneRole::AgentTerminal => !self.pane.is_alt_screen(),
+            PaneRole::AgentTerminal { .. } => !self.pane.is_alt_screen(),
             PaneRole::ReviewTerminal => false,
             PaneRole::Editor => !self.pane.is_viewport_at_bottom(),
         }
@@ -522,7 +526,10 @@ mod tests {
 
     #[test]
     fn agent_intercepts_page_keys_for_viewport_scroll() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         let outcome = pane
             .handle_terminal_key(
                 &[Key::PageUp],
@@ -538,7 +545,10 @@ mod tests {
 
     #[test]
     fn agent_forwards_page_keys_on_alt_screen() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         pane.process_for_test(b"\x1b[?1049h", true);
         assert!(pane.is_alt_screen());
 
@@ -597,7 +607,10 @@ mod tests {
 
     #[test]
     fn single_notch_scrolls_one_line() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
         assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
         assert_eq!(pane.accumulate_wheel_steps((0.0, 0.0)), 0);
@@ -605,7 +618,10 @@ mod tests {
 
     #[test]
     fn small_pixel_deltas_accumulate_into_one_step() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         // Four sub-threshold pixel events that together cross one step.
         assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
         assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
@@ -615,7 +631,10 @@ mod tests {
 
     #[test]
     fn direction_reversal_drops_carry() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 30.0)), 0);
         // Reversing direction should not have to "pay back" the prior carry.
         assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
@@ -623,7 +642,13 @@ mod tests {
 
     #[test]
     fn scroll_sensitivity_scales_steps() {
-        let mut pane = test_controller_with_sensitivity(PaneRole::AgentTerminal, 0.5);
+        let mut pane = test_controller_with_sensitivity(
+            PaneRole::AgentTerminal {
+                id: "agent".to_string(),
+                label: "agent".to_string(),
+            },
+            0.5,
+        );
         // Half sensitivity needs two notches for one step.
         assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 0);
         assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
@@ -631,7 +656,10 @@ mod tests {
 
     #[test]
     fn agent_role_opens_symbol_references_on_shift_click() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         pane.process_for_test(b"see Foo::bar here", true);
 
         let without_shift = pane
@@ -693,7 +721,10 @@ mod tests {
 
     #[test]
     fn agent_role_opens_file_references_on_shift_click() {
-        let mut pane = test_controller(PaneRole::AgentTerminal);
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+        });
         pane.process_for_test(b"open src/main.rs:42", true);
         let x = 6 * test_metrics().cell_width;
 
@@ -788,7 +819,13 @@ mod tests {
 
     #[test]
     fn local_wheel_falls_back_to_viewport_without_mouse_reporting() {
-        for role in [PaneRole::Editor, PaneRole::AgentTerminal] {
+        for role in [
+            PaneRole::Editor,
+            PaneRole::AgentTerminal {
+                id: "agent".to_string(),
+                label: "agent".to_string(),
+            },
+        ] {
             let mut pane = test_controller(role);
 
             let outcome = pane
@@ -802,7 +839,13 @@ mod tests {
 
     #[test]
     fn local_wheel_forwards_when_mouse_reporting_is_enabled() {
-        for role in [PaneRole::Editor, PaneRole::AgentTerminal] {
+        for role in [
+            PaneRole::Editor,
+            PaneRole::AgentTerminal {
+                id: "agent".to_string(),
+                label: "agent".to_string(),
+            },
+        ] {
             let mut pane = test_controller(role);
             pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
 

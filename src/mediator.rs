@@ -429,8 +429,30 @@ impl Mediator {
                     self.send_ui_command(UiCommand::AgentInput {
                         payload,
                         focus_agent: true,
+                        target_agent_id: None,
                     });
                 }
+            }
+            EditorEvent::AgentSend {
+                agent_id,
+                content,
+                focus,
+            } => {
+                // Route to the specific agent pane (by id) if provided.
+                self.send_ui_command(UiCommand::AgentInput {
+                    payload: content.clone(),
+                    focus_agent: *focus,
+                    target_agent_id: agent_id.clone(),
+                });
+            }
+            EditorEvent::SpawnAgent { id, role, command } => {
+                info!(%id, role = ?role, command = ?command, "spawn agent requested");
+                // Handled in UI layer via UiCommand in a follow-up step.
+                self.send_ui_command(UiCommand::SpawnAgent {
+                    id: id.clone(),
+                    role: role.clone(),
+                    command: command.clone(),
+                });
             }
         }
 
@@ -446,11 +468,7 @@ impl Mediator {
     async fn handle_agent_output(&mut self, chunk: String) {
         self.agent_output_buffer.push_str(&chunk);
 
-        loop {
-            let Some(newline_index) = self.agent_output_buffer.find('\n') else {
-                break;
-            };
-
+        while let Some(newline_index) = self.agent_output_buffer.find('\n') {
             let line = self.agent_output_buffer[..newline_index].trim().to_string();
             self.agent_output_buffer.drain(..=newline_index);
 
@@ -467,6 +485,7 @@ impl Mediator {
                 self.send_ui_command(UiCommand::AgentInput {
                     payload: response,
                     focus_agent: false,
+                    target_agent_id: None,
                 });
             }
         }
@@ -623,6 +642,7 @@ mod tests {
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
         }

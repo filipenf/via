@@ -538,8 +538,8 @@ fn narrow_call_wrapped_file_path(token: &str) -> Option<(usize, usize, String)> 
     let mut depth = 0usize;
     let mut close_idx: Option<usize> = None;
 
-    for i in open_idx..chars.len() {
-        match chars[i] {
+    for (i, c) in chars.iter().copied().enumerate().skip(open_idx) {
+        match c {
             '(' => depth += 1,
             ')' => {
                 depth -= 1;

@@ -79,7 +79,7 @@ mod tests {
     use super::*;
     use crate::cli::agent::SkillCommand;
     use clap::Parser;
-    use std::path::PathBuf;
+    use std::path::Path;
 
     #[test]
     fn parses_session_list_json() {
@@ -110,7 +110,7 @@ mod tests {
                     json: true,
                     file: Some(path),
                 },
-            }) if path == PathBuf::from("src/main.rs")
+            }) if path == Path::new("src/main.rs")
         ));
     }
 

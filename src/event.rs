@@ -63,6 +63,9 @@ pub enum UiCommand {
     AgentInput {
         payload: String,
         focus_agent: bool,
+        /// If Some(id), route to the AgentTerminal pane whose id matches.
+        /// If None or not found, fall back to the first agent pane.
+        target_agent_id: Option<String>,
     },
     AcpTranscriptChunk {
         kind: String,
@@ -80,6 +83,12 @@ pub enum UiCommand {
         message: String,
         options: Vec<AcpPermissionOption>,
         kind: AcpModalKind,
+    },
+    /// Request from orchestrator or Lua to spawn a new agent pane.
+    SpawnAgent {
+        id: String,
+        role: Option<String>,
+        command: Option<String>,
     },
 }
 
@@ -105,6 +114,16 @@ pub enum EditorEvent {
         path: PathBuf,
         start_line: Option<u32>,
         end_line: Option<u32>,
+    },
+    AgentSend {
+        agent_id: Option<String>,
+        content: String,
+        focus: bool,
+    },
+    SpawnAgent {
+        id: String,
+        role: Option<String>,
+        command: Option<String>,
     },
 }
 
