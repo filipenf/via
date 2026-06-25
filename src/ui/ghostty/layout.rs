@@ -1,5 +1,6 @@
 use super::input::Key;
 use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
+use tracing::info;
 
 const SPLIT_GAP: usize = 2;
 /// Minimum leading (editor) pane width in columns for vertical split mode.
@@ -275,6 +276,13 @@ pub(super) fn handle_layout_shortcuts(
 
             if let PaneLayoutMode::PaneMaximized(i) = next_mode {
                 if i >= pane_count {
+                    if let Some(digit) = key_to_digit(*key) {
+                        info!(
+                            digit,
+                            pane_count,
+                            "layout shortcut ignored: no pane at this index (spawn the agent first?)"
+                        );
+                    }
                     continue;
                 }
             }
@@ -306,6 +314,11 @@ pub(super) fn handle_layout_shortcuts(
                         *active_pane = target;
                         return true;
                     }
+                    info!(
+                        digit,
+                        pane_count,
+                        "focus shortcut ignored: no pane at this index (spawn the agent first?)"
+                    );
                 }
             }
         }

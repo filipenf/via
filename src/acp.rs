@@ -95,8 +95,28 @@ pub struct NewSessionParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ConfigOption {
+    id: String,
+    #[serde(default)]
+    current_value: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewSessionResult {
     pub session_id: String,
+    #[serde(default)]
+    config_options: Vec<ConfigOption>,
+}
+
+impl NewSessionResult {
+    /// Selected model from `session/new` config options (e.g. `lemonade/Gemma-…`).
+    pub fn selected_model(&self) -> Option<String> {
+        self.config_options
+            .iter()
+            .find(|option| option.id == "model")
+            .and_then(|option| option.current_value.clone())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -174,23 +194,9 @@ impl AcpClient {
         for (key, value) in extra_env {
             child_cmd.env(key, value);
         }
-        let mut child = child_cmd
+        let child = child_cmd
             .spawn()
             .with_context(|| format!("failed to spawn ACP agent: {command}"))?;
-
-        // Start a background task that logs everything the agent prints to stderr.
-        // This is crucial for seeing error messages, prompts, or crashes.
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if !line.trim().is_empty() {
-                        tracing::warn!(stderr = %line, "ACP agent stderr");
-                    }
-                }
-            });
-        }
 
         debug!(command, "ACP agent process started");
         Ok(Self {
@@ -249,6 +255,8 @@ impl AcpClient {
     pub fn spawn_reader(&mut self, events: EventSender) {
         let agent_id = self.agent_id.clone();
         if let Some(stdout) = self.child.stdout.take() {
+            let events = events.clone();
+            let agent_id = agent_id.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
@@ -260,6 +268,30 @@ impl AcpClient {
                     }
                 }
                 tracing::debug!(agent_id, "ACP agent stdout closed");
+            });
+        }
+        if let Some(stderr) = self.child.stderr.take() {
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    tracing::warn!(agent_id, stderr = %line, "ACP agent stderr");
+                    if looks_like_provider_error(line) {
+                        events
+                            .send(Event::Agent(AgentEvent::acp(
+                                &agent_id,
+                                AcpAgentEvent::SessionStatus {
+                                    provider_error: Some(truncate_provider_error(line)),
+                                },
+                            )))
+                            .await;
+                    }
+                }
+                tracing::debug!(agent_id, "ACP agent stderr closed");
             });
         }
     }
@@ -590,20 +622,32 @@ fn log_acp_line(line: &str, agent_id: &str) -> Option<AgentEvent> {
         JsonRpcMessage::Response {
             id, result, error, ..
         } => {
-            tracing::debug!(?id, ?result, ?error, "ACP response from agent");
-            if result
-                .as_ref()
-                .and_then(|result| result.get("stopReason"))
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-            {
-                Some(AcpAgentEvent::Progress {
-                    id: "__turn".to_string(),
-                    label: String::new(),
-                    active: false,
+            if let Some(err) = &error {
+                tracing::warn!(
+                    ?id,
+                    code = err.code,
+                    message = %err.message,
+                    "ACP JSON-RPC error from agent"
+                );
+                Some(AcpAgentEvent::SessionStatus {
+                    provider_error: Some(truncate_provider_error(&err.message)),
                 })
             } else {
-                None
+                tracing::debug!(?id, ?result, "ACP response from agent");
+                if result
+                    .as_ref()
+                    .and_then(|result| result.get("stopReason"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                {
+                    Some(AcpAgentEvent::Progress {
+                        id: "__turn".to_string(),
+                        label: String::new(),
+                        active: false,
+                    })
+                } else {
+                    None
+                }
             }
         }
     }
@@ -723,6 +767,27 @@ fn log_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
     }
 }
 
+fn looks_like_provider_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("cannot connect")
+        || lower.contains("failed")
+        || lower.contains("unable to connect")
+}
+
+fn truncate_provider_error(message: &str) -> String {
+    const MAX_LEN: usize = 160;
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_LEN {
+        collapsed
+    } else {
+        format!(
+            "{}…",
+            collapsed.chars().take(MAX_LEN.saturating_sub(1)).collect::<String>()
+        )
+    }
+}
+
 fn content_text(content: &serde_json::Value) -> Option<&str> {
     match content.get("type").and_then(serde_json::Value::as_str) {
         Some("text") => content.get("text").and_then(serde_json::Value::as_str),
@@ -826,5 +891,34 @@ mod tests {
                     && prompt == "Which?"
             ));
         }
+    }
+
+    #[test]
+    fn new_session_result_extracts_selected_model() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [
+                {"id": "model", "name": "Model", "currentValue": "lemonade/Gemma-4-26B-A4B-it-GGUF"}
+            ]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+        assert_eq!(
+            result.selected_model().as_deref(),
+            Some("lemonade/Gemma-4-26B-A4B-it-GGUF")
+        );
+    }
+
+    #[test]
+    fn log_acp_line_surfaces_jsonrpc_error_as_session_status() {
+        let line = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Cannot connect to API"}}"#;
+        let event = log_acp_line(line, "reviewer").expect("expected session status");
+        assert!(matches!(
+            event,
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::SessionStatus { provider_error }
+            } if agent_id == "reviewer"
+                && provider_error.as_deref() == Some("Cannot connect to API")
+        ));
     }
 }

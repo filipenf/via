@@ -590,8 +590,11 @@ impl WinitGhosttyApp {
         self.resize_terminals(size.width as usize, size.height as usize);
 
         if self.panes.is_empty() {
-            self.panes =
-                self.create_panes(self.width, self.height, self.terminal_config.metrics)?;
+            self.panes = vec![self.create_editor_pane(
+                self.width,
+                self.height,
+                self.terminal_config.metrics,
+            )?];
             let nvim_args = nvim_args(&self.config);
             let Some(editor_pane) = self.panes[0].as_terminal_mut() else {
                 return Err(anyhow!("editor pane is not a terminal"));
@@ -603,8 +606,16 @@ impl WinitGhosttyApp {
                 &[],
                 self.output_notifier.clone(),
             )?;
-            self.relayout();
-            self.write_agent_registry();
+            if let Some(agent_command) = self.config.agent_command.clone() {
+                self.create_agent_pane(
+                    "orchestrator",
+                    Some("orchestrator"),
+                    Some(agent_command.as_str()),
+                )?;
+            } else {
+                self.relayout();
+                self.write_agent_registry();
+            }
             info!(panes = self.panes.len(), "native terminal window ready");
         }
 
@@ -617,12 +628,12 @@ impl WinitGhosttyApp {
         Ok(())
     }
 
-    fn create_panes(
+    fn create_editor_pane(
         &self,
         width: usize,
         height: usize,
         metrics: TerminalMetrics,
-    ) -> Result<Vec<AppPane>> {
+    ) -> Result<AppPane> {
         let layout = SplitLayout::for_window(
             width,
             height,
@@ -631,7 +642,7 @@ impl WinitGhosttyApp {
             PaneSplitDirection::for_window(width, height),
             self.split_layout_options(),
         );
-        let mut panes = vec![AppPane::Terminal(TerminalPaneController::new(
+        Ok(AppPane::Terminal(TerminalPaneController::new(
             PaneRole::Editor,
             TerminalPane::new(
                 "nvim",
@@ -641,55 +652,10 @@ impl WinitGhosttyApp {
                 &self.terminal_config.theme,
             )?,
             self.config.scroll_sensitivity,
-        ))];
-
-        if self.config.agent_command.is_some() {
-            if self.config.is_acp_agent() {
-                let rect = layout.pane(1);
-                panes.push(AppPane::Acp(AcpAgentPane {
-                    pane: AcpPane::new(
-                        rect.width,
-                        rect.height,
-                        metrics,
-                        &self.terminal_config.theme,
-                    ),
-                    id: "orchestrator".to_string(),
-                    label: "agent".to_string(),
-                    command: self.config.agent_command.clone(),
-                }));
-            } else if let Some(agent_command) = self.config.agent_command.as_deref() {
-                let mut pane = TerminalPane::new(
-                    "agent",
-                    layout.pane(1).width,
-                    layout.pane(1).height,
-                    metrics,
-                    &self.terminal_config.theme,
-                )?;
-                pane.spawn_shell_command(
-                    agent_command,
-                    &self.config.working_directory,
-                    &[
-                        (crate::agent_bus::VIA_AGENT_ID_ENV, "orchestrator"),
-                        (crate::agent_bus::VIA_AGENT_ROLE_ENV, "orchestrator"),
-                    ],
-                    self.output_notifier.clone(),
-                )?;
-                panes.push(AppPane::Terminal(TerminalPaneController::new(
-                    PaneRole::AgentTerminal {
-                        id: "orchestrator".to_string(),
-                        label: "agent".to_string(),
-                        command: Some(agent_command.to_string()),
-                    },
-                    pane,
-                    self.config.scroll_sensitivity,
-                )));
-            }
-        }
-
-        Ok(panes)
+        )))
     }
 
-    fn spawn_agent_pane(
+    fn create_agent_pane(
         &mut self,
         id: &str,
         role: Option<&str>,
@@ -697,7 +663,7 @@ impl WinitGhosttyApp {
     ) -> Result<()> {
         // Deduplicate: if a pane with this id already exists, do nothing.
         if self.panes.iter().any(|pane| pane.agent_id_matches(id)) {
-            info!(%id, "spawn_agent called for existing id – ignoring");
+            info!(%id, "create_agent_pane called for existing id – ignoring");
             return Ok(());
         }
 
@@ -715,7 +681,8 @@ impl WinitGhosttyApp {
         if crate::config::is_acp_command(&cmd) {
             // ACP sub-agent: via drives it over the protocol (the mediator owns the client and
             // connects it). This pane only renders the transcript; no PTY child here.
-            let pane = AcpPane::new(w / 2, h / 2, metrics, &self.terminal_config.theme);
+            let mut pane = AcpPane::new(w / 2, h / 2, metrics, &self.terminal_config.theme);
+            pane.set_header_label(&label);
             self.panes.push(AppPane::Acp(AcpAgentPane {
                 pane,
                 id: id.to_string(),
@@ -749,8 +716,6 @@ impl WinitGhosttyApp {
                 )));
         }
 
-        // Helpers join the session (registry + Alt+1..9 switching) without hijacking the view:
-        // keep the current focus and layout so an in-progress orchestrator pane is not displaced.
         self.relayout();
         self.write_agent_registry();
         self.dirty = true;
@@ -1697,6 +1662,24 @@ impl WinitGhosttyApp {
                     );
                     acp_pane.update_progress(id, label, active);
                 }
+                UiCommand::AcpSessionStatus {
+                    agent_id,
+                    model,
+                    provider_error,
+                    clear_provider_error,
+                } => {
+                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
+                        continue;
+                    };
+                    debug!(
+                        agent_id,
+                        ?model,
+                        ?provider_error,
+                        clear_provider_error,
+                        "forwarding ACP session status to pane"
+                    );
+                    acp_pane.apply_session_status(model, provider_error, clear_provider_error);
+                }
                 UiCommand::AcpModalPrompt {
                     agent_id,
                     jsonrpc_id,
@@ -1710,10 +1693,10 @@ impl WinitGhosttyApp {
                     ));
                 }
                 UiCommand::SpawnAgent { id, role, command } => {
-                    info!(%id, role = ?role, command = ?command, "spawning new agent pane");
-                    if let Err(e) = self.spawn_agent_pane(&id, role.as_deref(), command.as_deref())
+                    info!(%id, role = ?role, command = ?command, "creating new agent pane");
+                    if let Err(e) = self.create_agent_pane(&id, role.as_deref(), command.as_deref())
                     {
-                        error!(%e, "failed to spawn agent pane");
+                        error!(%e, "failed to create agent pane");
                     }
                 }
                 UiCommand::TerminateAgent { id } => {

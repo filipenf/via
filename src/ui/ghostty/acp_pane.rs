@@ -26,6 +26,9 @@ pub(super) struct AcpPane {
     metrics: TerminalMetrics,
     theme: TerminalTheme,
     size: RatatuiPaneSize,
+    header_label: String,
+    model: Option<String>,
+    provider_error: Option<String>,
     transcript: Vec<TranscriptEntry>,
     progress: Option<ProgressState>,
     prompt: String,
@@ -79,6 +82,9 @@ impl AcpPane {
             metrics,
             theme: theme.clone(),
             size: ratatui_size_for_window(width, height, metrics),
+            header_label: "ACP".to_string(),
+            model: None,
+            provider_error: None,
             transcript: Vec::new(),
             progress: None,
             prompt: String::new(),
@@ -86,6 +92,42 @@ impl AcpPane {
             transcript_scroll_y: 0,
             transcript_follow_bottom: true,
             dirty: true,
+        }
+    }
+
+    pub(super) fn set_header_label(&mut self, label: &str) {
+        let label = label.trim();
+        if label.is_empty() || self.header_label == label {
+            return;
+        }
+        self.header_label = label.to_string();
+        self.dirty = true;
+    }
+
+    pub(super) fn apply_session_status(
+        &mut self,
+        model: Option<String>,
+        provider_error: Option<String>,
+        clear_provider_error: bool,
+    ) {
+        let mut changed = false;
+        if let Some(model) = model.filter(|model| !model.is_empty()) {
+            if self.model.as_deref() != Some(model.as_str()) {
+                self.model = Some(model);
+                changed = true;
+            }
+        }
+        if clear_provider_error && self.provider_error.is_some() {
+            self.provider_error = None;
+            changed = true;
+        } else if let Some(error) = provider_error.filter(|error| !error.is_empty()) {
+            if self.provider_error.as_deref() != Some(error.as_str()) {
+                self.provider_error = Some(error);
+                changed = true;
+            }
+        }
+        if changed {
+            self.dirty = true;
         }
     }
 
@@ -115,11 +157,18 @@ impl AcpPane {
     /// Rows available for the transcript body (ratatui cells), for page-scroll step size.
     pub(super) fn transcript_viewport_rows(&self) -> u16 {
         let prompt_h = self.prompt_height_cells();
+        let header_h = self.header_height_cells();
         self.size
             .rows
-            .saturating_sub(3)
+            .saturating_sub(header_h)
             .saturating_sub(prompt_h)
             .max(1)
+    }
+
+    fn header_height_cells(&self) -> u16 {
+        let content_lines = if self.provider_error.is_some() { 2 } else { 1 };
+        // One row for the bottom border.
+        content_lines + 1
     }
 
     fn prompt_height_cells(&self) -> u16 {
@@ -363,8 +412,9 @@ impl AcpPane {
         let size = self.size;
         let area = Rect::new(0, 0, size.cols, size.rows);
         let prompt_height = self.prompt_height_cells();
+        let header_height = self.header_height_cells();
         let chunks = Layout::vertical([
-            Constraint::Length(3),
+            Constraint::Length(header_height),
             Constraint::Min(3),
             Constraint::Length(prompt_height),
         ])
@@ -374,6 +424,12 @@ impl AcpPane {
             .fg(Color::Indexed(12))
             .add_modifier(Modifier::BOLD);
         let muted_style = Style::default().fg(Color::Indexed(8));
+        let warn_style = Style::default()
+            .fg(Color::Indexed(11))
+            .add_modifier(Modifier::BOLD);
+        let error_style = Style::default()
+            .fg(Color::Indexed(9))
+            .add_modifier(Modifier::BOLD);
         let user_style = Style::default()
             .fg(Color::Indexed(11))
             .add_modifier(Modifier::BOLD);
@@ -383,12 +439,31 @@ impl AcpPane {
         let thought_style = Style::default().fg(Color::Indexed(14));
         let tool_style = Style::default().fg(Color::Indexed(13));
 
-        Paragraph::new(vec![Line::from(vec![
-            Span::styled("ACP mode", title_style),
-            Span::raw("  "),
-        ])])
-        .block(Block::default().borders(Borders::BOTTOM))
-        .render(chunks[0], buffer);
+        let mut header_lines = vec![Line::from(vec![
+            Span::styled(self.header_label.as_str(), title_style),
+            Span::raw("  ·  "),
+            Span::styled(
+                format!(
+                    "model: {}",
+                    self.model
+                        .as_deref()
+                        .filter(|model| !model.is_empty())
+                        .unwrap_or("(unknown)")
+                ),
+                muted_style,
+            ),
+        ])];
+        if let Some(error) = &self.provider_error {
+            header_lines.push(Line::from(vec![
+                Span::styled("⚠ ", warn_style),
+                Span::styled(error.as_str(), error_style),
+            ]));
+        }
+
+        Paragraph::new(header_lines)
+            .wrap(Wrap { trim: false })
+            .block(Block::default().borders(Borders::BOTTOM))
+            .render(chunks[0], buffer);
 
         let mut transcript = Vec::new();
         if self.transcript.is_empty() {

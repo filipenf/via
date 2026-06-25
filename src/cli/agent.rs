@@ -1,3 +1,6 @@
+use std::thread;
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
@@ -118,7 +121,23 @@ fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Resul
     }
     agent_bus::notify_editor_socket(&session.editor_socket, &payload)
         .context("ask via to spawn the agent")?;
-    println!("requested spawn of agent '{id}'");
+
+    // Confirm via actually opened the pane (socket success alone is not enough).
+    for _ in 0..30 {
+        if let Ok(agents) = agent_bus::read_registry(&session.agents_dir) {
+            if agents.iter().any(|agent| agent.id == id) {
+                println!("spawned agent '{id}'");
+                return Ok(());
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    eprintln!(
+        "warning: via accepted the spawn request but '{id}' is not in the agent registry after 3s; \
+         the pane may not have opened — run `via agent list` and check ~/.local/share/via/via-*/logs/via.log"
+    );
+    println!("requested spawn of agent '{id}' (unconfirmed)");
     Ok(())
 }
 

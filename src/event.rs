@@ -82,6 +82,13 @@ pub enum UiCommand {
         label: String,
         active: bool,
     },
+    /// Model selection and provider connectivity for the ACP pane header.
+    AcpSessionStatus {
+        agent_id: String,
+        model: Option<String>,
+        provider_error: Option<String>,
+        clear_provider_error: bool,
+    },
     /// Centered modal: ACP `session/request_permission` or agent ask-question requests.
     AcpModalPrompt {
         agent_id: String,
@@ -170,6 +177,10 @@ pub enum AcpAgentEvent {
         question_id: String,
         prompt: String,
         options: Vec<AcpPermissionOption>,
+    },
+    /// Provider connectivity or JSON-RPC failure surfaced for the ACP pane header.
+    SessionStatus {
+        provider_error: Option<String>,
     },
 }
 
