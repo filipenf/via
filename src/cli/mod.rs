@@ -1,10 +1,12 @@
 mod agent;
+mod plugin;
 mod session;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 pub use agent::AgentCommand;
+pub use plugin::PluginCommand;
 pub use session::SessionCommand;
 
 /// via — bridge Neovim and AI agents.
@@ -35,6 +37,10 @@ pub struct Cli {
     #[arg(long = "scroll-sensitivity")]
     pub scroll_sensitivity: Option<f32>,
 
+    /// Local directory holding a user plugin (extra skills/agents/workflows).
+    #[arg(long = "plugin-dir")]
+    pub plugin_dir: Option<String>,
+
     /// Write the resolved user-facing configuration to via.conf before running.
     #[arg(long = "persist")]
     pub persist: bool,
@@ -51,6 +57,7 @@ impl Cli {
             agent_pane_cols: self.agent_pane_cols,
             review_backend: self.review_backend,
             scroll_sensitivity: self.scroll_sensitivity,
+            plugin_dir: self.plugin_dir.clone(),
         }
     }
 }
@@ -65,19 +72,23 @@ pub enum Command {
         #[command(subcommand)]
         command: AgentCommand,
     },
+    Plugin {
+        #[command(subcommand)]
+        command: PluginCommand,
+    },
 }
 
 pub async fn run(command: Command) -> Result<()> {
     match command {
         Command::Session { command } => session::run(command).await,
         Command::Agent { command } => agent::run(command),
+        Command::Plugin { command } => plugin::run(command),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::agent::SkillCommand;
     use clap::Parser;
     use std::path::Path;
 
@@ -115,25 +126,89 @@ mod tests {
     }
 
     #[test]
-    fn parses_agent_skill_show() {
-        let cli = Cli::try_parse_from(["via", "agent", "skill", "show"]).unwrap();
+    fn parses_agent_list_json() {
+        let cli = Cli::try_parse_from(["via", "agent", "list", "--json"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Agent {
-                command: AgentCommand::Skill {
-                    command: Some(SkillCommand::Show),
+                command: AgentCommand::List { json: true },
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_agent_spawn() {
+        let cli = Cli::try_parse_from([
+            "via", "agent", "spawn", "--id", "reviewer", "--role", "reviewer",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Spawn { id, role, command: None },
+            }) if id == "reviewer" && role.as_deref() == Some("reviewer")
+        ));
+    }
+
+    #[test]
+    fn parses_agent_send() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "agent",
+            "send",
+            "--to",
+            "reviewer",
+            "-m",
+            "hello",
+            "--no-focus",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Send {
+                    to: Some(to),
+                    message,
+                    no_focus: true,
+                    no_notify: false,
+                },
+            }) if to == "reviewer" && message == "hello"
+        ));
+    }
+
+    #[test]
+    fn parses_agent_inbox() {
+        let cli = Cli::try_parse_from(["via", "agent", "inbox", "--peek"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Inbox {
+                    json: false,
+                    peek: true,
                 },
             })
         ));
     }
 
     #[test]
-    fn parses_agent_skill_default() {
-        let cli = Cli::try_parse_from(["via", "agent", "skill"]).unwrap();
+    fn parses_plugin_install_from() {
+        let cli =
+            Cli::try_parse_from(["via", "plugin", "install", "--from", "/tmp/my-plugin"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Agent {
-                command: AgentCommand::Skill { command: None },
+            Some(Command::Plugin {
+                command: PluginCommand::Install { from: Some(path) },
+            }) if path == Path::new("/tmp/my-plugin")
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_status_default() {
+        let cli = Cli::try_parse_from(["via", "plugin", "status"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Status,
             })
         ));
     }

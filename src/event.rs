@@ -22,9 +22,13 @@ pub enum UiEvent {
     ReviewRequested,
     AgentPromptSubmitted {
         text: String,
+        /// Which ACP agent the prompt was typed into (None = primary/orchestrator).
+        agent_id: Option<String>,
     },
     /// JSON-RPC response written to the ACP agent stdin (`id` + `result` only).
     AcpJsonRpcResult {
+        /// ACP agent whose session this result belongs to.
+        agent_id: String,
         id: serde_json::Value,
         result: serde_json::Value,
     },
@@ -45,7 +49,7 @@ pub struct AcpPermissionOption {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AcpModalKind {
     SessionPermission,
-    CursorAskQuestion { question_id: String },
+    AskQuestion { question_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,16 +72,19 @@ pub enum UiCommand {
         target_agent_id: Option<String>,
     },
     AcpTranscriptChunk {
+        agent_id: String,
         kind: String,
         text: String,
     },
     AcpProgress {
+        agent_id: String,
         id: String,
         label: String,
         active: bool,
     },
-    /// Centered modal: ACP `session/request_permission` or Cursor `cursor/ask_question`.
+    /// Centered modal: ACP `session/request_permission` or agent ask-question requests.
     AcpModalPrompt {
+        agent_id: String,
         jsonrpc_id: serde_json::Value,
         title: String,
         message: String,
@@ -89,6 +96,10 @@ pub enum UiCommand {
         id: String,
         role: Option<String>,
         command: Option<String>,
+    },
+    /// Close a sub-agent pane and tear down its session (PTY or ACP).
+    TerminateAgent {
+        id: String,
     },
 }
 
@@ -117,6 +128,8 @@ pub enum EditorEvent {
     },
     AgentSend {
         agent_id: Option<String>,
+        /// Sender id, used to build a mailbox ping for PTY recipients.
+        from: Option<String>,
         content: String,
         focus: bool,
     },
@@ -124,6 +137,39 @@ pub enum EditorEvent {
         id: String,
         role: Option<String>,
         command: Option<String>,
+    },
+    TerminateAgent {
+        id: String,
+    },
+}
+
+/// ACP protocol payload from an agent subprocess (routing id lives on `AgentEvent::Acp`).
+#[derive(Debug, Clone)]
+pub enum AcpAgentEvent {
+    TranscriptChunk {
+        kind: String,
+        text: String,
+    },
+    Progress {
+        id: String,
+        label: String,
+        active: bool,
+    },
+    /// `session/request_permission` from the agent.
+    PermissionRequest {
+        jsonrpc_id: serde_json::Value,
+        session_id: String,
+        tool_call_id: String,
+        title: String,
+        options: Vec<AcpPermissionOption>,
+    },
+    /// Agent ask-question blocking request (e.g. `cursor/ask_question`, `_zed/askQuestion`).
+    AskQuestion {
+        jsonrpc_id: serde_json::Value,
+        title: String,
+        question_id: String,
+        prompt: String,
+        options: Vec<AcpPermissionOption>,
     },
 }
 
@@ -134,29 +180,18 @@ pub enum AgentEvent {
         path: PathBuf,
         line: Option<u32>,
     },
-    AcpTranscriptChunk {
-        kind: String,
-        text: String,
+    /// ACP reader output — always tagged for pane routing when several agents run.
+    Acp {
+        agent_id: String,
+        event: AcpAgentEvent,
     },
-    AcpProgress {
-        id: String,
-        label: String,
-        active: bool,
-    },
-    /// `session/request_permission` from the agent.
-    AcpPermissionRequest {
-        jsonrpc_id: serde_json::Value,
-        session_id: String,
-        tool_call_id: String,
-        title: String,
-        options: Vec<AcpPermissionOption>,
-    },
-    /// Cursor `cursor/ask_question` blocking request.
-    AcpCursorAskQuestion {
-        jsonrpc_id: serde_json::Value,
-        title: String,
-        question_id: String,
-        prompt: String,
-        options: Vec<AcpPermissionOption>,
-    },
+}
+
+impl AgentEvent {
+    pub fn acp(agent_id: impl Into<String>, event: AcpAgentEvent) -> Self {
+        Self::Acp {
+            agent_id: agent_id.into(),
+            event,
+        }
+    }
 }

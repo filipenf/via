@@ -17,4 +17,13 @@ vim.defer_fn(function()
   via.agent.send(nil, "Hello orchestrator!", false)
 end, 2000)
 
--- print(via.agent.list())
+-- Discover the agents via spawned. Returns { id, role, command, primary } tables.
+vim.defer_fn(function()
+  for _, agent in ipairs(via.agent.list()) do
+    print(string.format("agent %s (role=%s)", agent.id, agent.role or "-"))
+  end
+end, 3000)
+
+-- Agents themselves talk to each other through the `via agent` CLI (see the
+-- via-agents skill): `via agent list`, `via agent send --to <id> -m ...`,
+-- `via agent inbox`, `via agent whoami`.

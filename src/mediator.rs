@@ -1,22 +1,28 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use serde::{Deserialize, Serialize};
 
 use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
+use crate::agent_bus;
 use crate::config::Config;
 use crate::editor::{self, EditorState};
-use crate::event::{AcpModalKind, AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
+use crate::event::{AcpAgentEvent, AcpModalKind, AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim::{self, FileTarget};
 
 const EVENT_BUFFER_SIZE: usize = 128;
+
+/// Upper bound on the ACP spawn + initialize + new_session handshake. A misbehaving
+/// subprocess that never replies must not pin the connect task forever.
+const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Deserialize)]
 struct AgentToolRequest {
@@ -57,6 +63,91 @@ fn selection_resource_uri(path: &Path, start_line: u32, end_line: u32) -> String
     format!("file://{}#L{start_line}-L{end_line}", path.display())
 }
 
+/// One connected ACP agent: its JSON-RPC client and active session id.
+#[derive(Clone)]
+struct AcpSession {
+    client: Arc<Mutex<AcpClient>>,
+    session_id: String,
+}
+
+/// Spawn an ACP agent process, run the initialize handshake, and create a session.
+/// Used both for the primary at startup and for sub-agents spawned at runtime.
+async fn establish_acp(
+    agent_id: &str,
+    role: &str,
+    command: &str,
+    args: &[&str],
+    cwd: &Path,
+) -> Result<AcpSession> {
+    let handshake = async {
+        let mut client = AcpClient::spawn(
+            agent_id,
+            command,
+            args,
+            &[
+                (agent_bus::VIA_AGENT_ID_ENV, agent_id),
+                (agent_bus::VIA_AGENT_ROLE_ENV, role),
+            ],
+        )
+        .await?;
+        let init = client.initialize().await?;
+        let agent_name = init
+            .agent_info
+            .as_ref()
+            .map(|info| info.name.as_str())
+            .unwrap_or("unknown");
+        let agent_version = init
+            .agent_info
+            .as_ref()
+            .map(|info| info.version.as_str())
+            .unwrap_or("unknown");
+        tracing::info!(
+            agent_id,
+            agent = agent_name,
+            version = agent_version,
+            protocol_version = init.protocol_version,
+            "ACP agent initialized"
+        );
+
+        let session = client.new_session(cwd).await?;
+        tracing::info!(agent_id, session_id = %session.session_id, "ACP session created");
+
+        Ok::<AcpSession, anyhow::Error>(AcpSession {
+            client: Arc::new(Mutex::new(client)),
+            session_id: session.session_id,
+        })
+    };
+
+    tokio::time::timeout(ACP_HANDSHAKE_TIMEOUT, handshake)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "ACP handshake for agent '{agent_id}' timed out after {}s",
+                ACP_HANDSHAKE_TIMEOUT.as_secs()
+            )
+        })?
+}
+
+fn spawn_acp_prompt_delivery(session: AcpSession, contents: Vec<String>) {
+    if contents.is_empty() {
+        return;
+    }
+    let client = Arc::clone(&session.client);
+    let session_id = session.session_id;
+    tokio::spawn(async move {
+        let mut guard = client.lock().await;
+        for content in contents {
+            if let Err(err) = guard.prompt(&session_id, &content, None).await {
+                warn!(%err, "failed to deliver ACP prompt");
+                break;
+            }
+        }
+    });
+}
+
+/// Bus id of the primary/orchestrator ACP agent.
+const PRIMARY_AGENT_ID: &str = "orchestrator";
+
 pub struct Mediator {
     config: Config,
     events: mpsc::Receiver<Event>,
@@ -65,12 +156,18 @@ pub struct Mediator {
     in_flight_symbol_open: Option<JoinHandle<()>>,
     lsp_handle: Option<lsp_bridge::LspBridgeHandle>,
     agent_output_buffer: String,
-    /// ACP client when using the Agent Client Protocol instead of raw PTY.
-    acp_client: Option<Arc<Mutex<AcpClient>>>,
-    /// Current ACP session ID (if ACP is active).
-    acp_session_id: Option<String>,
-    /// Tool call id → latest title from `session/update` (for permission UI).
-    acp_tool_titles: HashMap<String, String>,
+    /// Connected ACP agents keyed by bus id ("orchestrator" plus any spawned subs).
+    /// Shared so async connect tasks can insert new sessions without `&mut self`.
+    acp_sessions: Arc<Mutex<HashMap<String, AcpSession>>>,
+    /// Event sender retained after `spawn()` so dynamically connected agents can start readers.
+    event_sender: Option<EventSender>,
+    /// (agent id, tool call id) → latest title from `session/update` (for permission UI).
+    /// Keyed by agent id as well so concurrent ACP agents can't collide on tool_call_id.
+    acp_tool_titles: HashMap<(String, String), String>,
+    /// Prompts for ACP sub-agents that arrived before the handshake finished.
+    pending_acp_prompts: Arc<Mutex<HashMap<String, Vec<String>>>>,
+    /// Sub-agent ids spawned (or connecting) as ACP — used to queue bus messages until ready.
+    expected_acp_agents: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -102,9 +199,11 @@ impl Mediator {
             in_flight_symbol_open: None,
             lsp_handle: None,
             agent_output_buffer: String::new(),
-            acp_client: None,
-            acp_session_id: None,
+            acp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            event_sender: None,
             acp_tool_titles: HashMap::new(),
+            pending_acp_prompts: Arc::new(Mutex::new(HashMap::new())),
+            expected_acp_agents: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -114,31 +213,74 @@ impl Mediator {
     /// and creates a new session. After this call, editor context updates
     /// will be sent via ACP `context/update` instead of raw PTY injection.
     pub async fn connect_acp(&mut self, command: &str, args: &[&str]) -> Result<String> {
-        let mut client = AcpClient::spawn(command, args).await?;
-        let init = client.initialize().await?;
-        let agent_name = init
-            .agent_info
-            .as_ref()
-            .map(|info| info.name.as_str())
-            .unwrap_or("unknown");
-        let agent_version = init
-            .agent_info
-            .as_ref()
-            .map(|info| info.version.as_str())
-            .unwrap_or("unknown");
-        tracing::info!(
-            agent = agent_name,
-            version = agent_version,
-            protocol_version = init.protocol_version,
-            "ACP agent initialized"
-        );
+        let session = establish_acp(
+            PRIMARY_AGENT_ID,
+            PRIMARY_AGENT_ID,
+            command,
+            args,
+            &self.config.working_directory,
+        )
+        .await?;
+        let session_id = session.session_id.clone();
+        self.acp_sessions
+            .lock()
+            .await
+            .insert(PRIMARY_AGENT_ID.to_string(), session);
+        Ok(session_id)
+    }
 
-        let session = client.new_session(&self.config.working_directory).await?;
-        tracing::info!(session_id = %session.session_id, "ACP session created");
+    /// Look up a connected ACP session by exact id (no fallback).
+    async fn acp_session(&self, agent_id: &str) -> Option<AcpSession> {
+        self.acp_sessions.lock().await.get(agent_id).cloned()
+    }
 
-        self.acp_client = Some(Arc::new(Mutex::new(client)));
-        self.acp_session_id = Some(session.session_id.clone());
-        Ok(session.session_id)
+    /// True when a bus recipient is (or will be) an ACP agent rather than a PTY pane.
+    async fn recipient_is_acp(&self, agent_id: &str) -> bool {
+        if self.expected_acp_agents.lock().await.contains(agent_id) {
+            return true;
+        }
+        agent_bus::read_registry(&self.config.agents_dir)
+            .ok()
+            .and_then(|records| records.into_iter().find(|record| record.id == agent_id))
+            .and_then(|record| record.command)
+            .is_some_and(|command| crate::config::is_acp_command(&command))
+    }
+
+    async fn queue_acp_prompt(&self, agent_id: &str, content: String) {
+        info!(agent_id, "queuing ACP prompt until session is ready");
+        self.pending_acp_prompts
+            .lock()
+            .await
+            .entry(agent_id.to_string())
+            .or_default()
+            .push(content);
+    }
+
+    fn collect_acp_prompts_for_agent(
+        agents_dir: &Path,
+        agent_id: &str,
+        pending: &mut HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
+        let mut contents = pending.remove(agent_id).unwrap_or_default();
+        if let Ok(messages) = agent_bus::drain_inbox(agents_dir, agent_id, false) {
+            contents.extend(messages.into_iter().map(|message| message.text));
+        }
+        contents
+    }
+
+    /// Resolve the ACP session to use for a prompt, preferring an explicit id, then the
+    /// primary/orchestrator, then any single connected agent.
+    async fn acp_session_for_prompt(&self, agent_id: Option<&str>) -> Option<AcpSession> {
+        let map = self.acp_sessions.lock().await;
+        if let Some(id) = agent_id {
+            if let Some(session) = map.get(id) {
+                return Some(session.clone());
+            }
+        }
+        if let Some(session) = map.get(PRIMARY_AGENT_ID) {
+            return Some(session.clone());
+        }
+        map.values().next().cloned()
     }
 
     pub fn spawn(mut self) -> MediatorHandle {
@@ -149,15 +291,21 @@ impl Mediator {
         let events = EventSender {
             events: events_tx.clone(),
         };
+        self.event_sender = Some(events.clone());
 
-        if let Some(client) = &self.acp_client {
-            let client = Arc::clone(client);
-            let events = events.clone();
-            tokio::spawn(async move {
-                let mut guard = client.lock().await;
-                guard.spawn_reader(events);
-            });
-        }
+        // Start a stdout reader for each ACP agent connected before startup (the primary).
+        let sessions = Arc::clone(&self.acp_sessions);
+        let reader_events = events.clone();
+        tokio::spawn(async move {
+            let map = sessions.lock().await;
+            for session in map.values() {
+                let client = Arc::clone(&session.client);
+                let events = reader_events.clone();
+                tokio::spawn(async move {
+                    client.lock().await.spawn_reader(events);
+                });
+            }
+        });
 
         let editor_listener = editor::spawn_listener(
             self.config.editor_socket_path.clone(),
@@ -252,7 +400,7 @@ impl Mediator {
                         error!(%error, "failed to open review in Neovim");
                     }
                 }
-                Event::Ui(UiEvent::AgentPromptSubmitted { text }) => {
+                Event::Ui(UiEvent::AgentPromptSubmitted { text, agent_id }) => {
                     if text.trim().is_empty() {
                         continue;
                     }
@@ -272,13 +420,13 @@ impl Mediator {
                             text: selection.text.clone(),
                         });
 
-                    let (Some(client), Some(session_id)) =
-                        (&self.acp_client, self.acp_session_id.clone())
+                    let Some(session) = self.acp_session_for_prompt(agent_id.as_deref()).await
                     else {
                         debug!("agent prompt submitted without an active ACP session");
                         continue;
                     };
-                    let client = Arc::clone(client);
+                    let client = Arc::clone(&session.client);
+                    let session_id = session.session_id;
                     tokio::spawn(async move {
                         let mut guard = client.lock().await;
                         if let Err(error) = guard.prompt(&session_id, &text, prompt_resource).await
@@ -287,10 +435,15 @@ impl Mediator {
                         }
                     });
                 }
-                Event::Ui(UiEvent::AcpJsonRpcResult { id, result }) => {
-                    let Some(client) = self.acp_client.clone() else {
+                Event::Ui(UiEvent::AcpJsonRpcResult {
+                    agent_id,
+                    id,
+                    result,
+                }) => {
+                    let Some(session) = self.acp_session(&agent_id).await else {
                         continue;
                     };
+                    let client = Arc::clone(&session.client);
                     tokio::spawn(async move {
                         let mut guard = client.lock().await;
                         if let Err(err) = guard.send_jsonrpc_result(id, result).await {
@@ -298,64 +451,82 @@ impl Mediator {
                         }
                     });
                 }
-                Event::Editor(event) => self.apply_editor_event(event),
+                Event::Editor(event) => self.apply_editor_event(event).await,
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
                     self.handle_agent_output(chunk).await;
                 }
-                Event::Agent(AgentEvent::AcpTranscriptChunk { kind, text }) => {
-                    self.send_ui_command(UiCommand::AcpTranscriptChunk { kind, text });
-                }
-                Event::Agent(AgentEvent::AcpProgress { id, label, active }) => {
-                    if active && !label.is_empty() {
-                        self.acp_tool_titles.insert(id.clone(), label.clone());
+                Event::Agent(AgentEvent::Acp { agent_id, event }) => match event {
+                    AcpAgentEvent::TranscriptChunk { kind, text } => {
+                        self.send_ui_command(UiCommand::AcpTranscriptChunk {
+                            agent_id,
+                            kind,
+                            text,
+                        });
                     }
-                    if !active {
-                        self.acp_tool_titles.remove(&id);
-                    }
-                    self.send_ui_command(UiCommand::AcpProgress { id, label, active });
-                }
-                Event::Agent(AgentEvent::AcpPermissionRequest {
-                    jsonrpc_id,
-                    session_id,
-                    tool_call_id,
-                    mut title,
-                    options,
-                }) => {
-                    if title == "Permission required" || title.trim().is_empty() {
-                        if let Some(t) = self.acp_tool_titles.get(&tool_call_id) {
-                            title = t.clone();
+                    AcpAgentEvent::Progress {
+                        id,
+                        label,
+                        active,
+                    } => {
+                        if active && !label.is_empty() {
+                            self.acp_tool_titles
+                                .insert((agent_id.clone(), id.clone()), label.clone());
+                        } else if !active {
+                            self.acp_tool_titles.remove(&(agent_id.clone(), id.clone()));
                         }
+                        self.send_ui_command(UiCommand::AcpProgress {
+                            agent_id,
+                            id,
+                            label,
+                            active,
+                        });
                     }
-                    self.send_ui_command(UiCommand::AcpModalPrompt {
+                    AcpAgentEvent::PermissionRequest {
+                        jsonrpc_id,
+                        session_id,
+                        tool_call_id,
+                        mut title,
+                        options,
+                    } => {
+                        if title == "Permission required" || title.trim().is_empty() {
+                            let title_key = (agent_id.clone(), tool_call_id.clone());
+                            if let Some(t) = self.acp_tool_titles.get(&title_key) {
+                                title = t.clone();
+                            }
+                        }
+                        self.send_ui_command(UiCommand::AcpModalPrompt {
+                            agent_id,
+                            jsonrpc_id,
+                            title,
+                            message: format!("Session `{session_id}`\nTool call `{tool_call_id}`"),
+                            options,
+                            kind: AcpModalKind::SessionPermission,
+                        });
+                    }
+                    AcpAgentEvent::AskQuestion {
                         jsonrpc_id,
                         title,
-                        message: format!("Session `{session_id}`\nTool call `{tool_call_id}`"),
+                        question_id,
+                        prompt,
                         options,
-                        kind: AcpModalKind::SessionPermission,
-                    });
-                }
-                Event::Agent(AgentEvent::AcpCursorAskQuestion {
-                    jsonrpc_id,
-                    title,
-                    question_id,
-                    prompt,
-                    options,
-                }) => {
-                    self.send_ui_command(UiCommand::AcpModalPrompt {
-                        jsonrpc_id,
-                        title,
-                        message: prompt,
-                        options,
-                        kind: AcpModalKind::CursorAskQuestion { question_id },
-                    });
-                }
+                    } => {
+                        self.send_ui_command(UiCommand::AcpModalPrompt {
+                            agent_id,
+                            jsonrpc_id,
+                            title,
+                            message: prompt,
+                            options,
+                            kind: AcpModalKind::AskQuestion { question_id },
+                        });
+                    }
+                },
                 Event::Agent(event) => debug!(?event, "agent event received"),
                 event => debug!(?event, "mediator event received"),
             }
         }
     }
 
-    fn apply_editor_event(&mut self, event: EditorEvent) {
+    async fn apply_editor_event(&mut self, event: EditorEvent) {
         let previous_path = self
             .editor_state
             .active_buffer
@@ -365,13 +536,12 @@ impl Mediator {
         debug!(?event, "editor context updated");
         match &event {
             EditorEvent::ActiveBufferChanged { path, line, column } => {
-                if let (Some(client), Some(_session_id)) = (&self.acp_client, &self.acp_session_id)
-                {
-                    // ACP path: send structured context update
+                // Editor context follows the primary ACP agent when one is connected.
+                if let Some(session) = self.acp_session_for_prompt(None).await {
                     let path = path.clone();
                     let line = *line;
                     let column = *column;
-                    let client = Arc::clone(client);
+                    let client = Arc::clone(&session.client);
                     tokio::spawn(async move {
                         let params = ContextUpdateParams {
                             active_buffer: Some(acp::BufferContext {
@@ -405,11 +575,11 @@ impl Mediator {
                 let display_path = path
                     .strip_prefix(&self.config.working_directory)
                     .unwrap_or(path);
-                if let (Some(client), Some(session_id)) = (&self.acp_client, &self.acp_session_id) {
-                    let client = Arc::clone(client);
+                if let Some(session) = self.acp_session_for_prompt(None).await {
+                    let client = Arc::clone(&session.client);
+                    let session_id = session.session_id;
                     let path = path.clone();
                     let display_path = display_path.to_path_buf();
-                    let session_id = session_id.clone();
                     let line_range = start_line.zip(*end_line);
                     tokio::spawn(async move {
                         let mut guard = client.lock().await;
@@ -435,28 +605,141 @@ impl Mediator {
             }
             EditorEvent::AgentSend {
                 agent_id,
+                from,
                 content,
                 focus,
             } => {
-                // Route to the specific agent pane (by id) if provided.
-                self.send_ui_command(UiCommand::AgentInput {
-                    payload: content.clone(),
-                    focus_agent: *focus,
-                    target_agent_id: agent_id.clone(),
-                });
+                // ACP recipient: deliver the full body as a prompt so its next turn starts
+                // automatically. PTY recipient (or unknown): inject a lightweight inbox ping;
+                // never auto-submit the body into an interactive pane.
+                let target = agent_id.as_deref().unwrap_or(PRIMARY_AGENT_ID);
+                if let Some(session) = self.acp_session(target).await {
+                    spawn_acp_prompt_delivery(session, vec![content.clone()]);
+                } else if self.recipient_is_acp(target).await {
+                    // `via agent send` already enqueued the body; the connect task drains the
+                    // mailbox. Lua `agent.send` has no mailbox — queue in memory instead.
+                    if from.is_none() {
+                        self.queue_acp_prompt(target, content.clone()).await;
+                    } else {
+                        info!(
+                            agent_id = target,
+                            "ACP session not ready; prompt will be delivered from mailbox after handshake"
+                        );
+                    }
+                } else {
+                    let sender = from.as_deref().unwrap_or("another agent");
+                    let ping =
+                        format!("[via] new message from {sender}; run `via agent inbox` to read");
+                    self.send_ui_command(UiCommand::AgentInput {
+                        payload: ping,
+                        focus_agent: *focus,
+                        target_agent_id: agent_id.clone(),
+                    });
+                }
             }
             EditorEvent::SpawnAgent { id, role, command } => {
                 info!(%id, role = ?role, command = ?command, "spawn agent requested");
-                // Handled in UI layer via UiCommand in a follow-up step.
+                let resolved = command
+                    .clone()
+                    .or_else(|| self.config.agent_command.clone())
+                    .unwrap_or_else(|| {
+                        std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+                    });
+
+                // ACP sub-agents are driven by via over the protocol; connect a session for
+                // this id so messages to it can start turns automatically.
+                if crate::config::is_acp_command(&resolved) {
+                    self.expected_acp_agents
+                        .lock()
+                        .await
+                        .insert(id.clone());
+                    self.connect_acp_agent(id.clone(), role.clone(), resolved.clone());
+                }
+
                 self.send_ui_command(UiCommand::SpawnAgent {
                     id: id.clone(),
                     role: role.clone(),
-                    command: command.clone(),
+                    command: Some(resolved),
                 });
+            }
+            EditorEvent::TerminateAgent { id } => {
+                if id == PRIMARY_AGENT_ID {
+                    tracing::warn!(%id, "refusing to terminate primary orchestrator agent");
+                } else {
+                    info!(%id, "terminate agent requested");
+                    self.acp_sessions.lock().await.remove(id);
+                    self.expected_acp_agents.lock().await.remove(id);
+                    self.pending_acp_prompts.lock().await.remove(id);
+                    self.acp_tool_titles
+                        .retain(|(agent_id, _), _| agent_id != id);
+                    self.send_ui_command(UiCommand::TerminateAgent {
+                        id: id.clone(),
+                    });
+                }
             }
         }
 
         self.editor_state.apply(event);
+    }
+
+    /// Connect an ACP sub-agent in the background, insert it into the session map, and start its
+    /// stdout reader. Best-effort: failures are logged and the (UI) pane simply has no session.
+    fn connect_acp_agent(&self, id: String, role: Option<String>, command: String) {
+        let sessions = Arc::clone(&self.acp_sessions);
+        let pending = Arc::clone(&self.pending_acp_prompts);
+        let expected = Arc::clone(&self.expected_acp_agents);
+        let event_sender = self.event_sender.clone();
+        let cwd = self.config.working_directory.clone();
+        let agents_dir = self.config.agents_dir.clone();
+        let role = role.unwrap_or_else(|| id.clone());
+        tokio::spawn(async move {
+            let tokens: Vec<&str> = command.split_whitespace().collect();
+            let [program, args @ ..] = tokens.as_slice() else {
+                expected.lock().await.remove(&id);
+                return;
+            };
+            match establish_acp(&id, &role, program, args, &cwd).await {
+                Ok(session) => {
+                    // Insert the session before starting the reader so that any event the
+                    // reader emits can be resolved by `acp_session()`. Otherwise an event
+                    // arriving in the gap would find no session and be silently dropped.
+                    let client = Arc::clone(&session.client);
+                    let mut pending_guard = pending.lock().await;
+                    let queued =
+                        Self::collect_acp_prompts_for_agent(&agents_dir, &id, &mut pending_guard);
+                    drop(pending_guard);
+                    sessions.lock().await.insert(id.clone(), session.clone());
+                    expected.lock().await.remove(&id);
+                    if !queued.is_empty() {
+                        info!(
+                            agent_id = %id,
+                            count = queued.len(),
+                            "delivering queued ACP prompts after handshake"
+                        );
+                        spawn_acp_prompt_delivery(session, queued);
+                    }
+                    if let Some(events) = event_sender {
+                        tokio::spawn(async move {
+                            client.lock().await.spawn_reader(events);
+                        });
+                    }
+                }
+                Err(err) => {
+                    expected.lock().await.remove(&id);
+                    let dropped = pending.lock().await.remove(&id).unwrap_or_default();
+                    if !dropped.is_empty() {
+                        warn!(
+                            agent_id = %id,
+                            count = dropped.len(),
+                            %err,
+                            "dropped queued ACP prompts: sub-agent handshake failed"
+                        );
+                    } else {
+                        tracing::error!(%id, %err, "failed to connect ACP sub-agent");
+                    }
+                }
+            }
+        });
     }
 
     fn send_ui_command(&self, command: UiCommand) {
@@ -641,10 +924,12 @@ mod tests {
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
             nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
         }
     }
 

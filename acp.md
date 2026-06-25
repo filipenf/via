@@ -30,8 +30,10 @@ clients.
   - Create sessions via `new_session`
   - Push structured context via `context/update`
 - Integration into `Mediator`:
-  - `connect_acp(command, args)` method
-  - `acp_client` + `acp_session_id` fields
+  - `connect_acp(command, args)` connects the primary agent (keyed
+    `orchestrator`) into a `HashMap<agent_id, AcpSession { client, session_id }>`
+  - Sub-agents connect dynamically: when a spawn command `is_acp_command`, the
+    mediator establishes a session for that id and starts its reader
   - `BufferSendRequested` events are routed through ACP when a client is
     connected (otherwise fall back to normal/PTY injection)
 - `VIA_AGENT="opencode acp"` (or `cursor-agent acp`, `claude acp`, etc.) results
@@ -86,6 +88,25 @@ Next steps:
 - Mode selection (plan/build/etc)
 - Model selection
 - Tool request handling
+
+### Multi-agent coordination (two modes)
+
+ACP is also how via does **automatic** agent-to-agent handoff. The two agent
+modes split coordination cleanly:
+
+- **PTY = interactive/manual.** A `via agent send` to a PTY agent only injects an
+  inbox ping; that agent reads `via agent inbox` and acts on its own. via never
+  auto-submits into an interactive pane.
+- **ACP = orchestrated/automatic.** Inbound text for an ACP agent — typed into
+  its pane or delivered over the bus — resolves to its session and goes through a
+  single primitive, `client.prompt()`, which starts the agent's next turn with
+  no human in the loop. Reader events carry the `agent_id` so transcript,
+  progress, and permission modals route to the right pane.
+
+So an orchestrator can spawn an ACP reviewer and message it for a hands-off
+review; the reviewer's turn starts automatically. Handing work back to a PTY
+orchestrator is still manual (inbox). The mailbox is always written for
+durability and `--no-notify` sends.
 
 ### Open questions
 

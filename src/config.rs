@@ -67,10 +67,15 @@ pub struct Config {
     pub scroll_sensitivity: f32,
     pub nvim_socket_path: PathBuf,
     pub editor_socket_path: PathBuf,
+    /// Per-process directory holding the agent registry and per-agent mailboxes.
+    pub agents_dir: PathBuf,
     pub nvim_context_bridge_path: PathBuf,
     pub nvim_via_module_path: PathBuf,
     pub lsp_bridge_socket_path: PathBuf,
     pub working_directory: PathBuf,
+    /// Optional local directory holding a user plugin (extra skills/agents/workflows),
+    /// overlaid on top of the embedded base skills at install time.
+    pub plugin_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -80,6 +85,7 @@ pub struct ConfigOverrides {
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: Option<ReviewBackend>,
     pub scroll_sensitivity: Option<f32>,
+    pub plugin_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -193,6 +199,7 @@ struct FileConfig {
     agent_pane_cols: Option<AgentPaneCols>,
     review_backend: Option<ReviewBackend>,
     scroll_sensitivity: Option<f32>,
+    plugin_dir: Option<String>,
 }
 
 impl From<FileConfig> for ConfigOverrides {
@@ -203,6 +210,7 @@ impl From<FileConfig> for ConfigOverrides {
             agent_pane_cols: config.agent_pane_cols,
             review_backend: config.review_backend,
             scroll_sensitivity: config.scroll_sensitivity,
+            plugin_dir: config.plugin_dir,
         }
     }
 }
@@ -221,6 +229,7 @@ impl ConfigOverrides {
             scroll_sensitivity: env::var("VIA_SCROLL_SENSITIVITY")
                 .ok()
                 .and_then(|value| value.parse().ok()),
+            plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
         }
     }
 }
@@ -232,6 +241,7 @@ struct ResolvedUserConfig {
     agent_pane_cols: AgentPaneCols,
     review_backend: ReviewBackend,
     scroll_sensitivity: f32,
+    plugin_dir: Option<String>,
 }
 
 fn resolve_user_config_from_sources(
@@ -260,6 +270,11 @@ fn resolve_user_config_from_sources(
         .or(file.scroll_sensitivity)
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(DEFAULT_SCROLL_SENSITIVITY);
+    let plugin_dir = cli
+        .plugin_dir
+        .or(env.plugin_dir)
+        .or(file.plugin_dir)
+        .filter(|s| !s.is_empty());
 
     ResolvedUserConfig {
         nvim_command,
@@ -270,6 +285,7 @@ fn resolve_user_config_from_sources(
         }),
         review_backend,
         scroll_sensitivity,
+        plugin_dir,
     }
 }
 
@@ -310,6 +326,9 @@ fn render_user_config(config: &ResolvedUserConfig) -> String {
         "scroll_sensitivity = {}\n",
         config.scroll_sensitivity
     ));
+    if let Some(dir) = &config.plugin_dir {
+        output.push_str(&format!("plugin_dir = \"{}\"\n", toml_escape_string(dir)));
+    }
     output
 }
 
@@ -336,6 +355,9 @@ impl Config {
         let editor_socket_path = env::var_os("VIA_EDITOR_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_editor_socket_path);
+        let agents_dir = env::var_os("VIA_AGENTS_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(default_agents_dir);
         let nvim_context_bridge_path = env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_context_bridge_path);
@@ -355,10 +377,12 @@ impl Config {
             scroll_sensitivity: user_config.scroll_sensitivity,
             nvim_socket_path,
             editor_socket_path,
+            agents_dir,
             nvim_context_bridge_path,
             nvim_via_module_path,
             lsp_bridge_socket_path,
             working_directory,
+            plugin_dir: user_config.plugin_dir.map(PathBuf::from),
         })
     }
 
@@ -367,7 +391,7 @@ impl Config {
     pub fn is_acp_agent(&self) -> bool {
         self.agent_command
             .as_deref()
-            .map(|cmd| cmd.split_whitespace().last() == Some("acp"))
+            .map(is_acp_command)
             .unwrap_or(false)
     }
 
@@ -416,6 +440,27 @@ fn default_nvim_socket_path() -> PathBuf {
 
 fn default_editor_socket_path() -> PathBuf {
     runtime_base_dir().join(format!("via-editor-{}.sock", std::process::id()))
+}
+
+/// True when an agent command string is an ACP launch (its last token is `acp`),
+/// e.g. `opencode acp`, `cursor-agent acp`. Shared by config and runtime spawning so
+/// PTY vs ACP classification has a single source of truth.
+pub fn is_acp_command(command: &str) -> bool {
+    command.split_whitespace().last() == Some("acp")
+}
+
+/// Per-process directory for the agent registry (`registry.json`) and per-agent mailboxes.
+/// Per-session agent bus directory (`registry.json`, `inbox/<id>/…`).
+///
+/// Detached runs use `<runtime>/agents/` (runtime is already `via-<pid>/`). Foreground runs keep
+/// a pid suffix because they share the global via data directory with other sessions.
+pub fn default_agents_dir() -> PathBuf {
+    let base = runtime_base_dir();
+    if env::var_os("VIA_RUNTIME_ROOT").is_some() {
+        base.join("agents")
+    } else {
+        base.join(format!("agents-{}", std::process::id()))
+    }
 }
 
 fn ensure_lua_assets() {
@@ -473,6 +518,16 @@ mod tests {
         let path = default_nvim_socket_path();
 
         assert!(path.ends_with(format!("via-nvim-{}.sock", std::process::id())));
+    }
+
+    #[test]
+    fn is_acp_command_matches_acp_suffix() {
+        assert!(is_acp_command("opencode acp"));
+        assert!(is_acp_command("cursor-agent acp"));
+        assert!(is_acp_command("acp"));
+        assert!(!is_acp_command("opencode"));
+        assert!(!is_acp_command("opencode acp --foo"));
+        assert!(!is_acp_command(""));
     }
 
     #[test]
@@ -543,6 +598,7 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
+            plugin_dir: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -550,6 +606,7 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
+            plugin_dir: None,
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
@@ -557,6 +614,7 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 90, max: 110 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(2.0),
+            plugin_dir: Some("/home/user/my-via-plugin".to_string()),
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -566,6 +624,10 @@ mod tests {
         assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 90, max: 110 });
         assert_eq!(config.review_backend, ReviewBackend::Nvim);
         assert_eq!(config.scroll_sensitivity, 2.0);
+        assert_eq!(
+            config.plugin_dir.as_deref(),
+            Some("/home/user/my-via-plugin")
+        );
     }
 
     #[test]
@@ -576,6 +638,7 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
+            plugin_dir: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -583,6 +646,7 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
+            plugin_dir: None,
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -617,6 +681,7 @@ mod tests {
             agent_pane_cols: AgentPaneCols { min: 80, max: 120 },
             review_backend: ReviewBackend::Hunk,
             scroll_sensitivity: 1.5,
+            plugin_dir: Some("/home/user/my-via-plugin".to_string()),
         });
 
         assert_eq!(
@@ -627,6 +692,7 @@ mod tests {
                 "agent_pane_cols = \"80:120\"\n",
                 "review_backend = \"hunk\"\n",
                 "scroll_sensitivity = 1.5\n",
+                "plugin_dir = \"/home/user/my-via-plugin\"\n",
             )
         );
     }
@@ -664,10 +730,12 @@ scroll_sensitivity = 1.5
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
             nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -683,10 +751,12 @@ scroll_sensitivity = 1.5
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
             nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
             nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));

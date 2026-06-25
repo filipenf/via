@@ -168,12 +168,6 @@ See the main [README.md](README.md) for configuration (`~/.config/via/via.conf`,
 env vars, `--agent-pane-cols`, review backends, font tweaks, etc.) and the
 embedded Neovim Lua bridges (`nvim/*.lua`).
 
-The `via-editor` agent skill (auto-installed on session start when an agent
-command is configured) is defined in `skills/via-editor/SKILL.md`. It lets
-agents run `via session diagnostics --json` (and related commands) over the
-local socket without scraping the UI. The `VIA_SESSION` env is how session
-commands resolve the right via instance.
-
 ## Architecture pointers
 
 - Original lightweight design brief: [project.md](project.md)

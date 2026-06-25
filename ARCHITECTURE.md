@@ -133,6 +133,31 @@ Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
 `AcpClient` is intentionally minimal (handshake, session create, context,
 prompt, tool result serialization). It is not a full agent SDK.
 
+### Two coordination modes
+
+These two modes also define how multi-agent coordination works:
+
+- **PTY = interactive / manual.** PTY agents are driven by a human at the
+  keyboard. They do **not** participate in automatic orchestration. A `via agent
+  send` to a PTY recipient only injects a lightweight ping (`[via] new message
+  from <sender>; run via agent inbox to read`); the recipient reads its mailbox
+  with `via agent inbox` and acts when it chooses. via never auto-submits text
+  into an interactive pane.
+- **ACP = orchestrated / automatic.** ACP agents are driven by via over the
+  protocol, so messages can start a turn without human input. The mediator keeps
+  a `HashMap<agent_id, AcpSession>` (the primary is keyed `orchestrator`; spawned
+  subs use their bus id). Inbound text — whether typed into a pane
+  (`AgentPromptSubmitted`) or delivered from the bus (`AgentSend`) — resolves to
+  the recipient's session and goes through a single primitive: `client.prompt()`.
+  Reader output is emitted as `AgentEvent::Acp { agent_id, .. }` so transcript,
+  progress, and permission modals route to the matching pane.
+
+Auto handoff is therefore **ACP-only**: an orchestrator can spawn an ACP sub
+(e.g. a reviewer) and message it, and the sub's next turn starts automatically.
+Handing work *back* to a PTY orchestrator is still manual (it reads its inbox).
+The mailbox is always written for durability and for `--no-notify` sends,
+regardless of recipient type.
+
 `src/pty.rs` also provides `CoalescedOutputNotifier` so that bursty PTY readers
 don't flood the UI thread with redraw events.
 
@@ -167,8 +192,35 @@ resolved user-facing values.
 `via session ...` subcommands and agents running inside the session can find the
 right sockets without extra flags.
 
-CLI subcommands live under `via session` (list, get, diagnostics) and
-`via agent skill` (install/status the global via-editor skill).
+CLI subcommands live under `via session` (list, get, diagnostics), `via agent`
+(list, spawn, send, inbox, whoami — the agent bus), and `via plugin`
+(install/status the plugin skills).
+
+### Agent bus (src/agent_bus.rs)
+
+Inter-agent discovery and messaging, all file-backed under a per-process
+`agents_dir` (recorded in the session manifest so CLI commands resolve it from
+`VIA_SESSION`):
+
+- `registry.json` — the list of agent panes, written by the UI whenever it spawns
+  a pane (`write_agent_registry`). This is the discovery surface (`via agent list`,
+  Lua `require('via').agent.list()`).
+- `inbox/<id>/*.json` — per-recipient mailbox files under `<runtime>/agents/`.
+  `via agent send` appends one file per message (the source of truth) and optionally
+  pings the recipient pane via the existing `agent_send` editor-socket event;
+  `via agent inbox` drains it.
+
+Each agent pane is spawned with `VIA_AGENT_ID`/`VIA_AGENT_ROLE` so an agent knows
+its own identity.
+
+### Plugin (src/plugin.rs)
+
+The skills (and, later, agents/workflows/tools) via projects into the agent's
+skill directory. A tiny embedded base (`via-editor`, `via-agents`) ships in the
+binary so things work out of the box; users can point via at a local plugin
+directory (`plugin_dir` / `VIA_PLUGIN_DIR` / `--plugin-dir`) whose `skills/*` are
+overlaid on top. `via plugin install` (also run automatically at startup)
+projects them into the detected agent family's skill roots.
 
 ### Other notable pieces
 
@@ -210,10 +262,16 @@ and are mitigated by the native + GPU nature of the stack.
 - A "via-editor" skill is auto-installed for ACP agents so they can pull
   diagnostics without hallucinating file state.
 - Multi-agent spawning: the orchestrator (primary agent) or Neovim Lua
-  (`require('via').agent.spawn(...)`) can request additional visible agent
-  panes at runtime. Each pane carries a `PaneRole::AgentTerminal { id, label }`
-  and is routed via the same mediator/UI command path. The Lua module talks
-  over the editor Unix socket using the existing JSON event protocol.
+  (`require('via').agent.spawn(...)`) can request additional agent panes at
+  runtime. A spawned agent whose command ends in `acp` (see
+  `config::is_acp_command`) gets an ACP transcript pane and a mediator-owned
+  session; anything else gets a `PaneRole::AgentTerminal { id, label, command }`
+  PTY pane. Spawned helpers join the registry and are reachable via Alt+1..9 but
+  do not steal focus or reshape the active layout.
+- Coordination is two-mode: PTY agents are interactive (manual `via agent
+  inbox`), ACP agents are orchestrated (bus sends and pane prompts both go
+  through `client.prompt()`, so a sub's turn starts automatically). Automatic
+  handoff is ACP-only; see "Two coordination modes" above.
 - The vendored Ghostty VT bits are pinned to a specific git rev of a
   libghostty-rs wrapper. This gives a single static binary but makes clean
   builds heavy (Zig + git).

@@ -1,5 +1,5 @@
 mod acp;
-mod agent_skill;
+mod agent_bus;
 mod bootstrap;
 mod cli;
 mod config;
@@ -9,9 +9,11 @@ mod logging;
 mod lsp_bridge;
 mod mediator;
 mod nvim;
+mod plugin;
 mod pty;
 mod session;
 pub mod ui;
+mod util;
 
 use anyhow::Result;
 use clap::Parser;
@@ -77,13 +79,13 @@ async fn async_main(cli: Cli) -> Result<()> {
     let _session_guard = session::SessionGuard::create(&config)?;
 
     if let Some(agent_command) = &config.agent_command {
-        let family = agent_skill::detect_agent_family(agent_command);
-        match agent_skill::ensure_global_skill(family) {
+        let family = plugin::detect_agent_family(agent_command);
+        match plugin::install(family, config.plugin_dir.as_deref()) {
             Ok(paths) if !paths.is_empty() => {
                 info!(
                     agent = %agent_command,
                     count = paths.len(),
-                    "installed via-editor skill for agent"
+                    "installed via plugin skills for agent"
                 );
             }
             Ok(_) => {}
@@ -91,7 +93,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 tracing::warn!(
                     agent = %agent_command,
                     %err,
-                    "failed to install via-editor skill for agent"
+                    "failed to install via plugin for agent"
                 );
             }
         }
@@ -100,6 +102,13 @@ async fn async_main(cli: Cli) -> Result<()> {
     let mut mediator = Mediator::new(config.clone());
 
     if config.is_acp_agent() {
+        // ACP orchestrator has no PTY child; export bus identity on this process so tool
+        // subprocesses and `via agent` CLI invocations from the agent can resolve whoami/inbox.
+        unsafe {
+            std::env::set_var(agent_bus::VIA_AGENT_ID_ENV, "orchestrator");
+            std::env::set_var(agent_bus::VIA_AGENT_ROLE_ENV, "orchestrator");
+        }
+
         if let Some(cmd) = &config.agent_command {
             let tokens: Vec<&str> = cmd.split_whitespace().collect();
             if let [command, args @ ..] = tokens.as_slice() {

@@ -72,10 +72,88 @@ function M.agent.spawn(id, role, command)
   })
 end
 
--- List known agent panes (placeholder for future richer discovery).
-function M.agent.list()
-  -- Currently returns a placeholder; real listing can be added via RPC response.
-  return { "orchestrator" }
+-- Close a sub-agent pane and tear down its session.
+-- id: agent id to terminate (cannot be the primary orchestrator).
+function M.agent.del(id)
+  notify({
+    type = "terminate_agent",
+    id = id,
+  })
 end
+
+local function decode(text)
+  if vim.json and vim.json.decode then
+    return vim.json.decode(text)
+  end
+  return vim.fn.json_decode(text)
+end
+
+local function read_file(path)
+  local fd = io.open(path, "r")
+  if not fd then
+    return nil
+  end
+  local contents = fd:read("*a")
+  fd:close()
+  return contents
+end
+
+-- List agents currently registered in this via session.
+-- Reads the registry that via writes (resolved via the VIA_SESSION manifest).
+-- Returns a list of { id, role, command, primary } tables (empty on failure).
+function M.agent.list()
+  local session_path = vim.env.VIA_SESSION
+  if not session_path or session_path == "" then
+    return {}
+  end
+
+  local ok, agents = pcall(function()
+    local manifest = decode(read_file(session_path) or "")
+    if type(manifest) ~= "table" or not manifest.agents_dir then
+      return {}
+    end
+    local registry = read_file(manifest.agents_dir .. "/registry.json")
+    if not registry then
+      return {}
+    end
+    return decode(registry)
+  end)
+
+  if ok and type(agents) == "table" then
+    return agents
+  end
+  return {}
+end
+
+local function complete_agent_ids()
+  local ids = {}
+  for _, agent in ipairs(M.agent.list()) do
+    if agent.id and agent.id ~= "orchestrator" then
+      table.insert(ids, agent.id)
+    end
+  end
+  return ids
+end
+
+vim.api.nvim_create_user_command("ViaAgentDel", function(opts)
+  local id = vim.trim(opts.args)
+  if id == "" then
+    vim.notify("via: usage :ViaAgentDel <agent-id>", vim.log.levels.WARN)
+    return
+  end
+  M.agent.del(id)
+end, {
+  nargs = 1,
+  desc = "Terminate a sub-agent pane in this via session",
+  complete = function(arglead)
+    local matches = {}
+    for _, id in ipairs(complete_agent_ids()) do
+      if id:find("^" .. vim.pesc(arglead)) then
+        table.insert(matches, id)
+      end
+    end
+    return matches
+  end,
+})
 
 return M

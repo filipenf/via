@@ -14,6 +14,14 @@ use super::render::{DamageRect, draw_pane_focus_chrome, draw_ratatui_buffer};
 
 const TURN_PROGRESS_ID: &str = "__turn";
 
+/// ACP UI pane plus bus identity (orchestrator when used as the primary agent).
+pub(super) struct AcpAgentPane {
+    pub(super) pane: AcpPane,
+    pub(super) id: String,
+    pub(super) label: String,
+    pub(super) command: Option<String>,
+}
+
 pub(super) struct AcpPane {
     metrics: TerminalMetrics,
     theme: TerminalTheme,

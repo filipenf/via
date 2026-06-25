@@ -46,9 +46,35 @@ is injected into `~/.local/share/via/lua/` at startup). Example usage:
 ```lua
 local via = require('via')
 via.agent.spawn("reviewer", "reviewer")                 -- spawn a reviewer pane
+via.agent.del("reviewer")                                 -- terminate a sub-agent when done
 via.agent.send("reviewer", "please review this diff", false) -- send without stealing focus
 via.agent.send(nil, "hello orchestrator")               -- send to the primary agent (focus=true by default)
+for _, agent in ipairs(via.agent.list()) do print(agent.id) end -- discover running agents
 ```
+
+**Agent-to-agent communication (the agent bus)**
+
+Agents running inside via can discover, spawn, and message each other through the
+`via agent` CLI (documented for agents in the bundled `via-agents` skill). Each
+agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
+
+```bash
+via agent whoami                                  # this agent's id/role/session
+via agent list                                    # agents running in this session
+via agent spawn --id reviewer --role reviewer     # ask via to open a reviewer pane
+via agent send --to reviewer -m "review this"     # queue a message + deliver it
+via agent inbox                                    # read (and clear) your mailbox
+```
+
+Coordination has two modes. **PTY** agents are interactive: a send only pings
+their inbox and they act manually. **ACP** agents (spawned with a command ending
+in `acp`) are orchestrated: a send is delivered as a prompt, so their next turn
+starts automatically. Automatic handoff (e.g. orchestrator → reviewer → back) is
+therefore ACP-only; the mailbox is always written for durability.
+
+Messages are delivered to a per-agent mailbox (the source of truth) under the
+session runtime directory; the recipient's pane also gets a one-line ping unless
+you pass `--no-notify`.
 
 ## Work in progress
 
@@ -58,8 +84,8 @@ it has some rough edges still. Some things I have planned:
 - Review process: make it easier to switch between agent/review and send
   feedback to the agent directly from the vim pane (may use some existing nvim
   plugin for this)
-- Diagnostics integration: `via session diagnostics --json`; global agent skill
-  auto-install (`via agent skill install` / `status`)
+- Diagnostics integration: `via session diagnostics --json`; plugin skills
+  auto-install (`via plugin install` / `status`)
 - Better use of LSP: the symbol search could be further updated to highlight
   known symbols on the agent pane
 
@@ -130,6 +156,7 @@ nvim = "nvim"
 agent = "opencode acp"
 agent_pane_cols = "80:120"
 review_backend = "nvim"
+plugin_dir = "~/my-via-plugin"
 ```
 
 Equivalent CLI/env names:
@@ -138,6 +165,12 @@ Equivalent CLI/env names:
 - `--agent` / `VIA_AGENT`
 - `--agent-pane-cols` / `VIA_AGENT_PANE_COLS`
 - `--review-backend` / `VIA_REVIEW_BACKEND`
+- `--plugin-dir` / `VIA_PLUGIN_DIR`
+
+`plugin_dir` points at a local directory with extra agent skills (a `skills/`
+subdirectory of `SKILL.md` files). via overlays them on top of its built-in base
+skills when installing the plugin, so you can ship your own agents/workflows
+without modifying via.
 
 Use `--persist` to write the resolved user-facing config to `via.conf` before
 running. For example, this writes `agent = "opencode"` plus the resolved

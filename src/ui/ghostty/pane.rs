@@ -79,6 +79,7 @@ impl TerminalPane {
         command: &str,
         args: I,
         cwd: &Path,
+        extra_env: &[(&str, &str)],
         output_notifier: N,
     ) -> Result<()>
     where
@@ -90,6 +91,7 @@ impl TerminalPane {
             command,
             args,
             cwd,
+            extra_env,
             self.view.size,
             output_notifier,
         )?));
@@ -102,6 +104,7 @@ impl TerminalPane {
         &mut self,
         command: &str,
         cwd: &Path,
+        extra_env: &[(&str, &str)],
         output_notifier: N,
     ) -> Result<()>
     where
@@ -111,6 +114,7 @@ impl TerminalPane {
             "sh",
             [OsString::from("-lc"), OsString::from(command)],
             cwd,
+            extra_env,
             output_notifier,
         )
     }
@@ -202,6 +206,18 @@ impl TerminalPane {
 
     pub(super) fn clear_selection(&mut self) -> bool {
         self.view.clear_selection()
+    }
+
+    pub(super) fn child_has_exited(&mut self) -> bool {
+        match &self.pty {
+            None => true,
+            Some(pty) => pty.borrow_mut().has_exited(),
+        }
+    }
+
+    pub(super) fn terminate_child(&mut self) {
+        self.pty = None;
+        let _ = self.view.clear_pty_response_writer();
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {

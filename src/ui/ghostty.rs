@@ -33,7 +33,7 @@ mod pane_controller;
 mod render;
 
 use acp_modal::{AcpModalState, render_acp_modal_buffer};
-use acp_pane::AcpPane;
+use acp_pane::{AcpAgentPane, AcpPane};
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers, paste_requested, read_clipboard_text};
@@ -150,15 +150,19 @@ struct WinitGhosttyApp {
 
 enum AppPane {
     Terminal(TerminalPaneController),
-    Acp(AcpPane),
+    Acp(AcpAgentPane),
 }
 
 impl AppPane {
-    fn is_agent_terminal(&self) -> bool {
+    fn is_agent_pane(&self) -> bool {
         match self {
             Self::Terminal(pane) => matches!(pane.role(), PaneRole::AgentTerminal { .. }),
-            Self::Acp(_) => false,
+            Self::Acp(_) => true,
         }
+    }
+
+    fn is_agent_terminal(&self) -> bool {
+        matches!(self, Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }))
     }
 
     fn agent_id_matches(&self, want: &str) -> bool {
@@ -166,7 +170,28 @@ impl AppPane {
             Self::Terminal(pane) => {
                 matches!(pane.role(), PaneRole::AgentTerminal { id, .. } if id == want)
             }
-            Self::Acp(_) => false,
+            Self::Acp(acp) => acp.id == want,
+        }
+    }
+
+    /// Discovery record for an agent pane, or `None` for non-agent panes.
+    fn agent_record(&self) -> Option<crate::agent_bus::AgentRecord> {
+        match self {
+            Self::Terminal(pane) => match pane.role() {
+                PaneRole::AgentTerminal { id, label, .. } => Some(crate::agent_bus::AgentRecord {
+                    id: id.clone(),
+                    role: Some(label.clone()),
+                    command: pane.command().map(str::to_string),
+                    primary: id == "orchestrator",
+                }),
+                _ => None,
+            },
+            Self::Acp(acp) => Some(crate::agent_bus::AgentRecord {
+                id: acp.id.clone(),
+                role: Some(acp.label.clone()),
+                command: acp.command.clone(),
+                primary: acp.id == "orchestrator",
+            }),
         }
     }
 
@@ -177,10 +202,33 @@ impl AppPane {
         }
     }
 
-    fn as_acp_mut(&mut self) -> Option<&mut AcpPane> {
+    fn as_acp_mut(&mut self) -> Option<&mut AcpAgentPane> {
         match self {
             Self::Terminal(_) => None,
             Self::Acp(pane) => Some(pane),
+        }
+    }
+
+    fn acp_pane_mut(&mut self) -> Option<&mut AcpPane> {
+        self.as_acp_mut().map(|acp| &mut acp.pane)
+    }
+
+    /// Bus id if this is an ACP agent pane.
+    fn acp_id(&self) -> Option<&str> {
+        match self {
+            Self::Acp(acp) => Some(acp.id.as_str()),
+            Self::Terminal(_) => None,
+        }
+    }
+
+    /// Bus id of this pane if it is any kind of agent pane (terminal or ACP).
+    fn agent_id(&self) -> Option<String> {
+        match self {
+            Self::Terminal(pane) => match pane.role() {
+                PaneRole::AgentTerminal { id, .. } => Some(id.clone()),
+                _ => None,
+            },
+            Self::Acp(acp) => Some(acp.id.clone()),
         }
     }
 
@@ -189,8 +237,8 @@ impl AppPane {
             Self::Terminal(pane) => {
                 pane.resize_with_metrics(width, height, metrics);
             }
-            Self::Acp(pane) => {
-                pane.resize_with_metrics(width, height, metrics);
+            Self::Acp(acp) => {
+                acp.pane.resize_with_metrics(width, height, metrics);
             }
         }
     }
@@ -198,7 +246,7 @@ impl AppPane {
     fn apply_theme(&mut self, theme: &config::TerminalTheme) {
         match self {
             Self::Terminal(pane) => pane.apply_theme(theme),
-            Self::Acp(pane) => pane.apply_theme(theme),
+            Self::Acp(acp) => acp.pane.apply_theme(theme),
         }
     }
 
@@ -216,6 +264,29 @@ impl AppPane {
         }
     }
 
+    fn has_exited_agent(&mut self) -> bool {
+        match self {
+            Self::Terminal(pane) => pane.has_exited(),
+            Self::Acp(_) => false,
+        }
+    }
+
+    fn terminate_agent(&mut self) {
+        if let Self::Terminal(pane) = self {
+            pane.terminate_agent();
+        }
+    }
+
+    fn is_terminable_sub_agent(&self) -> bool {
+        match self {
+            Self::Terminal(pane) => matches!(
+                pane.role(),
+                PaneRole::AgentTerminal { id, .. } if id != "orchestrator"
+            ),
+            Self::Acp(acp) => acp.id != "orchestrator",
+        }
+    }
+
     fn drain_agent_output_chunks(&mut self) -> Option<Vec<Vec<u8>>> {
         match self {
             Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }) => {
@@ -228,7 +299,7 @@ impl AppPane {
     fn tick_progress(&mut self) -> bool {
         match self {
             Self::Terminal(_) => false,
-            Self::Acp(pane) => pane.tick_progress(),
+            Self::Acp(acp) => acp.pane.tick_progress(),
         }
     }
 
@@ -245,8 +316,8 @@ impl AppPane {
             Self::Terminal(pane) => {
                 pane.handle_terminal_key(pressed_keys, key, text, repeat, modifiers, suppress_input)
             }
-            Self::Acp(pane) => Ok(handle_acp_key_event(
-                pane,
+            Self::Acp(acp) => Ok(handle_acp_key_event(
+                &mut acp.pane,
                 pressed_keys,
                 key,
                 text,
@@ -260,8 +331,8 @@ impl AppPane {
     fn handle_text_commit(&mut self, text: &str, modifiers: Modifiers) -> Result<PaneEventOutcome> {
         match self {
             Self::Terminal(pane) => pane.handle_text_commit(text, modifiers),
-            Self::Acp(pane) => Ok(PaneEventOutcome {
-                dirty: pane.handle_text_input(text, modifiers),
+            Self::Acp(acp) => Ok(PaneEventOutcome {
+                dirty: acp.pane.handle_text_input(text, modifiers),
                 force_redraw: false,
                 command: None,
             }),
@@ -279,7 +350,7 @@ impl AppPane {
             Self::Terminal(pane) => {
                 pane.handle_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
             }
-            Self::Acp(pane) => Ok(handle_acp_mouse_wheel(pane, scroll_delta)),
+            Self::Acp(acp) => Ok(handle_acp_mouse_wheel(&mut acp.pane, scroll_delta)),
         }
     }
 
@@ -342,7 +413,7 @@ impl AppPane {
                 redraw_chrome,
                 damage,
             ),
-            Self::Acp(pane) => pane.draw(
+            Self::Acp(acp) => acp.pane.draw(
                 font_renderer,
                 buffer,
                 buffer_width,
@@ -529,9 +600,11 @@ impl WinitGhosttyApp {
                 &self.config.nvim_command,
                 nvim_args,
                 &self.config.working_directory,
+                &[],
                 self.output_notifier.clone(),
             )?;
             self.relayout();
+            self.write_agent_registry();
             info!(panes = self.panes.len(), "native terminal window ready");
         }
 
@@ -573,12 +646,17 @@ impl WinitGhosttyApp {
         if self.config.agent_command.is_some() {
             if self.config.is_acp_agent() {
                 let rect = layout.pane(1);
-                panes.push(AppPane::Acp(AcpPane::new(
-                    rect.width,
-                    rect.height,
-                    metrics,
-                    &self.terminal_config.theme,
-                )));
+                panes.push(AppPane::Acp(AcpAgentPane {
+                    pane: AcpPane::new(
+                        rect.width,
+                        rect.height,
+                        metrics,
+                        &self.terminal_config.theme,
+                    ),
+                    id: "orchestrator".to_string(),
+                    label: "agent".to_string(),
+                    command: self.config.agent_command.clone(),
+                }));
             } else if let Some(agent_command) = self.config.agent_command.as_deref() {
                 let mut pane = TerminalPane::new(
                     "agent",
@@ -590,12 +668,17 @@ impl WinitGhosttyApp {
                 pane.spawn_shell_command(
                     agent_command,
                     &self.config.working_directory,
+                    &[
+                        (crate::agent_bus::VIA_AGENT_ID_ENV, "orchestrator"),
+                        (crate::agent_bus::VIA_AGENT_ROLE_ENV, "orchestrator"),
+                    ],
                     self.output_notifier.clone(),
                 )?;
                 panes.push(AppPane::Terminal(TerminalPaneController::new(
                     PaneRole::AgentTerminal {
                         id: "orchestrator".to_string(),
                         label: "agent".to_string(),
+                        command: Some(agent_command.to_string()),
                     },
                     pane,
                     self.config.scroll_sensitivity,
@@ -622,37 +705,126 @@ impl WinitGhosttyApp {
         // Use current layout dimensions to size the new pane; relayout will adjust.
         let (w, h) = (self.width, self.height);
         let label = role.unwrap_or(id).to_string();
-        // Leak a small string for the static title requirement of TerminalPane.
-        let title: &'static str = Box::leak(label.clone().into_boxed_str());
-        let mut pane =
-            TerminalPane::new(title, w / 2, h / 2, metrics, &self.terminal_config.theme)?;
         // Prefer the command passed to SpawnAgent, then the configured agent_command,
         // finally fall back to $SHELL so the pane is at least usable.
         let cmd = command
             .map(|s| s.to_string())
             .or_else(|| self.config.agent_command.clone())
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
-        pane.spawn_shell_command(
-            &cmd,
-            &self.config.working_directory,
-            self.output_notifier.clone(),
-        )?;
-        self.panes
-            .push(AppPane::Terminal(TerminalPaneController::new(
-                PaneRole::AgentTerminal {
-                    id: id.to_string(),
-                    label,
-                },
+
+        if crate::config::is_acp_command(&cmd) {
+            // ACP sub-agent: via drives it over the protocol (the mediator owns the client and
+            // connects it). This pane only renders the transcript; no PTY child here.
+            let pane = AcpPane::new(w / 2, h / 2, metrics, &self.terminal_config.theme);
+            self.panes.push(AppPane::Acp(AcpAgentPane {
                 pane,
-                self.config.scroll_sensitivity,
-            )));
-        // Focus the newly created agent pane and ensure we are in a visible split layout.
-        self.active_pane = self.panes.len() - 1;
-        self.pane_layout_mode = PaneLayoutMode::Split;
+                id: id.to_string(),
+                label,
+                command: Some(cmd),
+            }));
+        } else {
+            // Leak a small string for the static title requirement of TerminalPane.
+            let title: &'static str = Box::leak(label.clone().into_boxed_str());
+            let mut pane =
+                TerminalPane::new(title, w / 2, h / 2, metrics, &self.terminal_config.theme)?;
+            let role_label = role.unwrap_or(id);
+            pane.spawn_shell_command(
+                &cmd,
+                &self.config.working_directory,
+                &[
+                    (crate::agent_bus::VIA_AGENT_ID_ENV, id),
+                    (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
+                ],
+                self.output_notifier.clone(),
+            )?;
+            self.panes
+                .push(AppPane::Terminal(TerminalPaneController::new(
+                    PaneRole::AgentTerminal {
+                        id: id.to_string(),
+                        label,
+                        command: Some(cmd),
+                    },
+                    pane,
+                    self.config.scroll_sensitivity,
+                )));
+        }
+
+        // Helpers join the session (registry + Alt+1..9 switching) without hijacking the view:
+        // keep the current focus and layout so an in-progress orchestrator pane is not displaced.
         self.relayout();
+        self.write_agent_registry();
         self.dirty = true;
         self.force_redraw = true;
         Ok(())
+    }
+
+    fn terminate_agent_pane(&mut self, id: &str) -> Result<()> {
+        if id == "orchestrator" {
+            info!(%id, "terminate_agent called for orchestrator – ignoring");
+            return Ok(());
+        }
+
+        let Some(index) = self.panes.iter().position(|pane| pane.agent_id_matches(id)) else {
+            info!(%id, "terminate_agent called for unknown id – ignoring");
+            return Ok(());
+        };
+
+        if !self.panes[index].is_terminable_sub_agent() {
+            info!(%id, "terminate_agent refused for non-sub-agent pane");
+            return Ok(());
+        }
+
+        self.panes[index].terminate_agent();
+        self.panes.remove(index);
+
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len().saturating_sub(1);
+        }
+        if self
+            .acp_modal
+            .as_ref()
+            .is_some_and(|modal| modal.agent_id == id)
+        {
+            self.acp_modal = None;
+        }
+
+        self.relayout();
+        self.write_agent_registry();
+        self.dirty = true;
+        self.force_redraw = true;
+        info!(%id, "terminated agent pane");
+        Ok(())
+    }
+
+    /// Persist the current set of agent panes to the registry so `via agent list`
+    /// (and Lua's `require('via').agent.list()`) can discover them. Best-effort.
+    fn write_agent_registry(&self) {
+        let records: Vec<crate::agent_bus::AgentRecord> = self
+            .panes
+            .iter()
+            .filter_map(|pane| pane.agent_record())
+            .collect();
+        if let Err(error) = crate::agent_bus::write_registry(&self.config.agents_dir, &records) {
+            warn!(%error, "failed to write agent registry");
+        }
+    }
+
+    /// Drop terminal agent panes whose PTY child has exited and refresh the registry.
+    fn prune_exited_agent_panes(&mut self) {
+        let before = self.panes.len();
+        self.panes.retain_mut(|pane| !pane.has_exited_agent());
+        if self.panes.len() == before {
+            return;
+        }
+
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len().saturating_sub(1);
+        }
+        self.write_agent_registry();
+        self.relayout();
+        self.dirty = true;
+        self.force_redraw = true;
+        info!("removed exited agent pane(s); refreshed agent registry");
     }
 
     fn resize_surface(
@@ -816,19 +988,27 @@ impl WinitGhosttyApp {
         };
         match code {
             KeyCode::Escape => {
+                let agent_id = modal.agent_id.clone();
                 let id = modal.jsonrpc_id.clone();
                 let result = modal.result_cancelled();
                 self.acp_modal = None;
-                self.events
-                    .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
+                    agent_id,
+                    id,
+                    result,
+                }));
                 true
             }
             KeyCode::Enter | KeyCode::NumpadEnter => {
+                let agent_id = modal.agent_id.clone();
                 let id = modal.jsonrpc_id.clone();
                 let result = modal.result_for_selection(modal.focused);
                 self.acp_modal = None;
-                self.events
-                    .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
+                    agent_id,
+                    id,
+                    result,
+                }));
                 true
             }
             KeyCode::ArrowUp => {
@@ -859,11 +1039,15 @@ impl WinitGhosttyApp {
         if index >= modal.options.len() {
             return false;
         }
+        let agent_id = modal.agent_id.clone();
         let id = modal.jsonrpc_id.clone();
         let result = modal.result_for_selection(index);
         self.acp_modal = None;
-        self.events
-            .try_send(Event::Ui(UiEvent::AcpJsonRpcResult { id, result }));
+        self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
+            agent_id,
+            id,
+            result,
+        }));
         true
     }
 
@@ -991,6 +1175,7 @@ impl WinitGhosttyApp {
             pane.spawn_shell_command(
                 hunk_review_command(),
                 &self.config.working_directory,
+                &[],
                 self.output_notifier.clone(),
             )?;
             let controller = TerminalPaneController::new(
@@ -1199,8 +1384,9 @@ impl WinitGhosttyApp {
                         .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
                 }
                 PaneCommand::AgentPromptSubmitted { text } => {
+                    let agent_id = self.panes.get(self.active_pane).and_then(AppPane::agent_id);
                     self.events
-                        .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text }));
+                        .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text, agent_id }));
                 }
             }
         }
@@ -1246,6 +1432,7 @@ impl WinitGhosttyApp {
         for pane in self.panes.iter_mut() {
             self.dirty |= pane.tick_progress();
         }
+        self.prune_exited_agent_panes();
         Ok(())
     }
 
@@ -1293,8 +1480,15 @@ impl WinitGhosttyApp {
             .and_then(AppPane::as_terminal_mut)
     }
 
-    fn acp_pane_mut(&mut self) -> Option<&mut AcpPane> {
-        self.panes.iter_mut().find_map(AppPane::as_acp_mut)
+    /// ACP transcript pane for `agent_id`, falling back to the first ACP pane (covers an empty
+    /// id or the single-agent case).
+    fn acp_pane_for(&mut self, agent_id: &str) -> Option<&mut AcpPane> {
+        let idx = self
+            .panes
+            .iter()
+            .position(|pane| pane.agent_id_matches(agent_id) && pane.acp_id().is_some())
+            .or_else(|| self.panes.iter().position(|pane| pane.acp_id().is_some()))?;
+        self.panes[idx].acp_pane_mut()
     }
 
     fn render(&mut self) -> Result<()> {
@@ -1450,18 +1644,15 @@ impl WinitGhosttyApp {
                     focus_agent,
                     target_agent_id,
                 } => {
-                    // Determine target pane first (specific id or first AgentTerminal).
                     let idx = if let Some(ref want) = target_agent_id {
                         self.panes.iter().position(|p| p.agent_id_matches(want))
                     } else {
                         None
                     };
-                    let idx =
-                        idx.or_else(|| self.panes.iter().position(AppPane::is_agent_terminal));
+                    let idx = idx.or_else(|| self.panes.iter().position(AppPane::is_agent_pane));
 
                     if let Some(i) = idx {
                         if focus_agent {
-                            // Focus the specific target pane (not a hardcoded one).
                             if matches!(self.pane_layout_mode, PaneLayoutMode::PaneMaximized(_)) {
                                 self.pane_layout_mode = PaneLayoutMode::PaneMaximized(i);
                             }
@@ -1470,27 +1661,44 @@ impl WinitGhosttyApp {
                         debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
                         if let Some(agent_pane) = self.panes[i].as_terminal_mut() {
                             agent_pane.write_all(payload.as_bytes())?;
+                        } else if let Some(acp) = self.panes[i].acp_pane_mut() {
+                            acp.append_transcript_chunk("system", &payload);
+                            self.dirty = true;
+                            self.force_redraw = true;
                         }
                     } else {
                         warn!("no agent pane available to receive input");
                     }
                     self.pending_agent_write = None;
                 }
-                UiCommand::AcpTranscriptChunk { kind, text } => {
-                    let Some(acp_pane) = self.acp_pane_mut() else {
+                UiCommand::AcpTranscriptChunk {
+                    agent_id,
+                    kind,
+                    text,
+                } => {
+                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
                         continue;
                     };
-                    debug!(kind, "forwarding ACP transcript chunk to pane");
+                    debug!(agent_id, kind, "forwarding ACP transcript chunk to pane");
                     acp_pane.append_transcript_chunk(&kind, &text);
                 }
-                UiCommand::AcpProgress { id, label, active } => {
-                    let Some(acp_pane) = self.acp_pane_mut() else {
+                UiCommand::AcpProgress {
+                    agent_id,
+                    id,
+                    label,
+                    active,
+                } => {
+                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
                         continue;
                     };
-                    debug!(id, label, active, "forwarding ACP progress update to pane");
+                    debug!(
+                        agent_id,
+                        id, label, active, "forwarding ACP progress to pane"
+                    );
                     acp_pane.update_progress(id, label, active);
                 }
                 UiCommand::AcpModalPrompt {
+                    agent_id,
                     jsonrpc_id,
                     title,
                     message,
@@ -1498,7 +1706,7 @@ impl WinitGhosttyApp {
                     kind,
                 } => {
                     self.acp_modal = Some(AcpModalState::new(
-                        jsonrpc_id, title, message, options, kind,
+                        agent_id, jsonrpc_id, title, message, options, kind,
                     ));
                 }
                 UiCommand::SpawnAgent { id, role, command } => {
@@ -1506,6 +1714,11 @@ impl WinitGhosttyApp {
                     if let Err(e) = self.spawn_agent_pane(&id, role.as_deref(), command.as_deref())
                     {
                         error!(%e, "failed to spawn agent pane");
+                    }
+                }
+                UiCommand::TerminateAgent { id } => {
+                    if let Err(e) = self.terminate_agent_pane(&id) {
+                        error!(%e, "failed to terminate agent pane");
                     }
                 }
             }
@@ -1825,12 +2038,12 @@ mod tests {
     #[test]
     fn app_pane_routes_acp_prompt_submission() {
         let terminal_config = TerminalConfig::default();
-        let mut pane = AppPane::Acp(AcpPane::new(
-            100,
-            50,
-            terminal_config.metrics,
-            &terminal_config.theme,
-        ));
+        let mut pane = AppPane::Acp(AcpAgentPane {
+            pane: AcpPane::new(100, 50, terminal_config.metrics, &terminal_config.theme),
+            id: "orchestrator".to_string(),
+            label: "agent".to_string(),
+            command: None,
+        });
 
         let no_keys: &[Key] = &[];
         pane.handle_key_event(
@@ -2273,10 +2486,12 @@ mod tests {
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
             nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
             editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
+            agents_dir: PathBuf::from("/tmp/via-agents"),
             nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
             nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
             lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
             working_directory: PathBuf::from("/repo"),
+            plugin_dir: None,
         };
         let args = nvim_args(&config);
 

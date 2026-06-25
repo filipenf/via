@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-use crate::event::{AcpPermissionOption, AgentEvent, Event};
+use crate::event::{AcpAgentEvent, AcpPermissionOption, AgentEvent, Event};
 use crate::mediator::EventSender;
 
 /// Minimal ACP (Agent Client Protocol) client.
@@ -16,6 +16,9 @@ use crate::mediator::EventSender;
 pub struct AcpClient {
     child: Child,
     next_id: u64,
+    /// Bus id of the agent this client drives (e.g. "orchestrator", "reviewer").
+    /// Used to stamp emitted events so the UI can route them to the right pane.
+    agent_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,13 +158,23 @@ impl AcpClient {
     /// Spawn an ACP-capable agent as a subprocess.
     ///
     /// The command should be something like "opencode acp", "cursor-agent acp", etc.
-    pub async fn spawn(command: &str, args: &[&str]) -> Result<Self> {
-        debug!(command, ?args, "spawning ACP agent subprocess");
-        let mut child = Command::new(command)
+    pub async fn spawn(
+        agent_id: &str,
+        command: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self> {
+        debug!(agent_id, command, ?args, "spawning ACP agent subprocess");
+        let mut child_cmd = Command::new(command);
+        child_cmd
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            child_cmd.env(key, value);
+        }
+        let mut child = child_cmd
             .spawn()
             .with_context(|| format!("failed to spawn ACP agent: {command}"))?;
 
@@ -180,7 +193,11 @@ impl AcpClient {
         }
 
         debug!(command, "ACP agent process started");
-        Ok(Self { child, next_id: 1 })
+        Ok(Self {
+            child,
+            next_id: 1,
+            agent_id: agent_id.to_string(),
+        })
     }
 
     /// Perform the ACP initialize handshake.
@@ -230,18 +247,19 @@ impl AcpClient {
     /// This is the simplest way to observe streaming responses and
     /// notifications while we build proper rendering.
     pub fn spawn_reader(&mut self, events: EventSender) {
+        let agent_id = self.agent_id.clone();
         if let Some(stdout) = self.child.stdout.take() {
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        if let Some(event) = log_acp_line(&line) {
+                        if let Some(event) = log_acp_line(&line, &agent_id) {
                             events.send(Event::Agent(event)).await;
                         }
                     }
                 }
-                tracing::debug!("ACP agent stdout closed");
+                tracing::debug!(agent_id, "ACP agent stdout closed");
             });
         }
     }
@@ -358,7 +376,7 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Reply to a JSON-RPC **request** from the agent (e.g. `session/request_permission`, `cursor/ask_question`).
+    /// Reply to a JSON-RPC **request** from the agent (e.g. `session/request_permission`, ask-question methods).
     pub async fn send_jsonrpc_result(
         &mut self,
         id: serde_json::Value,
@@ -457,7 +475,7 @@ fn jsonrpc_id_matches(received: &serde_json::Value, expected: u64) -> bool {
 fn parse_permission_request(
     jsonrpc_id: serde_json::Value,
     params: serde_json::Value,
-) -> Option<AgentEvent> {
+) -> Option<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)?
@@ -489,7 +507,7 @@ fn parse_permission_request(
     if options.is_empty() {
         return None;
     }
-    Some(AgentEvent::AcpPermissionRequest {
+    Some(AcpAgentEvent::PermissionRequest {
         jsonrpc_id,
         session_id,
         tool_call_id,
@@ -498,10 +516,10 @@ fn parse_permission_request(
     })
 }
 
-fn parse_cursor_ask_question(
+fn parse_ask_question(
     jsonrpc_id: serde_json::Value,
     params: serde_json::Value,
-) -> Option<AgentEvent> {
+) -> Option<AcpAgentEvent> {
     let title = params
         .get("title")
         .and_then(serde_json::Value::as_str)
@@ -532,7 +550,7 @@ fn parse_cursor_ask_question(
     if options.is_empty() {
         return None;
     }
-    Some(AgentEvent::AcpCursorAskQuestion {
+    Some(AcpAgentEvent::AskQuestion {
         jsonrpc_id,
         title,
         question_id,
@@ -541,7 +559,7 @@ fn parse_cursor_ask_question(
     })
 }
 
-fn log_acp_line(line: &str) -> Option<AgentEvent> {
+fn log_acp_line(line: &str, agent_id: &str) -> Option<AgentEvent> {
     // Keep raw logs around while ACP support is still being brought up; these are invaluable
     // when a specific agent sends a shape we do not recognize yet.
     tracing::info!(raw = %line, "ACP message from agent");
@@ -563,7 +581,7 @@ fn log_acp_line(line: &str) -> Option<AgentEvent> {
             id, method, params, ..
         } => match method.as_str() {
             "session/request_permission" => parse_permission_request(id, params),
-            "cursor/ask_question" => parse_cursor_ask_question(id, params),
+            "cursor/ask_question" | "_zed/askQuestion" => parse_ask_question(id, params),
             _ => {
                 tracing::info!(?id, %method, "ACP request from agent (no handler)");
                 None
@@ -579,7 +597,7 @@ fn log_acp_line(line: &str) -> Option<AgentEvent> {
                 .and_then(serde_json::Value::as_str)
                 .is_some()
             {
-                Some(AgentEvent::AcpProgress {
+                Some(AcpAgentEvent::Progress {
                     id: "__turn".to_string(),
                     label: String::new(),
                     active: false,
@@ -589,9 +607,10 @@ fn log_acp_line(line: &str) -> Option<AgentEvent> {
             }
         }
     }
+    .map(|event| AgentEvent::acp(agent_id, event))
 }
 
-fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
+fn log_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
@@ -634,7 +653,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
             if text.is_empty() {
                 None
             } else {
-                Some(AgentEvent::AcpTranscriptChunk {
+                Some(AcpAgentEvent::TranscriptChunk {
                     kind: kind.to_string(),
                     text: text.to_string(),
                 })
@@ -655,7 +674,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
             tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
-            Some(AgentEvent::AcpProgress {
+            Some(AcpAgentEvent::Progress {
                 id: tool_call_id.to_string(),
                 label: title.to_string(),
                 active: status != "completed" && status != "failed" && status != "cancelled",
@@ -682,7 +701,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
                 status,
                 "ACP tool call updated"
             );
-            Some(AgentEvent::AcpProgress {
+            Some(AcpAgentEvent::Progress {
                 id: tool_call_id.to_string(),
                 label: title.to_string(),
                 active: status != "completed" && status != "failed" && status != "cancelled",
@@ -745,4 +764,67 @@ async fn selected_file_resource(
         mime_type: Some("text/plain".to_string()),
         text,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_acp_line_tags_events_with_agent_id() {
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#;
+        let event = log_acp_line(line, "reviewer").expect("expected transcript chunk");
+        assert!(matches!(
+            event,
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::TranscriptChunk { kind, text }
+            } if agent_id == "reviewer" && kind == "agent_message_chunk" && text == "hi"
+        ));
+    }
+
+    #[test]
+    fn agent_event_acp_constructor() {
+        let event = AgentEvent::acp(
+            "coder",
+            AcpAgentEvent::Progress {
+                id: "t1".to_string(),
+                label: "Working".to_string(),
+                active: true,
+            },
+        );
+        assert!(matches!(
+            event,
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::Progress { id, .. }
+            } if agent_id == "coder" && id == "t1"
+        ));
+    }
+
+    #[test]
+    fn log_acp_line_parses_ask_question_methods() {
+        let params = r#"{"title":"Pick one","questions":[{"id":"q1","prompt":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        for method in ["cursor/ask_question", "_zed/askQuestion"] {
+            let line = format!(
+                r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{params}}}"#
+            );
+            let event = log_acp_line(&line, "orchestrator").expect("expected ask question");
+            assert!(matches!(
+                event,
+                AgentEvent::Acp {
+                    agent_id,
+                    event: AcpAgentEvent::AskQuestion {
+                        title,
+                        question_id,
+                        prompt,
+                        ..
+                    }
+                } if agent_id == "orchestrator"
+                    && title == "Pick one"
+                    && question_id == "q1"
+                    && prompt == "Which?"
+            ));
+        }
+    }
 }

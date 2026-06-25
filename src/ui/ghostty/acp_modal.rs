@@ -7,6 +7,8 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use crate::event::{AcpModalKind, AcpPermissionOption};
 
 pub struct AcpModalState {
+    /// ACP agent whose request this modal answers (for routing the JSON-RPC result back).
+    pub agent_id: String,
     pub jsonrpc_id: serde_json::Value,
     pub title: String,
     pub message: String,
@@ -17,6 +19,7 @@ pub struct AcpModalState {
 
 impl AcpModalState {
     pub fn new(
+        agent_id: String,
         jsonrpc_id: serde_json::Value,
         title: String,
         message: String,
@@ -24,6 +27,7 @@ impl AcpModalState {
         kind: AcpModalKind,
     ) -> Self {
         Self {
+            agent_id,
             jsonrpc_id,
             title,
             message,
@@ -59,7 +63,7 @@ impl AcpModalState {
                     "optionId": option_id,
                 }
             }),
-            AcpModalKind::CursorAskQuestion { question_id } => serde_json::json!({
+            AcpModalKind::AskQuestion { question_id } => serde_json::json!({
                 "outcome": {
                     "outcome": "answered",
                     "answers": [{

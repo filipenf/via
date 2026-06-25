@@ -341,3 +341,6 @@ vim.schedule(function()
   end
   send_clients()
 end)
+
+-- Agent helpers (`ViaAgentDel`, `require('via').agent.*`) live in via.lua.
+pcall(require, "via")

@@ -1,6 +1,5 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -20,6 +19,9 @@ pub struct SessionManifest {
     pub cwd: PathBuf,
     pub nvim_socket: PathBuf,
     pub editor_socket: PathBuf,
+    /// Per-process directory with the agent registry and per-agent mailboxes.
+    #[serde(default)]
+    pub agents_dir: PathBuf,
     #[serde(default)]
     pub started_at_unix: Option<u64>,
 }
@@ -31,7 +33,8 @@ impl SessionManifest {
             cwd: config.working_directory.clone(),
             nvim_socket: config.nvim_socket_path.clone(),
             editor_socket: config.editor_socket_path.clone(),
-            started_at_unix: unix_seconds_now(),
+            agents_dir: config.agents_dir.clone(),
+            started_at_unix: crate::util::unix_seconds_now(),
         }
     }
 
@@ -172,13 +175,6 @@ fn write_atomic_json(path: &Path, manifest: &SessionManifest) -> Result<()> {
     Ok(())
 }
 
-fn unix_seconds_now() -> Option<u64> {
-    SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .ok()
-        .map(|duration| duration.as_secs())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,6 +186,7 @@ mod tests {
             cwd: PathBuf::from("/repo"),
             nvim_socket: PathBuf::from("/tmp/via-nvim-42.sock"),
             editor_socket: PathBuf::from("/tmp/via-editor-42.sock"),
+            agents_dir: PathBuf::from("/tmp/via-42/agents"),
             started_at_unix: Some(1),
         };
         let encoded = serde_json::to_string(&manifest).unwrap();
