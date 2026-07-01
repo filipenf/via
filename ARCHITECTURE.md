@@ -24,6 +24,12 @@ Success criteria called out early:
 Design philosophy: "The editor is the heart, the agent is the brain, and the
 terminal wrapper is the nervous system."
 
+**Orchestration policy:** via **transports** — panes, sockets, ACP sessions, and
+the file-backed mailbox — it does not encode multi-agent workflows in Rust.
+Agents **orchestrate** themselves via skills, CLI (`via agent`), and (eventually)
+MCP tools. The primary interactive pane is always a PTY; spawned helpers use ACP
+when the configured driver supports it.
+
 ## Core components and data flow
 
 ```
@@ -122,10 +128,10 @@ Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
 
 ### Agent side: Normal mode (PTY) vs ACP mode (src/acp.rs + mediator + pty.rs)
 
-- Normal mode (PTY, e.g. `VIA_AGENT="claude"` etc.): a `PtySession` is spawned
+- Normal mode (PTY, e.g. `VIA_AGENT="opencode"`): a `PtySession` is spawned
   for the agent. Output is fed to a libghostty `Terminal` in the agent pane.
   Context is injected by writing text into the PTY.
-- ACP mode (e.g. `VIA_AGENT="opencode acp"` etc.): `AcpClient` spawns the agent
+- ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
   as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, context is
   sent as `context/update` messages. The UI for this path is the Ratatui ACP
   pane (not a raw PTY). Tool permissions and results flow through the mediator.
@@ -135,28 +141,14 @@ prompt, tool result serialization). It is not a full agent SDK.
 
 ### Two coordination modes
 
-These two modes also define how multi-agent coordination works:
+- **PTY = interactive / manual (default primary).** `--agent opencode` starts a PTY
+  pane (bus id `agent`). Bus sends are mailbox-only; read with `via agent inbox`.
+- **ACP = orchestrated / automatic (spawned).** Spawn `orchestrator`, `reviewer`, etc.;
+  via drives them over ACP. Bus sends and pane prompts go through `client.prompt()`.
+  Auto handoff is ACP-only. The PTY `agent` pane remains for interactive work alongside
+  spawned ACP helpers.
 
-- **PTY = interactive / manual.** PTY agents are driven by a human at the
-  keyboard. They do **not** participate in automatic orchestration. A `via agent
-  send` to a PTY recipient only injects a lightweight ping (`[via] new message
-  from <sender>; run via agent inbox to read`); the recipient reads its mailbox
-  with `via agent inbox` and acts when it chooses. via never auto-submits text
-  into an interactive pane.
-- **ACP = orchestrated / automatic.** ACP agents are driven by via over the
-  protocol, so messages can start a turn without human input. The mediator keeps
-  a `HashMap<agent_id, AcpSession>` (the primary is keyed `orchestrator`; spawned
-  subs use their bus id). Inbound text — whether typed into a pane
-  (`AgentPromptSubmitted`) or delivered from the bus (`AgentSend`) — resolves to
-  the recipient's session and goes through a single primitive: `client.prompt()`.
-  Reader output is emitted as `AgentEvent::Acp { agent_id, .. }` so transcript,
-  progress, and permission modals route to the matching pane.
-
-Auto handoff is therefore **ACP-only**: an orchestrator can spawn an ACP sub
-(e.g. a reviewer) and message it, and the sub's next turn starts automatically.
-Handing work *back* to a PTY orchestrator is still manual (it reads its inbox).
-The mailbox is always written for durability and for `--no-notify` sends,
-regardless of recipient type.
+`--agent "… acp"` is rejected at startup; the primary pane is always a PTY.
 
 `src/pty.rs` also provides `CoalescedOutputNotifier` so that bursty PTY readers
 don't flood the UI thread with redraw events.
@@ -185,8 +177,11 @@ dir). There is deliberately no "guess the newest socket" fallback.
 ### Config, sessions, and CLI (src/config.rs, src/session.rs, src/cli/\*)
 
 Config resolution is strict precedence: CLI > env (`VIA_*`) >
-`~/.config/via/via.conf` (TOML) > built-in defaults. `--persist` writes the
-resolved user-facing values.
+`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command must
+be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects whether spawned
+helpers can resolve to ACP (known-agent table or `acp_agent` override). Spawn presets
+(`[agents.orchestrator]`, `[agents.reviewer]`, `[agents.coder]` in `via.conf`, plus
+built-in defaults) fill missing `role` / `command` when opening helper panes.
 
 `SessionGuard` writes (and removes on drop) a per-pid manifest so that
 `via session ...` subcommands and agents running inside the session can find the
@@ -206,8 +201,8 @@ Inter-agent discovery and messaging, all file-backed under a per-process
   a pane (`write_agent_registry`). This is the discovery surface (`via agent list`,
   Lua `require('via').agent.list()`).
 - `inbox/<id>/*.json` — per-recipient mailbox files under `<runtime>/agents/`.
-  `via agent send` appends one file per message (the source of truth) and optionally
-  pings the recipient pane via the existing `agent_send` editor-socket event;
+  `via agent send` appends one file per message (the source of truth) and notifies
+  the mediator for ACP delivery via the `agent_send` editor-socket event;
   `via agent inbox` drains it.
 
 Each agent pane is spawned with `VIA_AGENT_ID`/`VIA_AGENT_ROLE` so an agent knows

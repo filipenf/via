@@ -16,8 +16,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
-use crate::config::{Config, ReviewBackend};
-use crate::event::{Event, UiCommand, UiEvent};
+use crate::config::{Config, PRIMARY_PTY_AGENT_ID, ReviewBackend};
+use crate::event::{AcpHandshakeAction, AcpModalKind, Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 
@@ -178,19 +178,24 @@ impl AppPane {
     fn agent_record(&self) -> Option<crate::agent_bus::AgentRecord> {
         match self {
             Self::Terminal(pane) => match pane.role() {
-                PaneRole::AgentTerminal { id, label, .. } => Some(crate::agent_bus::AgentRecord {
-                    id: id.clone(),
-                    role: Some(label.clone()),
-                    command: pane.command().map(str::to_string),
-                    primary: id == "orchestrator",
-                }),
+                PaneRole::AgentTerminal { id, label, .. } => {
+                    let command = pane.command().map(str::to_string);
+                    Some(crate::agent_bus::AgentRecord {
+                        id: id.clone(),
+                        role: Some(label.clone()),
+                        command: command.clone(),
+                        mode: Some(crate::agent_bus::AgentMode::Pty),
+                        primary: id == PRIMARY_PTY_AGENT_ID,
+                    })
+                }
                 _ => None,
             },
             Self::Acp(acp) => Some(crate::agent_bus::AgentRecord {
                 id: acp.id.clone(),
                 role: Some(acp.label.clone()),
                 command: acp.command.clone(),
-                primary: acp.id == "orchestrator",
+                mode: Some(crate::agent_bus::AgentMode::Acp),
+                primary: false,
             }),
         }
     }
@@ -281,9 +286,9 @@ impl AppPane {
         match self {
             Self::Terminal(pane) => matches!(
                 pane.role(),
-                PaneRole::AgentTerminal { id, .. } if id != "orchestrator"
+                PaneRole::AgentTerminal { id, .. } if id != PRIMARY_PTY_AGENT_ID
             ),
-            Self::Acp(acp) => acp.id != "orchestrator",
+            Self::Acp(_) => true,
         }
     }
 
@@ -608,8 +613,8 @@ impl WinitGhosttyApp {
             )?;
             if let Some(agent_command) = self.config.agent_command.clone() {
                 self.create_agent_pane(
-                    "orchestrator",
-                    Some("orchestrator"),
+                    PRIMARY_PTY_AGENT_ID,
+                    Some("agent"),
                     Some(agent_command.as_str()),
                 )?;
             } else {
@@ -724,8 +729,8 @@ impl WinitGhosttyApp {
     }
 
     fn terminate_agent_pane(&mut self, id: &str) -> Result<()> {
-        if id == "orchestrator" {
-            info!(%id, "terminate_agent called for orchestrator – ignoring");
+        if id == PRIMARY_PTY_AGENT_ID {
+            info!(%id, "terminate_agent called for primary PTY agent – ignoring");
             return Ok(());
         }
 
@@ -941,6 +946,12 @@ impl WinitGhosttyApp {
         }
     }
 
+    fn send_acp_handshake_action(&mut self, agent_id: String, action: AcpHandshakeAction) {
+        self.acp_modal = None;
+        self.events
+            .try_send(Event::Ui(UiEvent::AcpHandshakeAction { agent_id, action }));
+    }
+
     fn handle_acp_modal_winit_key(&mut self, event: &KeyEvent) -> bool {
         let Some(modal) = &mut self.acp_modal else {
             return false;
@@ -951,50 +962,104 @@ impl WinitGhosttyApp {
         let PhysicalKey::Code(code) = event.physical_key else {
             return false;
         };
-        match code {
-            KeyCode::Escape => {
-                let agent_id = modal.agent_id.clone();
-                let id = modal.jsonrpc_id.clone();
-                let result = modal.result_cancelled();
-                self.acp_modal = None;
-                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
-                    agent_id,
-                    id,
-                    result,
-                }));
-                true
+        if modal.kind == AcpModalKind::HandshakeRetry {
+            match code {
+                KeyCode::Escape => {
+                    let agent_id = modal.agent_id.clone();
+                    self.send_acp_handshake_action(agent_id, AcpHandshakeAction::Dismiss);
+                    true
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let agent_id = modal.agent_id.clone();
+                    let option_id = modal
+                        .options
+                        .get(modal.focused)
+                        .map(|opt| opt.option_id.as_str())
+                        .unwrap_or("retry");
+                    let action = match option_id {
+                        "discard" => AcpHandshakeAction::DiscardQueued,
+                        _ => AcpHandshakeAction::Retry,
+                    };
+                    self.send_acp_handshake_action(agent_id, action);
+                    true
+                }
+                KeyCode::ArrowUp => {
+                    modal.move_focus(-1);
+                    true
+                }
+                KeyCode::ArrowDown => {
+                    modal.move_focus(1);
+                    true
+                }
+                KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_handshake_select_digit(0),
+                KeyCode::Digit2 | KeyCode::Numpad2 => self.acp_handshake_select_digit(1),
+                _ => false,
             }
-            KeyCode::Enter | KeyCode::NumpadEnter => {
-                let agent_id = modal.agent_id.clone();
-                let id = modal.jsonrpc_id.clone();
-                let result = modal.result_for_selection(modal.focused);
-                self.acp_modal = None;
-                self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
-                    agent_id,
-                    id,
-                    result,
-                }));
-                true
+        } else {
+            match code {
+                KeyCode::Escape => {
+                    let agent_id = modal.agent_id.clone();
+                    let id = modal.jsonrpc_id.clone();
+                    let result = modal.result_cancelled();
+                    self.acp_modal = None;
+                    self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
+                        agent_id,
+                        id,
+                        result,
+                    }));
+                    true
+                }
+                KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let agent_id = modal.agent_id.clone();
+                    let id = modal.jsonrpc_id.clone();
+                    let result = modal.result_for_selection(modal.focused);
+                    self.acp_modal = None;
+                    self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
+                        agent_id,
+                        id,
+                        result,
+                    }));
+                    true
+                }
+                KeyCode::ArrowUp => {
+                    modal.move_focus(-1);
+                    true
+                }
+                KeyCode::ArrowDown => {
+                    modal.move_focus(1);
+                    true
+                }
+                KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_modal_select_digit(0),
+                KeyCode::Digit2 | KeyCode::Numpad2 => self.acp_modal_select_digit(1),
+                KeyCode::Digit3 | KeyCode::Numpad3 => self.acp_modal_select_digit(2),
+                KeyCode::Digit4 | KeyCode::Numpad4 => self.acp_modal_select_digit(3),
+                KeyCode::Digit5 | KeyCode::Numpad5 => self.acp_modal_select_digit(4),
+                KeyCode::Digit6 | KeyCode::Numpad6 => self.acp_modal_select_digit(5),
+                KeyCode::Digit7 | KeyCode::Numpad7 => self.acp_modal_select_digit(6),
+                KeyCode::Digit8 | KeyCode::Numpad8 => self.acp_modal_select_digit(7),
+                KeyCode::Digit9 | KeyCode::Numpad9 => self.acp_modal_select_digit(8),
+                _ => false,
             }
-            KeyCode::ArrowUp => {
-                modal.move_focus(-1);
-                true
-            }
-            KeyCode::ArrowDown => {
-                modal.move_focus(1);
-                true
-            }
-            KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_modal_select_digit(0),
-            KeyCode::Digit2 | KeyCode::Numpad2 => self.acp_modal_select_digit(1),
-            KeyCode::Digit3 | KeyCode::Numpad3 => self.acp_modal_select_digit(2),
-            KeyCode::Digit4 | KeyCode::Numpad4 => self.acp_modal_select_digit(3),
-            KeyCode::Digit5 | KeyCode::Numpad5 => self.acp_modal_select_digit(4),
-            KeyCode::Digit6 | KeyCode::Numpad6 => self.acp_modal_select_digit(5),
-            KeyCode::Digit7 | KeyCode::Numpad7 => self.acp_modal_select_digit(6),
-            KeyCode::Digit8 | KeyCode::Numpad8 => self.acp_modal_select_digit(7),
-            KeyCode::Digit9 | KeyCode::Numpad9 => self.acp_modal_select_digit(8),
-            _ => false,
         }
+    }
+
+    fn acp_handshake_select_digit(&mut self, index: usize) -> bool {
+        let Some(modal) = &self.acp_modal else {
+            return false;
+        };
+        if modal.kind != AcpModalKind::HandshakeRetry {
+            return false;
+        }
+        let Some(option) = modal.options.get(index) else {
+            return false;
+        };
+        let agent_id = modal.agent_id.clone();
+        let action = match option.option_id.as_str() {
+            "discard" => AcpHandshakeAction::DiscardQueued,
+            _ => AcpHandshakeAction::Retry,
+        };
+        self.send_acp_handshake_action(agent_id, action);
+        true
     }
 
     fn acp_modal_select_digit(&mut self, index: usize) -> bool {
@@ -2464,6 +2529,8 @@ mod tests {
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: None,
+            acp_agent: None,
+            orchestration_enabled: false,
             agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
@@ -2475,6 +2542,7 @@ mod tests {
             lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
             working_directory: PathBuf::from("/repo"),
             plugin_dir: None,
+            agent_presets: crate::config::default_agent_presets(),
         };
         let args = nvim_args(&config);
 

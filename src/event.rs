@@ -32,6 +32,11 @@ pub enum UiEvent {
         id: serde_json::Value,
         result: serde_json::Value,
     },
+    /// User answered a via-owned handshake retry modal (not forwarded to the agent).
+    AcpHandshakeAction {
+        agent_id: String,
+        action: AcpHandshakeAction,
+    },
     Resize {
         columns: u16,
         rows: u16,
@@ -50,6 +55,14 @@ pub struct AcpPermissionOption {
 pub enum AcpModalKind {
     SessionPermission,
     AskQuestion { question_id: String },
+    HandshakeRetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpHandshakeAction {
+    Retry,
+    DiscardQueued,
+    Dismiss,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,9 +118,7 @@ pub enum UiCommand {
         command: Option<String>,
     },
     /// Close a sub-agent pane and tear down its session (PTY or ACP).
-    TerminateAgent {
-        id: String,
-    },
+    TerminateAgent { id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -135,7 +146,7 @@ pub enum EditorEvent {
     },
     AgentSend {
         agent_id: Option<String>,
-        /// Sender id, used to build a mailbox ping for PTY recipients.
+        /// Sender id when the message was already enqueued (CLI path).
         from: Option<String>,
         content: String,
         focus: bool,

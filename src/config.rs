@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
@@ -56,10 +57,27 @@ pub const DEFAULT_AGENT_PANE_MIN_COLS: u16 = 80;
 pub const DEFAULT_AGENT_PANE_MAX_COLS: u16 = 100;
 pub const DEFAULT_SCROLL_SENSITIVITY: f32 = 3.0;
 
+/// Declarative defaults for common spawned agent ids (`orchestrator`, `reviewer`, `coder`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentPreset {
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Optional launch command override; otherwise resolved from the session primary agent.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub nvim_command: String,
+    /// Primary interactive agent (always launched as a PTY pane; must not end with `acp`).
     pub agent_command: Option<String>,
+    /// Explicit ACP launch override for unknown agents (e.g. `claude-code-acp`).
+    pub acp_agent: Option<String>,
+    /// True when the configured agent can be launched in ACP form for spawned helpers
+    /// (known-agent table or `acp_agent` override). Does not upgrade the primary pane.
+    pub orchestration_enabled: bool,
     /// Agent pane width bounds in terminal columns (vertical split only).
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: ReviewBackend,
@@ -76,16 +94,21 @@ pub struct Config {
     /// Optional local directory holding a user plugin (extra skills/agents/workflows),
     /// overlaid on top of the embedded base skills at install time.
     pub plugin_dir: Option<PathBuf>,
+    /// Spawn presets keyed by agent id (built-ins merged with `via.conf` `[agents.*]`).
+    pub agent_presets: HashMap<String, AgentPreset>,
 }
 
 #[derive(Debug, Default, Clone)]
 pub struct ConfigOverrides {
     pub nvim: Option<String>,
     pub agent: Option<String>,
+    /// Override ACP launch command for agents without a built-in mapping.
+    pub acp_agent: Option<String>,
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: Option<ReviewBackend>,
     pub scroll_sensitivity: Option<f32>,
     pub plugin_dir: Option<String>,
+    pub agent_presets: HashMap<String, AgentPreset>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,10 +219,13 @@ impl<'de> Deserialize<'de> for ReviewBackend {
 struct FileConfig {
     nvim: Option<String>,
     agent: Option<String>,
+    acp_agent: Option<String>,
     agent_pane_cols: Option<AgentPaneCols>,
     review_backend: Option<ReviewBackend>,
     scroll_sensitivity: Option<f32>,
     plugin_dir: Option<String>,
+    #[serde(default)]
+    agents: HashMap<String, AgentPreset>,
 }
 
 impl From<FileConfig> for ConfigOverrides {
@@ -207,10 +233,12 @@ impl From<FileConfig> for ConfigOverrides {
         Self {
             nvim: config.nvim,
             agent: config.agent,
+            acp_agent: config.acp_agent,
             agent_pane_cols: config.agent_pane_cols,
             review_backend: config.review_backend,
             scroll_sensitivity: config.scroll_sensitivity,
             plugin_dir: config.plugin_dir,
+            agent_presets: config.agents,
         }
     }
 }
@@ -220,6 +248,7 @@ impl ConfigOverrides {
         Self {
             nvim: env::var("VIA_NVIM").ok(),
             agent: env::var("VIA_AGENT").ok(),
+            acp_agent: env::var("VIA_ACP_AGENT").ok().filter(|s| !s.is_empty()),
             agent_pane_cols: env::var("VIA_AGENT_PANE_COLS")
                 .ok()
                 .and_then(|value| value.parse().ok()),
@@ -230,6 +259,7 @@ impl ConfigOverrides {
                 .ok()
                 .and_then(|value| value.parse().ok()),
             plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
+            agent_presets: HashMap::new(),
         }
     }
 }
@@ -238,10 +268,12 @@ impl ConfigOverrides {
 struct ResolvedUserConfig {
     nvim_command: String,
     agent_command: Option<String>,
+    acp_agent: Option<String>,
     agent_pane_cols: AgentPaneCols,
     review_backend: ReviewBackend,
     scroll_sensitivity: f32,
     plugin_dir: Option<String>,
+    agent_presets: HashMap<String, AgentPreset>,
 }
 
 fn resolve_user_config_from_sources(
@@ -255,6 +287,11 @@ fn resolve_user_config_from_sources(
         .or(file.nvim)
         .unwrap_or_else(|| "nvim".to_owned());
     let agent_command = cli.agent.or(env.agent).or(file.agent);
+    let acp_agent = cli
+        .acp_agent
+        .or(env.acp_agent)
+        .or(file.acp_agent)
+        .filter(|s| !s.is_empty());
     let agent_pane_cols = cli
         .agent_pane_cols
         .or(env.agent_pane_cols)
@@ -279,6 +316,7 @@ fn resolve_user_config_from_sources(
     ResolvedUserConfig {
         nvim_command,
         agent_command,
+        acp_agent,
         agent_pane_cols: agent_pane_cols.unwrap_or(AgentPaneCols {
             min: DEFAULT_AGENT_PANE_MIN_COLS,
             max: DEFAULT_AGENT_PANE_MAX_COLS,
@@ -286,6 +324,7 @@ fn resolve_user_config_from_sources(
         review_backend,
         scroll_sensitivity,
         plugin_dir,
+        agent_presets: file.agent_presets,
     }
 }
 
@@ -299,6 +338,9 @@ pub fn persist_resolved(cli: ConfigOverrides) -> AnyResult<PathBuf> {
     let path = config_file_path()
         .context("cannot determine via config path; set XDG_CONFIG_HOME or HOME")?;
     let config = resolve_user_config(cli)?;
+    if let Some(agent) = &config.agent_command {
+        reject_acp_primary_agent(agent)?;
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create config directory {}", parent.display()))?;
@@ -317,6 +359,12 @@ fn render_user_config(config: &ResolvedUserConfig) -> String {
     if let Some(agent) = &config.agent_command {
         output.push_str(&format!("agent = \"{}\"\n", toml_escape_string(agent)));
     }
+    if let Some(acp_agent) = &config.acp_agent {
+        output.push_str(&format!(
+            "acp_agent = \"{}\"\n",
+            toml_escape_string(acp_agent)
+        ));
+    }
     output.push_str(&format!(
         "agent_pane_cols = \"{}\"\n",
         config.agent_pane_cols
@@ -328,6 +376,15 @@ fn render_user_config(config: &ResolvedUserConfig) -> String {
     ));
     if let Some(dir) = &config.plugin_dir {
         output.push_str(&format!("plugin_dir = \"{}\"\n", toml_escape_string(dir)));
+    }
+    for (id, preset) in &config.agent_presets {
+        output.push_str(&format!("\n[agents.{id}]\n"));
+        if let Some(role) = &preset.role {
+            output.push_str(&format!("role = \"{}\"\n", toml_escape_string(role)));
+        }
+        if let Some(command) = &preset.command {
+            output.push_str(&format!("command = \"{}\"\n", toml_escape_string(command)));
+        }
     }
     output
 }
@@ -346,9 +403,29 @@ fn toml_escape_string(value: &str) -> String {
         .collect()
 }
 
+/// Reject `--agent "… acp"` — the primary pane is always a PTY; spawn orchestration via ACP.
+pub fn reject_acp_primary_agent(agent: &str) -> AnyResult<()> {
+    if is_acp_command(agent) {
+        anyhow::bail!(
+            "primary agent must be a PTY command (not ending with `acp`); \
+             use e.g. `--agent opencode` and spawn an orchestrator with \
+             `via agent spawn --id orchestrator --role orchestrator`, or set `acp_agent` for spawn resolution"
+        );
+    }
+    Ok(())
+}
+
 impl Config {
     pub fn load(cli: ConfigOverrides) -> AnyResult<Self> {
         let user_config = resolve_user_config(cli)?;
+        let agent_command = user_config.agent_command.clone();
+        if let Some(agent) = agent_command.as_deref() {
+            reject_acp_primary_agent(agent)?;
+        }
+        let orchestration_enabled = agent_command
+            .as_deref()
+            .map(|agent| resolve_agent_launch(agent, user_config.acp_agent.as_deref()).acp)
+            .unwrap_or(false);
         let nvim_socket_path = env::var_os("VIA_NVIM_SOCKET")
             .map(PathBuf::from)
             .unwrap_or_else(default_nvim_socket_path);
@@ -371,7 +448,9 @@ impl Config {
 
         Ok(Self {
             nvim_command: user_config.nvim_command,
-            agent_command: user_config.agent_command,
+            agent_command,
+            acp_agent: user_config.acp_agent,
+            orchestration_enabled,
             agent_pane_cols: Some(user_config.agent_pane_cols),
             review_backend: user_config.review_backend,
             scroll_sensitivity: user_config.scroll_sensitivity,
@@ -383,29 +462,136 @@ impl Config {
             lsp_bridge_socket_path,
             working_directory,
             plugin_dir: user_config.plugin_dir.map(PathBuf::from),
+            agent_presets: merge_agent_presets(user_config.agent_presets),
         })
     }
 
-    /// Returns true if the `VIA_AGENT` command ends with the `acp` subcommand.
-    /// In that case we treat the agent as an ACP-only process (no PTY pane).
-    pub fn is_acp_agent(&self) -> bool {
-        self.agent_command
-            .as_deref()
-            .map(is_acp_command)
-            .unwrap_or(false)
+    /// Fill missing spawn `role` / `command` from `[agents.<id>]` presets.
+    pub fn apply_spawn_preset(
+        &self,
+        id: &str,
+        role: Option<String>,
+        command: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        let preset = self.agent_presets.get(id);
+        let role = role.or_else(|| preset.and_then(|p| p.role.clone()));
+        let command = command.or_else(|| preset.and_then(|p| p.command.clone()));
+        (role, command)
     }
 
-    /// Column bounds for the agent pane in vertical split mode (PTY agent only).
+    /// Column bounds for the agent pane in vertical split mode.
     pub fn agent_pane_col_limits(&self) -> Option<(u16, u16)> {
-        if self.agent_command.is_none() || self.is_acp_agent() {
-            return None;
-        }
+        self.agent_command.as_ref()?;
 
         let cols = self.agent_pane_cols.unwrap_or(AgentPaneCols {
             min: DEFAULT_AGENT_PANE_MIN_COLS,
             max: DEFAULT_AGENT_PANE_MAX_COLS,
         });
         Some((cols.min, cols.max))
+    }
+
+    /// Resolve a spawn command: explicit override, else ACP form of the configured agent.
+    pub fn resolve_spawn_command(&self, explicit: Option<&str>) -> ResolvedAgentLaunch {
+        match explicit {
+            Some(command) => resolve_agent_launch(command, self.acp_agent.as_deref()),
+            None => match &self.agent_command {
+                Some(command) => resolve_agent_launch(command, self.acp_agent.as_deref()),
+                None => ResolvedAgentLaunch {
+                    command: std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+                    acp: false,
+                },
+            },
+        }
+    }
+}
+
+/// Result of resolving a user-facing agent string to a launch command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAgentLaunch {
+    pub command: String,
+    pub acp: bool,
+}
+
+/// Bus id of the default interactive PTY agent pane (`--agent opencode`, etc.).
+pub const PRIMARY_PTY_AGENT_ID: &str = "agent";
+
+/// Bus id of the ACP orchestrator when orchestration is active.
+pub const ORCHESTRATOR_AGENT_ID: &str = "orchestrator";
+
+/// Built-in spawn presets; `via.conf` `[agents.*]` entries override per field.
+pub fn default_agent_presets() -> HashMap<String, AgentPreset> {
+    fn preset(role: &str) -> AgentPreset {
+        AgentPreset {
+            role: Some(role.to_string()),
+            command: None,
+        }
+    }
+    HashMap::from([
+        (ORCHESTRATOR_AGENT_ID.to_string(), preset("orchestrator")),
+        ("reviewer".to_string(), preset("reviewer")),
+        ("coder".to_string(), preset("coder")),
+    ])
+}
+
+fn merge_agent_presets(file: HashMap<String, AgentPreset>) -> HashMap<String, AgentPreset> {
+    let mut merged = default_agent_presets();
+    for (id, preset) in file {
+        let entry = merged.entry(id).or_default();
+        if preset.role.is_some() {
+            entry.role = preset.role;
+        }
+        if preset.command.is_some() {
+            entry.command = preset.command;
+        }
+    }
+    merged
+}
+
+/// Resolve a single agent token to an ACP launch command when possible.
+pub fn resolve_agent_launch(agent: &str, acp_override: Option<&str>) -> ResolvedAgentLaunch {
+    let agent = agent.trim();
+    if agent.is_empty() {
+        return ResolvedAgentLaunch {
+            command: String::new(),
+            acp: false,
+        };
+    }
+    if is_acp_command(agent) {
+        return ResolvedAgentLaunch {
+            command: agent.to_string(),
+            acp: true,
+        };
+    }
+    if let Some(override_cmd) = acp_override.filter(|s| !s.is_empty()) {
+        return ResolvedAgentLaunch {
+            command: override_cmd.trim().to_string(),
+            acp: true,
+        };
+    }
+    if let Some(command) = known_acp_launch_for(agent) {
+        return ResolvedAgentLaunch { command, acp: true };
+    }
+    ResolvedAgentLaunch {
+        command: agent.to_string(),
+        acp: false,
+    }
+}
+
+/// Built-in mapping from bare agent binary → ACP launch command.
+fn known_acp_launch_for(agent: &str) -> Option<String> {
+    let parts: Vec<&str> = agent.split_whitespace().collect();
+    if parts.len() != 1 {
+        return None;
+    }
+    let first = parts[0];
+    let name = std::path::Path::new(first)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(first)
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "opencode" | "cursor-agent" | "agent" => Some(format!("{first} acp")),
+        _ => None,
     }
 }
 
@@ -595,26 +781,32 @@ mod tests {
         let file = ConfigOverrides {
             nvim: Some("file-nvim".to_string()),
             agent: Some("file-agent".to_string()),
+            acp_agent: None,
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
             plugin_dir: None,
+            agent_presets: HashMap::new(),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
             agent: Some("env-agent".to_string()),
+            acp_agent: None,
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
             plugin_dir: None,
+            agent_presets: HashMap::new(),
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
             agent: Some("cli-agent".to_string()),
+            acp_agent: None,
             agent_pane_cols: Some(AgentPaneCols { min: 90, max: 110 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(2.0),
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
+            agent_presets: HashMap::new(),
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -635,18 +827,22 @@ mod tests {
         let file = ConfigOverrides {
             nvim: Some("file-nvim".to_string()),
             agent: Some("file-agent".to_string()),
+            acp_agent: None,
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
             plugin_dir: None,
+            agent_presets: HashMap::new(),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
             agent: Some("env-agent".to_string()),
+            acp_agent: None,
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
             plugin_dir: None,
+            agent_presets: HashMap::new(),
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -678,10 +874,12 @@ mod tests {
         let output = render_user_config(&ResolvedUserConfig {
             nvim_command: "nvim-nightly".to_string(),
             agent_command: Some("opencode acp".to_string()),
+            acp_agent: None,
             agent_pane_cols: AgentPaneCols { min: 80, max: 120 },
             review_backend: ReviewBackend::Hunk,
             scroll_sensitivity: 1.5,
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
+            agent_presets: HashMap::new(),
         });
 
         assert_eq!(
@@ -725,6 +923,8 @@ scroll_sensitivity = 1.5
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
+            acp_agent: None,
+            orchestration_enabled: false,
             agent_pane_cols: None,
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
@@ -736,6 +936,7 @@ scroll_sensitivity = 1.5
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
+            agent_presets: default_agent_presets(),
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -746,6 +947,8 @@ scroll_sensitivity = 1.5
         let config = Config {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
+            acp_agent: None,
+            orchestration_enabled: false,
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
@@ -757,8 +960,212 @@ scroll_sensitivity = 1.5
             lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
+            agent_presets: default_agent_presets(),
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
+    }
+
+    #[test]
+    fn resolve_agent_launch_known_binary_to_acp() {
+        let resolved = resolve_agent_launch("opencode", None);
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "opencode acp".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_acp_override_for_unknown() {
+        let resolved = resolve_agent_launch("claude", Some("claude-code-acp"));
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "claude-code-acp".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_unknown_without_override_stays_pty() {
+        let resolved = resolve_agent_launch("claude", None);
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "claude".to_string(),
+                acp: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_passes_through_acp_command() {
+        let resolved = resolve_agent_launch("cursor-agent acp", None);
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "cursor-agent acp".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn orchestration_available_for_known_agent_without_upgrading_primary() {
+        let user = ResolvedUserConfig {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            plugin_dir: None,
+            agent_presets: HashMap::new(),
+        };
+        let orchestration = user
+            .agent_command
+            .as_deref()
+            .map(|agent| resolve_agent_launch(agent, user.acp_agent.as_deref()).acp)
+            .unwrap_or(false);
+        assert!(orchestration);
+        assert_eq!(user.agent_command.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn orchestration_unavailable_without_acp_mapping() {
+        let orchestration = resolve_agent_launch("claude", None).acp;
+        assert!(!orchestration);
+    }
+
+    #[test]
+    fn resolve_spawn_command_defaults_to_acp_for_known_agent() {
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            orchestration_enabled: true,
+            agent_pane_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
+            agent_presets: default_agent_presets(),
+        };
+        let launch = config.resolve_spawn_command(None);
+        assert_eq!(launch.command, "opencode acp");
+        assert!(launch.acp);
+    }
+
+    #[test]
+    fn rejects_acp_primary_agent_command() {
+        let err = reject_acp_primary_agent("opencode acp").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("primary agent must be a PTY command")
+        );
+        reject_acp_primary_agent("opencode").unwrap();
+    }
+
+    #[test]
+    fn parses_agent_presets_from_file_config() {
+        let config: FileConfig = toml::from_str(
+            r#"
+[agents.reviewer]
+role = "reviewer"
+command = "cursor-agent acp"
+
+[agents.coder]
+role = "implementer"
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.agents.get("reviewer"),
+            Some(&AgentPreset {
+                role: Some("reviewer".to_string()),
+                command: Some("cursor-agent acp".to_string()),
+            })
+        );
+        assert_eq!(
+            config.agents.get("coder"),
+            Some(&AgentPreset {
+                role: Some("implementer".to_string()),
+                command: None,
+            })
+        );
+    }
+
+    #[test]
+    fn apply_spawn_preset_fills_builtin_role() {
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            orchestration_enabled: true,
+            agent_pane_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
+            agent_presets: default_agent_presets(),
+        };
+
+        let (role, command) = config.apply_spawn_preset("reviewer", None, None);
+        assert_eq!(role.as_deref(), Some("reviewer"));
+        assert_eq!(command, None);
+
+        let launch = config.resolve_spawn_command(command.as_deref());
+        assert_eq!(launch.command, "opencode acp");
+        assert!(launch.acp);
+    }
+
+    #[test]
+    fn file_agent_preset_overrides_builtin_command() {
+        let mut file = HashMap::new();
+        file.insert(
+            "reviewer".to_string(),
+            AgentPreset {
+                role: None,
+                command: Some("claude-code-acp".to_string()),
+            },
+        );
+        let presets = merge_agent_presets(file);
+        assert_eq!(
+            presets.get("reviewer"),
+            Some(&AgentPreset {
+                role: Some("reviewer".to_string()),
+                command: Some("claude-code-acp".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn load_rejects_acp_primary_agent() {
+        let err = Config::load(ConfigOverrides {
+            agent: Some("opencode acp".to_string()),
+            ..ConfigOverrides::default()
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("primary agent must be a PTY command")
+        );
     }
 }

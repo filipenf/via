@@ -30,22 +30,12 @@ clients.
   - Create sessions via `new_session`
   - Push structured context via `context/update`
 - Integration into `Mediator`:
-  - `connect_acp(command, args)` connects the primary agent (keyed
-    `orchestrator`) into a `HashMap<agent_id, AcpSession { client, session_id }>`
-  - Sub-agents connect dynamically: when a spawn command `is_acp_command`, the
+  - Sub-agents connect on spawn: when a spawn command `is_acp_command`, the
     mediator establishes a session for that id and starts its reader
   - `BufferSendRequested` events are routed through ACP when a client is
     connected (otherwise fall back to normal/PTY injection)
-- `VIA_AGENT="opencode acp"` (or `cursor-agent acp`, `claude acp`, etc.) results
-  in a single-pane layout (only Neovim).
-- `via` spawns the agent as a stdio JSON-RPC subprocess.
-- Performs the `initialize` handshake and creates a session.
-- Starts a background reader task that logs every incoming JSON-RPC line at
-  `info` level (visible with `RUST_LOG=info`).
-- Context is pushed via structured `context/update` messages when the user
-  invokes `:ViaBufferSend` or presses `<leader>ab`.
-- Normal (PTY) mode agents continue to work unchanged (`VIA_AGENT="claude"` etc.
-  still get the two-pane layout and raw PTY injection).
+- The primary agent pane is always PTY (`--agent opencode`). Spawned helpers
+  use ACP when the configured agent supports it (`opencode acp`, etc.).
 
 The explicit `:ViaBufferSend` mechanism is the single source of truth for
 injecting context on both paths.

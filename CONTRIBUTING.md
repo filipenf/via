@@ -142,14 +142,14 @@ build.
 via launches Neovim in one pane and your agent in another (or a single-pane ACP
 layout).
 
-ACP agents (preferred for structured interaction):
+ACP agents (spawned orchestration / helpers):
 
 ```sh
-VIA_FOREGROUND=1 cargo run -- --agent "opencode acp"
-# or: cursor-agent acp, claude acp, etc.
+VIA_FOREGROUND=1 cargo run -- --agent opencode
+via agent spawn --id orchestrator --role orchestrator
 ```
 
-Normal mode / PTY agents (raw terminal in the agent pane, context injected via
+Normal mode / PTY agents (primary interactive pane; context injected via
 PTY):
 
 ```sh

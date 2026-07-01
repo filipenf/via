@@ -9,9 +9,23 @@ description: >-
 
 # via agents skill
 
-via can run several agent panes side by side (an orchestrator plus helpers such as a
-reviewer or coder). This skill lets agents talk to each other through via using the `via`
-CLI. It works whenever `VIA_SESSION` is set (you are running inside a via-launched pane).
+via can run several agent panes side by side. The **default** is a single interactive PTY
+agent pane (`--agent opencode`, etc.) for everyday work. **ACP orchestration is opt-in:**
+when you need coordinated multi-agent handoff, spawn an ACP orchestrator plus helpers
+(reviewer, coder, …).
+
+This skill covers the bus/CLI used when `VIA_SESSION` is set.
+
+## Default vs orchestration
+
+| Mode | Primary pane | When |
+|------|--------------|------|
+| **Default** | PTY `agent` (`opencode`, `claude`, …) | Simple changes, interactive use |
+| **Orchestration** | PTY `agent` stays; add spawned ACP panes | Multi-agent handoff, auto prompts |
+
+`--agent opencode` does **not** auto-upgrade to `opencode acp`. Spawned helpers **do**
+resolve to ACP when the configured agent is in the known table (`opencode`, `cursor-agent`,
+`agent`) or when `acp_agent` / `--acp-agent` is set (e.g. `claude-code-acp`).
 
 ## Your identity
 
@@ -21,7 +35,8 @@ Each agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
 via agent whoami        # who am I, and which session
 ```
 
-The primary pane's id is `orchestrator`. Messages addressed to no one default to it.
+The default interactive pane is id `agent`. Bus messages with no recipient default to
+`orchestrator` once spawned; `via agent send` errors if the recipient is not registered.
 
 ## Discover other agents
 
@@ -30,59 +45,52 @@ via agent list           # id + role of every agent in this session
 via agent list --json    # machine-readable
 ```
 
-## Spawn a new agent
+## Start orchestration
 
-Ask via to open another agent pane with a role. The id must be unique; reusing an id is a
-no-op. The command defaults to the configured agent if omitted.
+Spawn an ACP orchestrator, then helpers. Built-in presets supply default roles for
+`orchestrator`, `reviewer`, and `coder` when `--role` is omitted. Commands without
+an explicit `--command` resolve to ACP form (e.g. `opencode` → `opencode acp`).
 
-```bash
-via agent spawn --id reviewer --role reviewer
-via agent spawn --id coder --role coder --command "opencode"
+Override presets in `~/.config/via/via.conf`:
+
+```toml
+[agents.reviewer]
+role = "reviewer"
+# command = "cursor-agent acp"  # optional
 ```
 
-## Terminate a sub-agent
+```bash
+via agent spawn --id orchestrator
+via agent spawn --id reviewer
+via agent spawn --id coder
+```
 
-When a helper is done (e.g. a reviewer finished), close its pane and tear down the session:
+Spawn is unavailable when the session has no ACP mapping for the configured agent (e.g.
+`claude` without `--acp-agent`).
+
+When orchestration is done, terminate spawned panes (orchestrator included):
 
 ```bash
 via agent terminate --id reviewer
+via agent terminate --id orchestrator
 ```
 
-From Neovim (after `require('via')`):
-
-```lua
-require('via').agent.del("reviewer")
--- or :ViaAgentDel reviewer
-```
-
-The primary `orchestrator` pane cannot be terminated this way.
+The primary PTY `agent` pane cannot be terminated.
 
 ## Send a message
 
-Messages always go to the recipient's **mailbox** (the durable source of truth). By default
-via also delivers them live; how depends on the recipient's mode:
+Messages always go to the recipient's **mailbox**. Live delivery:
 
-- **ACP agents** (spawned with a command ending in `acp`) are delivered the full message as a
-  prompt, so their next turn starts **automatically** — no human needed. This is how
-  automatic handoff works.
-- **PTY agents** (interactive panes, e.g. a human-driven `opencode`/`claude`) get a
-  lightweight ping (`[via] new message from <sender>; run via agent inbox to read`). They act
-  manually by reading their inbox; via never auto-submits into an interactive pane.
-
-Pass `--no-notify` for a silent mailbox-only delivery, or `--no-focus` to deliver without
-stealing focus.
+- **ACP agents** — full body delivered as a prompt (automatic turn).
+- **PTY agents** — mailbox only; read with `via agent inbox`.
 
 ```bash
-via agent send --to reviewer -m "Please review the changes on this branch for correctness."
-via agent send -m "Done with the refactor, handing back."   # to the orchestrator
+via agent send --to orchestrator -m "Plan the refactor."
+via agent send --to reviewer -m "Please review the branch."
+via agent send --to agent -m "Note for the interactive pane."   # mailbox only
 ```
 
-To get automatic, hands-off handoff, spawn the helper in ACP mode, e.g.
-`via agent spawn --id reviewer --role reviewer --command "opencode acp"`.
-
-via delivers bus messages as ACP prompts once the sub-agent handshake finishes. If you
-`via agent send` immediately after spawn, the message is queued in the mailbox and
-auto-delivered when the reviewer session connects — you do not need to sleep first.
+Use `--no-notify` for mailbox-only even for ACP recipients.
 
 ## Read your messages
 
@@ -92,26 +100,19 @@ via agent inbox --peek   # read without clearing
 via agent inbox --json   # machine-readable
 ```
 
-A typical PTY reviewer loop: when pinged, run `via agent inbox`, do the work, then
-`via agent send --to orchestrator -m "review complete: ..."`. An ACP reviewer instead
-receives the request as a prompt directly and replies with another `via agent send` — the
-mailbox/inbox is still available for durability.
-
 ## Command reference
 
 | Command | Purpose |
 |---------|---------|
 | `via agent whoami` | Show this agent's id, role, and session |
-| `via agent list [--json]` | List agents running in this session |
-| `via agent spawn --id ID [--role R] [--command CMD]` | Ask via to open a new agent pane |
-| `via agent terminate --id ID` | Close a sub-agent pane and tear down its session |
-| `via agent send [--to ID] -m TEXT [--no-focus] [--no-notify]` | Queue a message (and ping the pane) |
-| `via agent inbox [--json] [--peek]` | Read (and clear) your mailbox |
+| `via agent list [--json]` | List agents in this session |
+| `via agent spawn --id ID [--role R] [--command CMD]` | Open pane; preset fills missing role/command |
+| `via agent terminate --id ID` | Close a sub-agent (not the primary `agent` pane) |
+| `via agent send [--to ID] -m TEXT [--no-focus] [--no-notify]` | Deliver to a registered agent (errors if missing) |
+| `via agent inbox [--json] [--peek]` | Read your mailbox |
 
 ## Sandbox notes
 
-These commands talk to via over **local Unix sockets and files** under the session's runtime
-directory. If you run in a sandbox, allow local socket and filesystem access.
+These commands use local Unix sockets and files under the session runtime directory.
 
-If you see "VIA_SESSION is not set", you are not inside a via-launched agent pane and these
-commands are unavailable.
+If you see "VIA_SESSION is not set", you are not inside a via-launched pane.

@@ -41,41 +41,27 @@ pub enum AgentFamily {
     Unknown,
 }
 
-/// Infer the agent runtime from `VIA_AGENT` (or similar) command text.
-pub fn detect_agent_family(agent_command: &str) -> AgentFamily {
-    if is_cursor_agent_command(agent_command) {
-        return AgentFamily::Cursor;
-    }
-
-    let lower = agent_command.to_ascii_lowercase();
-    if lower.contains("opencode") {
-        AgentFamily::OpenCode
-    } else if lower.contains("crush") {
-        AgentFamily::Crush
-    } else if lower.contains("claude") {
-        AgentFamily::Claude
-    } else {
-        AgentFamily::Unknown
-    }
-}
-
-/// True when `agent_command` launches the Cursor agent CLI (`cursor-agent` or `agent`).
-fn is_cursor_agent_command(agent_command: &str) -> bool {
-    let lower = agent_command.trim().to_ascii_lowercase();
-    if lower.contains("cursor") {
-        return true;
-    }
-
-    let Some(first) = lower.split_whitespace().next() else {
-        return false;
+/// First token of the agent command, basename only (e.g. `/bin/opencode acp` → `opencode`).
+fn agent_binary(agent_command: &str) -> String {
+    let Some(first) = agent_command.split_whitespace().next() else {
+        return String::new();
     };
-
-    let binary = Path::new(first)
+    Path::new(first)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(first);
+        .unwrap_or(first)
+        .to_ascii_lowercase()
+}
 
-    matches!(binary, "agent" | "cursor-agent")
+/// Infer the agent runtime from `VIA_AGENT` (or similar) command text.
+pub fn detect_agent_family(agent_command: &str) -> AgentFamily {
+    match agent_binary(agent_command).as_str() {
+        "agent" | "cursor-agent" => AgentFamily::Cursor,
+        "opencode" => AgentFamily::OpenCode,
+        "claude" | "claude-code-acp" => AgentFamily::Claude,
+        "crush" => AgentFamily::Crush,
+        _ => AgentFamily::Unknown,
+    }
 }
 
 /// Skill root directories where the plugin's skills should be projected for this family.

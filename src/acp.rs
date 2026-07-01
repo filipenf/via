@@ -248,10 +248,7 @@ impl AcpClient {
     }
 
     /// Spawn a background task that continuously reads JSON-RPC lines
-    /// from the agent's stdout and logs them at info level.
-    ///
-    /// This is the simplest way to observe streaming responses and
-    /// notifications while we build proper rendering.
+    /// from the agent's stdout, logs them, and forwards recognized updates to the bus.
     pub fn spawn_reader(&mut self, events: EventSender) {
         let agent_id = self.agent_id.clone();
         if let Some(stdout) = self.child.stdout.take() {
@@ -262,7 +259,7 @@ impl AcpClient {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        if let Some(event) = log_acp_line(&line, &agent_id) {
+                        for event in process_acp_line(&line, &agent_id) {
                             events.send(Event::Agent(event)).await;
                         }
                     }
@@ -591,32 +588,37 @@ fn parse_ask_question(
     })
 }
 
-fn log_acp_line(line: &str, agent_id: &str) -> Option<AgentEvent> {
+/// Log one JSON-RPC line from agent stdout and translate recognized messages into bus events.
+fn process_acp_line(line: &str, agent_id: &str) -> Vec<AgentEvent> {
     // Keep raw logs around while ACP support is still being brought up; these are invaluable
     // when a specific agent sends a shape we do not recognize yet.
     tracing::info!(raw = %line, "ACP message from agent");
 
     let Ok(message) = serde_json::from_str::<JsonRpcMessage>(line) else {
         tracing::warn!(raw = %line, "failed to parse ACP message");
-        return None;
+        return Vec::new();
     };
 
-    match message {
+    let events: Vec<AcpAgentEvent> = match message {
         JsonRpcMessage::Notification { method, params, .. } if method == "session/update" => {
-            log_session_update(params)
+            process_session_update(params).into_iter().collect()
         }
         JsonRpcMessage::Notification { method, .. } => {
             tracing::debug!(method, "ACP notification from agent");
-            None
+            Vec::new()
         }
         JsonRpcMessage::Request {
             id, method, params, ..
         } => match method.as_str() {
-            "session/request_permission" => parse_permission_request(id, params),
-            "cursor/ask_question" | "_zed/askQuestion" => parse_ask_question(id, params),
+            "session/request_permission" => {
+                parse_permission_request(id, params).into_iter().collect()
+            }
+            "cursor/ask_question" | "_zed/askQuestion" => {
+                parse_ask_question(id, params).into_iter().collect()
+            }
             _ => {
                 tracing::info!(?id, %method, "ACP request from agent (no handler)");
-                None
+                Vec::new()
             }
         },
         JsonRpcMessage::Response {
@@ -629,9 +631,16 @@ fn log_acp_line(line: &str, agent_id: &str) -> Option<AgentEvent> {
                     message = %err.message,
                     "ACP JSON-RPC error from agent"
                 );
-                Some(AcpAgentEvent::SessionStatus {
-                    provider_error: Some(truncate_provider_error(&err.message)),
-                })
+                vec![
+                    AcpAgentEvent::SessionStatus {
+                        provider_error: Some(truncate_provider_error(&err.message)),
+                    },
+                    AcpAgentEvent::Progress {
+                        id: "__turn".to_string(),
+                        label: String::new(),
+                        active: false,
+                    },
+                ]
             } else {
                 tracing::debug!(?id, ?result, "ACP response from agent");
                 if result
@@ -640,21 +649,25 @@ fn log_acp_line(line: &str, agent_id: &str) -> Option<AgentEvent> {
                     .and_then(serde_json::Value::as_str)
                     .is_some()
                 {
-                    Some(AcpAgentEvent::Progress {
+                    vec![AcpAgentEvent::Progress {
                         id: "__turn".to_string(),
                         label: String::new(),
                         active: false,
-                    })
+                    }]
                 } else {
-                    None
+                    Vec::new()
                 }
             }
         }
-    }
-    .map(|event| AgentEvent::acp(agent_id, event))
+    };
+
+    events
+        .into_iter()
+        .map(|event| AgentEvent::acp(agent_id, event))
+        .collect()
 }
 
-fn log_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
+fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
@@ -783,7 +796,10 @@ fn truncate_provider_error(message: &str) -> String {
     } else {
         format!(
             "{}…",
-            collapsed.chars().take(MAX_LEN.saturating_sub(1)).collect::<String>()
+            collapsed
+                .chars()
+                .take(MAX_LEN.saturating_sub(1))
+                .collect::<String>()
         )
     }
 }
@@ -836,11 +852,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn log_acp_line_tags_events_with_agent_id() {
+    fn process_acp_line_tags_events_with_agent_id() {
         let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#;
-        let event = log_acp_line(line, "reviewer").expect("expected transcript chunk");
+        let events = process_acp_line(line, "reviewer");
+        assert_eq!(events.len(), 1);
         assert!(matches!(
-            event,
+            &events[0],
             AgentEvent::Acp {
                 agent_id,
                 event: AcpAgentEvent::TranscriptChunk { kind, text }
@@ -868,15 +885,15 @@ mod tests {
     }
 
     #[test]
-    fn log_acp_line_parses_ask_question_methods() {
+    fn process_acp_line_parses_ask_question_methods() {
         let params = r#"{"title":"Pick one","questions":[{"id":"q1","prompt":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
         for method in ["cursor/ask_question", "_zed/askQuestion"] {
-            let line = format!(
-                r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{params}}}"#
-            );
-            let event = log_acp_line(&line, "orchestrator").expect("expected ask question");
+            let line =
+                format!(r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{params}}}"#);
+            let events = process_acp_line(&line, "orchestrator");
+            assert_eq!(events.len(), 1);
             assert!(matches!(
-                event,
+                &events[0],
                 AgentEvent::Acp {
                     agent_id,
                     event: AcpAgentEvent::AskQuestion {
@@ -909,16 +926,25 @@ mod tests {
     }
 
     #[test]
-    fn log_acp_line_surfaces_jsonrpc_error_as_session_status() {
-        let line = r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Cannot connect to API"}}"#;
-        let event = log_acp_line(line, "reviewer").expect("expected session status");
+    fn process_acp_line_surfaces_jsonrpc_error_as_session_status() {
+        let line =
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Cannot connect to API"}}"#;
+        let events = process_acp_line(line, "reviewer");
+        assert_eq!(events.len(), 2);
         assert!(matches!(
-            event,
+            &events[0],
             AgentEvent::Acp {
                 agent_id,
                 event: AcpAgentEvent::SessionStatus { provider_error }
             } if agent_id == "reviewer"
                 && provider_error.as_deref() == Some("Cannot connect to API")
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::Progress { id, active, .. }
+            } if agent_id == "reviewer" && id == "__turn" && !active
         ));
     }
 }

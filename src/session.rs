@@ -22,6 +22,9 @@ pub struct SessionManifest {
     /// Per-process directory with the agent registry and per-agent mailboxes.
     #[serde(default)]
     pub agents_dir: PathBuf,
+    /// When false, spawn/coordinated handoff is unavailable (primary agent is PTY-only).
+    #[serde(default)]
+    pub orchestration_enabled: bool,
     #[serde(default)]
     pub started_at_unix: Option<u64>,
 }
@@ -34,6 +37,7 @@ impl SessionManifest {
             nvim_socket: config.nvim_socket_path.clone(),
             editor_socket: config.editor_socket_path.clone(),
             agents_dir: config.agents_dir.clone(),
+            orchestration_enabled: config.orchestration_enabled,
             started_at_unix: crate::util::unix_seconds_now(),
         }
     }
@@ -187,6 +191,7 @@ mod tests {
             nvim_socket: PathBuf::from("/tmp/via-nvim-42.sock"),
             editor_socket: PathBuf::from("/tmp/via-editor-42.sock"),
             agents_dir: PathBuf::from("/tmp/via-42/agents"),
+            orchestration_enabled: true,
             started_at_unix: Some(1),
         };
         let encoded = serde_json::to_string(&manifest).unwrap();

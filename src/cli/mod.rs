@@ -25,6 +25,10 @@ pub struct Cli {
     #[arg(long = "agent")]
     pub agent: Option<String>,
 
+    /// ACP launch override for agents without a built-in mapping (e.g. `claude-code-acp`).
+    #[arg(long = "acp-agent")]
+    pub acp_agent: Option<String>,
+
     /// Agent pane columns as one value or min:max, for example `100` or `80:120`.
     #[arg(long = "agent-pane-cols")]
     pub agent_pane_cols: Option<crate::config::AgentPaneCols>,
@@ -54,10 +58,12 @@ impl Cli {
         crate::config::ConfigOverrides {
             nvim: self.nvim.clone(),
             agent: self.agent.clone(),
+            acp_agent: self.acp_agent.clone(),
             agent_pane_cols: self.agent_pane_cols,
             review_backend: self.review_backend,
             scroll_sensitivity: self.scroll_sensitivity,
             plugin_dir: self.plugin_dir.clone(),
+            agent_presets: Default::default(),
         }
     }
 }

@@ -99,47 +99,13 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
-    let mut mediator = Mediator::new(config.clone());
+    let mediator = Mediator::new(config.clone());
 
-    if config.is_acp_agent() {
-        // ACP orchestrator has no PTY child; export bus identity on this process so tool
-        // subprocesses and `via agent` CLI invocations from the agent can resolve whoami/inbox.
-        unsafe {
-            std::env::set_var(agent_bus::VIA_AGENT_ID_ENV, "orchestrator");
-            std::env::set_var(agent_bus::VIA_AGENT_ROLE_ENV, "orchestrator");
+    if let Some(cmd) = &config.agent_command {
+        info!(agent = %cmd, "primary PTY agent");
+        if config.orchestration_enabled {
+            info!("ACP orchestration available; spawn orchestrator/reviewer/coder panes as needed");
         }
-
-        if let Some(cmd) = &config.agent_command {
-            let tokens: Vec<&str> = cmd.split_whitespace().collect();
-            if let [command, args @ ..] = tokens.as_slice() {
-                let command = command.to_string();
-                let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-                let cmd_for_log = cmd.clone();
-
-                // Connect with a timeout so a non-responsive agent doesn't hang startup.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    mediator.connect_acp(
-                        &command,
-                        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(session_id)) => {
-                        info!(agent = %cmd_for_log, session_id, "ACP agent connected");
-                    }
-                    Ok(Err(err)) => {
-                        tracing::error!(agent = %cmd_for_log, %err, "failed to connect ACP agent");
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = %cmd_for_log, "ACP agent did not respond within timeout");
-                    }
-                }
-            }
-        }
-    } else if let Some(cmd) = &config.agent_command {
-        info!(agent = %cmd, "legacy PTY agent");
     }
 
     let mut handle = mediator.spawn();

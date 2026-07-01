@@ -10,8 +10,9 @@
 //!   `via agent inbox` drains it. One file per message avoids append races and makes "consume" a
 //!   simple delete.
 //!
-//! The mailbox is the source of truth for inter-agent messages; the optional pane notification
-//! (a one-line ping written via the editor socket) is a convenience on top.
+//! The mailbox is the source of truth for inter-agent messages. Live delivery for ACP
+//! recipients goes through the mediator (`client.prompt()`); non-ACP recipients are
+//! mailbox-only (no pane injection).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+
+use crate::config::is_acp_command;
 
 /// Environment variable carrying an agent's own identity inside its pane.
 pub const VIA_AGENT_ID_ENV: &str = "VIA_AGENT_ID";
@@ -28,6 +31,14 @@ pub const VIA_AGENT_ROLE_ENV: &str = "VIA_AGENT_ROLE";
 const REGISTRY_FILE: &str = "registry.json";
 const INBOX_DIR: &str = "inbox";
 
+/// How an agent pane participates in coordinated handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentMode {
+    Acp,
+    Pty,
+}
+
 /// A single agent pane known to via.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecord {
@@ -36,9 +47,26 @@ pub struct AgentRecord {
     pub role: Option<String>,
     #[serde(default)]
     pub command: Option<String>,
-    /// True for the primary/orchestrator pane.
+    #[serde(default)]
+    pub mode: Option<AgentMode>,
+    /// True for the primary PTY agent pane (`agent`).
     #[serde(default)]
     pub primary: bool,
+}
+
+/// Effective mode for a registry record (derived from `mode` or `command` when absent).
+pub fn agent_record_mode(record: &AgentRecord) -> AgentMode {
+    record.mode.unwrap_or_else(|| {
+        if record.command.as_deref().is_some_and(is_acp_command) {
+            AgentMode::Acp
+        } else {
+            AgentMode::Pty
+        }
+    })
+}
+
+pub fn agent_record_is_acp(record: &AgentRecord) -> bool {
+    agent_record_mode(record) == AgentMode::Acp
 }
 
 /// A message addressed to an agent's mailbox.
@@ -219,12 +247,14 @@ mod tests {
                 id: "orchestrator".to_string(),
                 role: Some("orchestrator".to_string()),
                 command: Some("opencode acp".to_string()),
+                mode: Some(AgentMode::Acp),
                 primary: true,
             },
             AgentRecord {
                 id: "reviewer".to_string(),
                 role: Some("reviewer".to_string()),
                 command: None,
+                mode: None,
                 primary: false,
             },
         ];

@@ -72,6 +72,7 @@ impl AcpModalState {
                     }]
                 }
             }),
+            AcpModalKind::HandshakeRetry => serde_json::Value::Null,
         }
     }
 

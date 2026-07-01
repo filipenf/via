@@ -28,11 +28,11 @@ pub enum AgentCommand {
     },
     /// Close a sub-agent pane and tear down its session.
     Terminate {
-        /// Agent id to terminate (not the primary orchestrator).
+        /// Agent id to terminate (not the primary PTY agent).
         #[arg(long)]
         id: String,
     },
-    /// Send a message to another agent's mailbox (and ping its pane).
+    /// Send a message to another agent's mailbox (and deliver to ACP recipients).
     Send {
         /// Recipient agent id. Defaults to the orchestrator.
         #[arg(long)]
@@ -40,10 +40,10 @@ pub enum AgentCommand {
         /// Message body.
         #[arg(long, short = 'm')]
         message: String,
-        /// Do not steal focus when pinging the recipient pane.
+        /// Do not steal focus when delivering to an ACP recipient.
         #[arg(long)]
         no_focus: bool,
-        /// Do not ping the recipient pane (mailbox only).
+        /// Do not notify the mediator to deliver the message (mailbox only).
         #[arg(long)]
         no_notify: bool,
     },
@@ -109,6 +109,12 @@ fn run_list(json: bool) -> Result<()> {
 
 fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Result<()> {
     let session = session::resolve_session()?;
+    if !session.orchestration_enabled {
+        bail!(
+            "orchestration is unavailable for this session (agent has no ACP mapping); \
+             set a known agent (e.g. opencode) or use --acp-agent"
+        );
+    }
     let mut payload = serde_json::json!({
         "type": "spawn_agent",
         "id": id,
@@ -142,10 +148,16 @@ fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Resul
 }
 
 fn run_terminate(id: String) -> Result<()> {
-    if id == "orchestrator" {
-        bail!("refusing to terminate the primary orchestrator agent");
-    }
     let session = session::resolve_session()?;
+    if id == crate::config::PRIMARY_PTY_AGENT_ID {
+        bail!("refusing to terminate the primary agent pane");
+    }
+    if agent_bus::read_registry(&session.agents_dir)?
+        .into_iter()
+        .any(|record| record.id == id && record.primary)
+    {
+        bail!("refusing to terminate the primary agent");
+    }
     let payload = serde_json::json!({
         "type": "terminate_agent",
         "id": id,
@@ -161,11 +173,9 @@ fn run_send(to: Option<String>, message: String, focus: bool, notify: bool) -> R
     let to = to.unwrap_or_else(|| "orchestrator".to_string());
     let from = self_id().unwrap_or_else(|| "unknown".to_string());
 
-    // Warn (but still deliver) if the recipient is not currently registered.
-    if let Ok(agents) = agent_bus::read_registry(&session.agents_dir) {
-        if !agents.iter().any(|agent| agent.id == to) {
-            eprintln!("warning: no agent named '{to}' is currently registered; queuing anyway");
-        }
+    let agents = agent_bus::read_registry(&session.agents_dir)?;
+    if !agents.iter().any(|agent| agent.id == to) {
+        bail!("no agent named '{to}' is registered in this session");
     }
 
     let envelope = Message {
@@ -178,8 +188,7 @@ fn run_send(to: Option<String>, message: String, focus: bool, notify: bool) -> R
     agent_bus::enqueue(&session.agents_dir, &envelope).context("queue message")?;
 
     if notify {
-        // via decides delivery by recipient type: an ACP agent gets the full body as a prompt
-        // (auto turn); a PTY agent gets a lightweight ping pointing at its inbox.
+        // Mediator delivers ACP prompts; non-ACP recipients are mailbox-only.
         let payload = serde_json::json!({
             "type": "agent_send",
             "agent_id": to,
@@ -188,7 +197,7 @@ fn run_send(to: Option<String>, message: String, focus: bool, notify: bool) -> R
             "focus": focus,
         });
         if let Err(error) = agent_bus::notify_editor_socket(&session.editor_socket, &payload) {
-            eprintln!("warning: queued message but failed to ping pane: {error}");
+            eprintln!("warning: queued message but failed to notify mediator: {error}");
         }
     }
 
