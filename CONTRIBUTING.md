@@ -142,14 +142,14 @@ build.
 via launches Neovim in one pane and your agent in another (or a single-pane ACP
 layout).
 
-ACP agents (preferred for structured interaction):
+ACP agents (spawned orchestration / helpers):
 
 ```sh
-VIA_FOREGROUND=1 cargo run -- --agent "opencode acp"
-# or: cursor-agent acp, claude acp, etc.
+VIA_FOREGROUND=1 cargo run -- --agent opencode
+via agent spawn --id orchestrator --role orchestrator
 ```
 
-Normal mode / PTY agents (raw terminal in the agent pane, context injected via
+Normal mode / PTY agents (primary interactive pane; context injected via
 PTY):
 
 ```sh
@@ -167,12 +167,6 @@ In Neovim:
 See the main [README.md](README.md) for configuration (`~/.config/via/via.conf`,
 env vars, `--agent-pane-cols`, review backends, font tweaks, etc.) and the
 embedded Neovim Lua bridges (`nvim/*.lua`).
-
-The `via-editor` agent skill (auto-installed on session start when an agent
-command is configured) is defined in `skills/via-editor/SKILL.md`. It lets
-agents run `via session diagnostics --json` (and related commands) over the
-local socket without scraping the UI. The `VIA_SESSION` env is how session
-commands resolve the right via instance.
 
 ## Architecture pointers
 

@@ -80,6 +80,9 @@ impl EditorState {
             EditorEvent::SpawnAgent { .. } => {
                 // one-shot request, handled by mediator/ui
             }
+            EditorEvent::TerminateAgent { .. } => {
+                // one-shot request, handled by mediator/ui
+            }
         }
     }
 }
@@ -114,6 +117,8 @@ enum WireEditorEvent {
     AgentSend {
         #[serde(default)]
         agent_id: Option<String>,
+        #[serde(default)]
+        from: Option<String>,
         content: String,
         #[serde(default = "default_true")]
         focus: bool,
@@ -124,6 +129,9 @@ enum WireEditorEvent {
         role: Option<String>,
         #[serde(default)]
         command: Option<String>,
+    },
+    TerminateAgent {
+        id: String,
     },
 }
 
@@ -249,16 +257,19 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
         },
         WireEditorEvent::AgentSend {
             agent_id,
+            from,
             content,
             focus,
         } => EditorEvent::AgentSend {
             agent_id,
+            from,
             content,
             focus,
         },
         WireEditorEvent::SpawnAgent { id, role, command } => {
             EditorEvent::SpawnAgent { id, role, command }
         }
+        WireEditorEvent::TerminateAgent { id } => EditorEvent::TerminateAgent { id },
     })
 }
 
@@ -331,6 +342,36 @@ mod tests {
                 start_line: 3,
                 end_line: 8,
                 text: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_spawn_agent_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"spawn_agent","id":"reviewer","role":"reviewer","command":"opencode acp"}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::SpawnAgent {
+                id: "reviewer".to_string(),
+                role: Some("reviewer".to_string()),
+                command: Some("opencode acp".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_terminate_agent_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"terminate_agent","id":"reviewer"}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::TerminateAgent {
+                id: "reviewer".to_string(),
             }
         );
     }

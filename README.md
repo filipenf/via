@@ -25,11 +25,40 @@ It creates separate panes (libghostty terminals) for each and connects them.
 
 ## Multi-agent orchestration
 
-via supports spawning additional named agent panes at runtime. An orchestrator
-agent (or Neovim) can request new panes via the `SpawnAgent` protocol message or
-the Lua API. Spawned panes inherit the configured agent command (or accept an
-override) and appear in the shared secondary area (right column for vertical
-splits, bottom row for horizontal splits).
+The **default** layout is Neovim + one **interactive PTY agent** (`--agent opencode`).
+For everyday edits you work in that pane; no ACP process runs at startup.
+
+**Orchestration is opt-in:** spawn an ACP orchestrator and helpers when you need
+automatic multi-agent handoff:
+
+```bash
+via agent spawn --id orchestrator          # preset role: orchestrator
+via agent spawn --id reviewer              # preset role: reviewer
+via agent spawn --id coder               # preset role: coder
+via agent send --to reviewer -m "review this diff"
+```
+
+Spawned agents resolve to ACP when the configured driver supports it (`opencode` →
+`opencode acp`). If your main driver doesn't support ACP (ie claude, crush), you
+can pick a different agent for orchestration using `--acp-agent`. The primary
+PTY pane keeps id `agent`; the coordinator is `orchestrator`.
+
+**Policy:** via transports (panes, bus, ACP); agents orchestrate via skills and
+`via agent` — workflows stay out of the mediator.
+
+Configure spawn defaults in `~/.config/via/via.conf`:
+
+```toml
+[agents.reviewer]
+role = "reviewer"
+# command = "cursor-agent acp"  # optional override
+
+[agents.coder]
+role = "coder"
+```
+
+Then `via agent spawn --id reviewer` picks up the preset role and resolves the
+launch command from your primary agent.
 
 **Navigation**
 
@@ -46,9 +75,29 @@ is injected into `~/.local/share/via/lua/` at startup). Example usage:
 ```lua
 local via = require('via')
 via.agent.spawn("reviewer", "reviewer")                 -- spawn a reviewer pane
+via.agent.del("reviewer")                                 -- terminate a sub-agent when done
 via.agent.send("reviewer", "please review this diff", false) -- send without stealing focus
-via.agent.send(nil, "hello orchestrator")               -- send to the primary agent (focus=true by default)
+via.agent.send("orchestrator", "hello orchestrator")    -- send after spawning orchestrator
+for _, agent in ipairs(via.agent.list()) do print(agent.id) end -- discover running agents
 ```
+
+**Agent-to-agent communication (the agent bus)**
+
+Agents running inside via can discover, spawn, and message each other through the
+`via agent` CLI (documented for agents in the bundled `via-agents` skill). Each
+agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
+
+```bash
+via agent whoami                                  # this agent's id/role/session
+via agent list                                    # agents running in this session
+via agent spawn --id reviewer --role reviewer     # ask via to open a reviewer pane
+via agent send --to reviewer -m "review this"     # queue a message + deliver it
+via agent inbox                                    # read (and clear) your mailbox
+```
+
+Coordination: **PTY** panes (`agent`, or explicit non-ACP spawn) are mailbox-only on
+send. **ACP** spawned agents get prompts automatically. Orchestration spawn requires a
+known ACP mapping for the configured agent.
 
 ## Work in progress
 
@@ -58,8 +107,8 @@ it has some rough edges still. Some things I have planned:
 - Review process: make it easier to switch between agent/review and send
   feedback to the agent directly from the vim pane (may use some existing nvim
   plugin for this)
-- Diagnostics integration: `via session diagnostics --json`; global agent skill
-  auto-install (`via agent skill install` / `status`)
+- Diagnostics integration: `via session diagnostics --json`; plugin skills
+  auto-install (`via plugin install` / `status`)
 - Better use of LSP: the symbol search could be further updated to highlight
   known symbols on the agent pane
 
@@ -127,21 +176,29 @@ Example config:
 
 ```toml
 nvim = "nvim"
-agent = "opencode acp"
+agent = "opencode"          # PTY primary; ACP resolved only for spawned helpers
+acp_agent = "cursor-agent acp" # Use cursor instead of opencode for the acp agents
 agent_pane_cols = "80:120"
 review_backend = "nvim"
+plugin_dir = "~/my-via-plugin"
 ```
 
 Equivalent CLI/env names:
 
 - `--nvim` / `VIA_NVIM`
 - `--agent` / `VIA_AGENT`
+- `--acp-agent` / `VIA_ACP_AGENT`
 - `--agent-pane-cols` / `VIA_AGENT_PANE_COLS`
 - `--review-backend` / `VIA_REVIEW_BACKEND`
+- `--plugin-dir` / `VIA_PLUGIN_DIR`
+
+`plugin_dir` points at a local directory with extra agent skills (a `skills/`
+subdirectory of `SKILL.md` files). via overlays them on top of its built-in base
+skills when installing the plugin, so you can ship your own agents/workflows
+without modifying via.
 
 Use `--persist` to write the resolved user-facing config to `via.conf` before
-running. For example, this writes `agent = "opencode"` plus the resolved
-defaults for the other user-facing settings:
+running. For example, this writes `agent = "opencode"` (PTY primary) plus defaults:
 
 ```sh
 via --agent opencode --persist

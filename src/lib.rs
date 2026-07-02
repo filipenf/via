@@ -1,5 +1,5 @@
 mod acp;
-mod agent_skill;
+mod agent_bus;
 mod bootstrap;
 mod cli;
 mod config;
@@ -9,9 +9,11 @@ mod logging;
 mod lsp_bridge;
 mod mediator;
 mod nvim;
+mod plugin;
 mod pty;
 mod session;
 pub mod ui;
+mod util;
 
 use anyhow::Result;
 use clap::Parser;
@@ -77,13 +79,13 @@ async fn async_main(cli: Cli) -> Result<()> {
     let _session_guard = session::SessionGuard::create(&config)?;
 
     if let Some(agent_command) = &config.agent_command {
-        let family = agent_skill::detect_agent_family(agent_command);
-        match agent_skill::ensure_global_skill(family) {
+        let family = plugin::detect_agent_family(agent_command);
+        match plugin::install(family, config.plugin_dir.as_deref()) {
             Ok(paths) if !paths.is_empty() => {
                 info!(
                     agent = %agent_command,
                     count = paths.len(),
-                    "installed via-editor skill for agent"
+                    "installed via plugin skills for agent"
                 );
             }
             Ok(_) => {}
@@ -91,46 +93,19 @@ async fn async_main(cli: Cli) -> Result<()> {
                 tracing::warn!(
                     agent = %agent_command,
                     %err,
-                    "failed to install via-editor skill for agent"
+                    "failed to install via plugin for agent"
                 );
             }
         }
     }
 
-    let mut mediator = Mediator::new(config.clone());
+    let mediator = Mediator::new(config.clone());
 
-    if config.is_acp_agent() {
-        if let Some(cmd) = &config.agent_command {
-            let tokens: Vec<&str> = cmd.split_whitespace().collect();
-            if let [command, args @ ..] = tokens.as_slice() {
-                let command = command.to_string();
-                let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-                let cmd_for_log = cmd.clone();
-
-                // Connect with a timeout so a non-responsive agent doesn't hang startup.
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(8),
-                    mediator.connect_acp(
-                        &command,
-                        &args.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
-                    ),
-                )
-                .await
-                {
-                    Ok(Ok(session_id)) => {
-                        info!(agent = %cmd_for_log, session_id, "ACP agent connected");
-                    }
-                    Ok(Err(err)) => {
-                        tracing::error!(agent = %cmd_for_log, %err, "failed to connect ACP agent");
-                    }
-                    Err(_) => {
-                        tracing::error!(agent = %cmd_for_log, "ACP agent did not respond within timeout");
-                    }
-                }
-            }
+    if let Some(cmd) = &config.agent_command {
+        info!(agent = %cmd, "primary PTY agent");
+        if config.orchestration_enabled {
+            info!("ACP orchestration available; spawn orchestrator/reviewer/coder panes as needed");
         }
-    } else if let Some(cmd) = &config.agent_command {
-        info!(agent = %cmd, "legacy PTY agent");
     }
 
     let mut handle = mediator.spawn();

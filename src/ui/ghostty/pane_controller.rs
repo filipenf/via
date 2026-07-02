@@ -15,7 +15,11 @@ use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, Terminal
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PaneRole {
     Editor,
-    AgentTerminal { id: String, label: String },
+    AgentTerminal {
+        id: String,
+        label: String,
+        command: Option<String>,
+    },
     ReviewTerminal,
 }
 
@@ -77,6 +81,24 @@ impl TerminalPaneController {
 
     pub(super) fn role(&self) -> &PaneRole {
         &self.role
+    }
+
+    pub(super) fn has_exited(&mut self) -> bool {
+        matches!(self.role, PaneRole::AgentTerminal { .. }) && self.pane.child_has_exited()
+    }
+
+    pub(super) fn terminate_agent(&mut self) -> Result<()> {
+        if matches!(self.role, PaneRole::AgentTerminal { .. }) {
+            self.pane.terminate_child()?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn command(&self) -> Option<&str> {
+        match &self.role {
+            PaneRole::AgentTerminal { command, .. } => command.as_deref(),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -529,6 +551,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         let outcome = pane
             .handle_terminal_key(
@@ -548,6 +571,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         pane.process_for_test(b"\x1b[?1049h", true);
         assert!(pane.is_alt_screen());
@@ -610,6 +634,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
         assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
@@ -621,6 +646,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         // Four sub-threshold pixel events that together cross one step.
         assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
@@ -634,6 +660,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 30.0)), 0);
         // Reversing direction should not have to "pay back" the prior carry.
@@ -646,6 +673,7 @@ mod tests {
             PaneRole::AgentTerminal {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
+                command: None,
             },
             0.5,
         );
@@ -659,6 +687,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         pane.process_for_test(b"see Foo::bar here", true);
 
@@ -724,6 +753,7 @@ mod tests {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
+            command: None,
         });
         pane.process_for_test(b"open src/main.rs:42", true);
         let x = 6 * test_metrics().cell_width;
@@ -824,6 +854,7 @@ mod tests {
             PaneRole::AgentTerminal {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
+                command: None,
             },
         ] {
             let mut pane = test_controller(role);
@@ -844,6 +875,7 @@ mod tests {
             PaneRole::AgentTerminal {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
+                command: None,
             },
         ] {
             let mut pane = test_controller(role);

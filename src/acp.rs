@@ -6,7 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
-use crate::event::{AcpPermissionOption, AgentEvent, Event};
+use crate::event::{AcpAgentEvent, AcpPermissionOption, AgentEvent, Event};
 use crate::mediator::EventSender;
 
 /// Minimal ACP (Agent Client Protocol) client.
@@ -16,6 +16,9 @@ use crate::mediator::EventSender;
 pub struct AcpClient {
     child: Child,
     next_id: u64,
+    /// Bus id of the agent this client drives (e.g. "orchestrator", "reviewer").
+    /// Used to stamp emitted events so the UI can route them to the right pane.
+    agent_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,8 +95,28 @@ pub struct NewSessionParams {
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ConfigOption {
+    id: String,
+    #[serde(default)]
+    current_value: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NewSessionResult {
     pub session_id: String,
+    #[serde(default)]
+    config_options: Vec<ConfigOption>,
+}
+
+impl NewSessionResult {
+    /// Selected model from `session/new` config options (e.g. `lemonade/Gemma-…`).
+    pub fn selected_model(&self) -> Option<String> {
+        self.config_options
+            .iter()
+            .find(|option| option.id == "model")
+            .and_then(|option| option.current_value.clone())
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -155,32 +178,32 @@ impl AcpClient {
     /// Spawn an ACP-capable agent as a subprocess.
     ///
     /// The command should be something like "opencode acp", "cursor-agent acp", etc.
-    pub async fn spawn(command: &str, args: &[&str]) -> Result<Self> {
-        debug!(command, ?args, "spawning ACP agent subprocess");
-        let mut child = Command::new(command)
+    pub async fn spawn(
+        agent_id: &str,
+        command: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Result<Self> {
+        debug!(agent_id, command, ?args, "spawning ACP agent subprocess");
+        let mut child_cmd = Command::new(command);
+        child_cmd
             .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (key, value) in extra_env {
+            child_cmd.env(key, value);
+        }
+        let child = child_cmd
             .spawn()
             .with_context(|| format!("failed to spawn ACP agent: {command}"))?;
 
-        // Start a background task that logs everything the agent prints to stderr.
-        // This is crucial for seeing error messages, prompts, or crashes.
-        if let Some(stderr) = child.stderr.take() {
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if !line.trim().is_empty() {
-                        tracing::warn!(stderr = %line, "ACP agent stderr");
-                    }
-                }
-            });
-        }
-
         debug!(command, "ACP agent process started");
-        Ok(Self { child, next_id: 1 })
+        Ok(Self {
+            child,
+            next_id: 1,
+            agent_id: agent_id.to_string(),
+        })
     }
 
     /// Perform the ACP initialize handshake.
@@ -225,23 +248,47 @@ impl AcpClient {
     }
 
     /// Spawn a background task that continuously reads JSON-RPC lines
-    /// from the agent's stdout and logs them at info level.
-    ///
-    /// This is the simplest way to observe streaming responses and
-    /// notifications while we build proper rendering.
+    /// from the agent's stdout, logs them, and forwards recognized updates to the bus.
     pub fn spawn_reader(&mut self, events: EventSender) {
+        let agent_id = self.agent_id.clone();
         if let Some(stdout) = self.child.stdout.take() {
+            let events = events.clone();
+            let agent_id = agent_id.clone();
             tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     if !line.trim().is_empty() {
-                        if let Some(event) = log_acp_line(&line) {
+                        for event in process_acp_line(&line, &agent_id) {
                             events.send(Event::Agent(event)).await;
                         }
                     }
                 }
-                tracing::debug!("ACP agent stdout closed");
+                tracing::debug!(agent_id, "ACP agent stdout closed");
+            });
+        }
+        if let Some(stderr) = self.child.stderr.take() {
+            tokio::spawn(async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let line = line.trim();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    tracing::warn!(agent_id, stderr = %line, "ACP agent stderr");
+                    if looks_like_provider_error(line) {
+                        events
+                            .send(Event::Agent(AgentEvent::acp(
+                                &agent_id,
+                                AcpAgentEvent::SessionStatus {
+                                    provider_error: Some(truncate_provider_error(line)),
+                                },
+                            )))
+                            .await;
+                    }
+                }
+                tracing::debug!(agent_id, "ACP agent stderr closed");
             });
         }
     }
@@ -358,7 +405,7 @@ impl AcpClient {
         Ok(())
     }
 
-    /// Reply to a JSON-RPC **request** from the agent (e.g. `session/request_permission`, `cursor/ask_question`).
+    /// Reply to a JSON-RPC **request** from the agent (e.g. `session/request_permission`, ask-question methods).
     pub async fn send_jsonrpc_result(
         &mut self,
         id: serde_json::Value,
@@ -457,7 +504,7 @@ fn jsonrpc_id_matches(received: &serde_json::Value, expected: u64) -> bool {
 fn parse_permission_request(
     jsonrpc_id: serde_json::Value,
     params: serde_json::Value,
-) -> Option<AgentEvent> {
+) -> Option<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)?
@@ -489,7 +536,7 @@ fn parse_permission_request(
     if options.is_empty() {
         return None;
     }
-    Some(AgentEvent::AcpPermissionRequest {
+    Some(AcpAgentEvent::PermissionRequest {
         jsonrpc_id,
         session_id,
         tool_call_id,
@@ -498,10 +545,10 @@ fn parse_permission_request(
     })
 }
 
-fn parse_cursor_ask_question(
+fn parse_ask_question(
     jsonrpc_id: serde_json::Value,
     params: serde_json::Value,
-) -> Option<AgentEvent> {
+) -> Option<AcpAgentEvent> {
     let title = params
         .get("title")
         .and_then(serde_json::Value::as_str)
@@ -532,7 +579,7 @@ fn parse_cursor_ask_question(
     if options.is_empty() {
         return None;
     }
-    Some(AgentEvent::AcpCursorAskQuestion {
+    Some(AcpAgentEvent::AskQuestion {
         jsonrpc_id,
         title,
         question_id,
@@ -541,57 +588,86 @@ fn parse_cursor_ask_question(
     })
 }
 
-fn log_acp_line(line: &str) -> Option<AgentEvent> {
+/// Log one JSON-RPC line from agent stdout and translate recognized messages into bus events.
+fn process_acp_line(line: &str, agent_id: &str) -> Vec<AgentEvent> {
     // Keep raw logs around while ACP support is still being brought up; these are invaluable
     // when a specific agent sends a shape we do not recognize yet.
     tracing::info!(raw = %line, "ACP message from agent");
 
     let Ok(message) = serde_json::from_str::<JsonRpcMessage>(line) else {
         tracing::warn!(raw = %line, "failed to parse ACP message");
-        return None;
+        return Vec::new();
     };
 
-    match message {
+    let events: Vec<AcpAgentEvent> = match message {
         JsonRpcMessage::Notification { method, params, .. } if method == "session/update" => {
-            log_session_update(params)
+            process_session_update(params).into_iter().collect()
         }
         JsonRpcMessage::Notification { method, .. } => {
             tracing::debug!(method, "ACP notification from agent");
-            None
+            Vec::new()
         }
         JsonRpcMessage::Request {
             id, method, params, ..
         } => match method.as_str() {
-            "session/request_permission" => parse_permission_request(id, params),
-            "cursor/ask_question" => parse_cursor_ask_question(id, params),
+            "session/request_permission" => {
+                parse_permission_request(id, params).into_iter().collect()
+            }
+            "cursor/ask_question" | "_zed/askQuestion" => {
+                parse_ask_question(id, params).into_iter().collect()
+            }
             _ => {
                 tracing::info!(?id, %method, "ACP request from agent (no handler)");
-                None
+                Vec::new()
             }
         },
         JsonRpcMessage::Response {
             id, result, error, ..
         } => {
-            tracing::debug!(?id, ?result, ?error, "ACP response from agent");
-            if result
-                .as_ref()
-                .and_then(|result| result.get("stopReason"))
-                .and_then(serde_json::Value::as_str)
-                .is_some()
-            {
-                Some(AgentEvent::AcpProgress {
-                    id: "__turn".to_string(),
-                    label: String::new(),
-                    active: false,
-                })
+            if let Some(err) = &error {
+                tracing::warn!(
+                    ?id,
+                    code = err.code,
+                    message = %err.message,
+                    "ACP JSON-RPC error from agent"
+                );
+                vec![
+                    AcpAgentEvent::SessionStatus {
+                        provider_error: Some(truncate_provider_error(&err.message)),
+                    },
+                    AcpAgentEvent::Progress {
+                        id: "__turn".to_string(),
+                        label: String::new(),
+                        active: false,
+                    },
+                ]
             } else {
-                None
+                tracing::debug!(?id, ?result, "ACP response from agent");
+                if result
+                    .as_ref()
+                    .and_then(|result| result.get("stopReason"))
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+                {
+                    vec![AcpAgentEvent::Progress {
+                        id: "__turn".to_string(),
+                        label: String::new(),
+                        active: false,
+                    }]
+                } else {
+                    Vec::new()
+                }
             }
         }
-    }
+    };
+
+    events
+        .into_iter()
+        .map(|event| AgentEvent::acp(agent_id, event))
+        .collect()
 }
 
-fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
+fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
@@ -634,7 +710,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
             if text.is_empty() {
                 None
             } else {
-                Some(AgentEvent::AcpTranscriptChunk {
+                Some(AcpAgentEvent::TranscriptChunk {
                     kind: kind.to_string(),
                     text: text.to_string(),
                 })
@@ -655,7 +731,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
             tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
-            Some(AgentEvent::AcpProgress {
+            Some(AcpAgentEvent::Progress {
                 id: tool_call_id.to_string(),
                 label: title.to_string(),
                 active: status != "completed" && status != "failed" && status != "cancelled",
@@ -682,7 +758,7 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
                 status,
                 "ACP tool call updated"
             );
-            Some(AgentEvent::AcpProgress {
+            Some(AcpAgentEvent::Progress {
                 id: tool_call_id.to_string(),
                 label: title.to_string(),
                 active: status != "completed" && status != "failed" && status != "cancelled",
@@ -701,6 +777,30 @@ fn log_session_update(params: serde_json::Value) -> Option<AgentEvent> {
             tracing::debug!(session_id, kind = other, "unhandled ACP session update");
             None
         }
+    }
+}
+
+fn looks_like_provider_error(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("error")
+        || lower.contains("cannot connect")
+        || lower.contains("failed")
+        || lower.contains("unable to connect")
+}
+
+fn truncate_provider_error(message: &str) -> String {
+    const MAX_LEN: usize = 160;
+    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= MAX_LEN {
+        collapsed
+    } else {
+        format!(
+            "{}…",
+            collapsed
+                .chars()
+                .take(MAX_LEN.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
 
@@ -745,4 +845,106 @@ async fn selected_file_resource(
         mime_type: Some("text/plain".to_string()),
         text,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_acp_line_tags_events_with_agent_id() {
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hi"}}}}"#;
+        let events = process_acp_line(line, "reviewer");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::TranscriptChunk { kind, text }
+            } if agent_id == "reviewer" && kind == "agent_message_chunk" && text == "hi"
+        ));
+    }
+
+    #[test]
+    fn agent_event_acp_constructor() {
+        let event = AgentEvent::acp(
+            "coder",
+            AcpAgentEvent::Progress {
+                id: "t1".to_string(),
+                label: "Working".to_string(),
+                active: true,
+            },
+        );
+        assert!(matches!(
+            event,
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::Progress { id, .. }
+            } if agent_id == "coder" && id == "t1"
+        ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_ask_question_methods() {
+        let params = r#"{"title":"Pick one","questions":[{"id":"q1","prompt":"Which?","options":[{"id":"a","label":"A"},{"id":"b","label":"B"}]}]}"#;
+        for method in ["cursor/ask_question", "_zed/askQuestion"] {
+            let line =
+                format!(r#"{{"jsonrpc":"2.0","id":7,"method":"{method}","params":{params}}}"#);
+            let events = process_acp_line(&line, "orchestrator");
+            assert_eq!(events.len(), 1);
+            assert!(matches!(
+                &events[0],
+                AgentEvent::Acp {
+                    agent_id,
+                    event: AcpAgentEvent::AskQuestion {
+                        title,
+                        question_id,
+                        prompt,
+                        ..
+                    }
+                } if agent_id == "orchestrator"
+                    && title == "Pick one"
+                    && question_id == "q1"
+                    && prompt == "Which?"
+            ));
+        }
+    }
+
+    #[test]
+    fn new_session_result_extracts_selected_model() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [
+                {"id": "model", "name": "Model", "currentValue": "lemonade/Gemma-4-26B-A4B-it-GGUF"}
+            ]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+        assert_eq!(
+            result.selected_model().as_deref(),
+            Some("lemonade/Gemma-4-26B-A4B-it-GGUF")
+        );
+    }
+
+    #[test]
+    fn process_acp_line_surfaces_jsonrpc_error_as_session_status() {
+        let line =
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32603,"message":"Cannot connect to API"}}"#;
+        let events = process_acp_line(line, "reviewer");
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::SessionStatus { provider_error }
+            } if agent_id == "reviewer"
+                && provider_error.as_deref() == Some("Cannot connect to API")
+        ));
+        assert!(matches!(
+            &events[1],
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::Progress { id, active, .. }
+            } if agent_id == "reviewer" && id == "__turn" && !active
+        ));
+    }
 }

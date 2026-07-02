@@ -1,5 +1,6 @@
 use super::input::Key;
 use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
+use tracing::info;
 
 const SPLIT_GAP: usize = 2;
 /// Minimum leading (editor) pane width in columns for vertical split mode.
@@ -275,6 +276,13 @@ pub(super) fn handle_layout_shortcuts(
 
             if let PaneLayoutMode::PaneMaximized(i) = next_mode {
                 if i >= pane_count {
+                    if let Some(digit) = key_to_digit(*key) {
+                        info!(
+                            digit,
+                            pane_count,
+                            "layout shortcut ignored: no pane at this index (spawn the agent first?)"
+                        );
+                    }
                     continue;
                 }
             }
@@ -306,6 +314,11 @@ pub(super) fn handle_layout_shortcuts(
                         *active_pane = target;
                         return true;
                     }
+                    info!(
+                        digit,
+                        pane_count,
+                        "focus shortcut ignored: no pane at this index (spawn the agent first?)"
+                    );
                 }
             }
         }
@@ -333,6 +346,27 @@ fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
     match mode {
         PaneLayoutMode::PaneMaximized(i) => Some(i),
         PaneLayoutMode::Split => None,
+    }
+}
+
+/// Keep `active_pane` and `PaneMaximized` indices valid after removing a pane.
+pub(super) fn adjust_pane_indices_after_removal(
+    mode: &mut PaneLayoutMode,
+    active_pane: &mut usize,
+    removed_index: usize,
+    remaining_pane_count: usize,
+) {
+    if *active_pane > removed_index {
+        *active_pane -= 1;
+    }
+    *active_pane = (*active_pane).min(remaining_pane_count.saturating_sub(1));
+
+    if let PaneLayoutMode::PaneMaximized(i) = mode {
+        if *i == removed_index {
+            *mode = PaneLayoutMode::Split;
+        } else if *i > removed_index {
+            *i -= 1;
+        }
     }
 }
 
@@ -579,5 +613,32 @@ mod tests {
         assert_eq!(active, 0);
         assert!(!focus.relayout_needed);
         assert!(focus.focus_changed);
+    }
+
+    #[test]
+    fn adjust_pane_indices_after_removal_decrements_maximized_index() {
+        let mut mode = PaneLayoutMode::PaneMaximized(2);
+        let mut active = 2;
+        adjust_pane_indices_after_removal(&mut mode, &mut active, 0, 2);
+        assert_eq!(mode, PaneLayoutMode::PaneMaximized(1));
+        assert_eq!(active, 1);
+    }
+
+    #[test]
+    fn adjust_pane_indices_after_removal_resets_split_when_maximized_pane_removed() {
+        let mut mode = PaneLayoutMode::PaneMaximized(1);
+        let mut active = 1;
+        adjust_pane_indices_after_removal(&mut mode, &mut active, 1, 1);
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active, 0);
+    }
+
+    #[test]
+    fn adjust_pane_indices_after_removal_shifts_active_pane_down() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 2;
+        adjust_pane_indices_after_removal(&mut mode, &mut active, 0, 2);
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active, 1);
     }
 }

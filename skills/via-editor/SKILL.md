@@ -26,8 +26,8 @@ via installs this skill under your home directory for the configured agent when
 a session starts. You can refresh or inspect paths with:
 
 ```bash
-via agent skill install
-via agent skill status
+via plugin install
+via plugin status
 ```
 
 ## Session resolution
@@ -65,10 +65,10 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
 | `via session list` | List all running via sessions |
 | `via session get` | Show the session resolved from `VIA_SESSION` |
 | `via session diagnostics [--file PATH] --json` | Refresh unchanged Neovim buffers with `:checktime`, then export diagnostics |
-| `via agent skill install` | Install or update the global via-editor skill |
-| `via agent skill status` | Show global install paths and state |
-| `via agent skill cleanup` | Remove the skill from every known global location |
-| `via agent skill show` | Print this skill to stdout |
+| `via plugin install` | Install or update the via plugin skills |
+| `via plugin status` | Show install paths and state |
+| `via plugin cleanup` | Remove the base skills from every known location |
+| `via plugin path` | Print the primary install root |
 
 ## Output shape
 

@@ -67,6 +67,7 @@ impl PtySession {
         command: &str,
         args: I,
         cwd: &Path,
+        extra_env: &[(&str, &str)],
         size: TerminalSize,
         output_notifier: N,
     ) -> Result<Self>
@@ -88,6 +89,9 @@ impl PtySession {
         command.env("TERM", "xterm-ghostty");
         command.env("TERM_PROGRAM", "ghostty");
         command.env("COLORTERM", "truecolor");
+        for (key, value) in extra_env {
+            command.env(key, value);
+        }
 
         let child = pair
             .slave
@@ -151,6 +155,15 @@ impl PtySession {
         self.master
             .resize(size.into())
             .context("failed to resize PTY")
+    }
+
+    /// True when the child process has exited (or exit status could not be read).
+    pub fn has_exited(&mut self) -> bool {
+        match self.child.try_wait() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => true,
+        }
     }
 }
 

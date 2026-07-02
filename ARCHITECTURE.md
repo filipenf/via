@@ -24,6 +24,12 @@ Success criteria called out early:
 Design philosophy: "The editor is the heart, the agent is the brain, and the
 terminal wrapper is the nervous system."
 
+**Orchestration policy:** via **transports** — panes, sockets, ACP sessions, and
+the file-backed mailbox — it does not encode multi-agent workflows in Rust.
+Agents **orchestrate** themselves via skills, CLI (`via agent`), and (eventually)
+MCP tools. The primary interactive pane is always a PTY; spawned helpers use ACP
+when the configured driver supports it.
+
 ## Core components and data flow
 
 ```
@@ -122,16 +128,27 @@ Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
 
 ### Agent side: Normal mode (PTY) vs ACP mode (src/acp.rs + mediator + pty.rs)
 
-- Normal mode (PTY, e.g. `VIA_AGENT="claude"` etc.): a `PtySession` is spawned
+- Normal mode (PTY, e.g. `VIA_AGENT="opencode"`): a `PtySession` is spawned
   for the agent. Output is fed to a libghostty `Terminal` in the agent pane.
   Context is injected by writing text into the PTY.
-- ACP mode (e.g. `VIA_AGENT="opencode acp"` etc.): `AcpClient` spawns the agent
+- ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
   as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, context is
   sent as `context/update` messages. The UI for this path is the Ratatui ACP
   pane (not a raw PTY). Tool permissions and results flow through the mediator.
 
 `AcpClient` is intentionally minimal (handshake, session create, context,
 prompt, tool result serialization). It is not a full agent SDK.
+
+### Two coordination modes
+
+- **PTY = interactive / manual (default primary).** `--agent opencode` starts a PTY
+  pane (bus id `agent`). Bus sends are mailbox-only; read with `via agent inbox`.
+- **ACP = orchestrated / automatic (spawned).** Spawn `orchestrator`, `reviewer`, etc.;
+  via drives them over ACP. Bus sends and pane prompts go through `client.prompt()`.
+  Auto handoff is ACP-only. The PTY `agent` pane remains for interactive work alongside
+  spawned ACP helpers.
+
+`--agent "… acp"` is rejected at startup; the primary pane is always a PTY.
 
 `src/pty.rs` also provides `CoalescedOutputNotifier` so that bursty PTY readers
 don't flood the UI thread with redraw events.
@@ -160,15 +177,45 @@ dir). There is deliberately no "guess the newest socket" fallback.
 ### Config, sessions, and CLI (src/config.rs, src/session.rs, src/cli/\*)
 
 Config resolution is strict precedence: CLI > env (`VIA_*`) >
-`~/.config/via/via.conf` (TOML) > built-in defaults. `--persist` writes the
-resolved user-facing values.
+`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command must
+be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects whether spawned
+helpers can resolve to ACP (known-agent table or `acp_agent` override). Spawn presets
+(`[agents.orchestrator]`, `[agents.reviewer]`, `[agents.coder]` in `via.conf`, plus
+built-in defaults) fill missing `role` / `command` when opening helper panes.
 
 `SessionGuard` writes (and removes on drop) a per-pid manifest so that
 `via session ...` subcommands and agents running inside the session can find the
 right sockets without extra flags.
 
-CLI subcommands live under `via session` (list, get, diagnostics) and
-`via agent skill` (install/status the global via-editor skill).
+CLI subcommands live under `via session` (list, get, diagnostics), `via agent`
+(list, spawn, send, inbox, whoami — the agent bus), and `via plugin`
+(install/status the plugin skills).
+
+### Agent bus (src/agent_bus.rs)
+
+Inter-agent discovery and messaging, all file-backed under a per-process
+`agents_dir` (recorded in the session manifest so CLI commands resolve it from
+`VIA_SESSION`):
+
+- `registry.json` — the list of agent panes, written by the UI whenever it spawns
+  a pane (`write_agent_registry`). This is the discovery surface (`via agent list`,
+  Lua `require('via').agent.list()`).
+- `inbox/<id>/*.json` — per-recipient mailbox files under `<runtime>/agents/`.
+  `via agent send` appends one file per message (the source of truth) and notifies
+  the mediator for ACP delivery via the `agent_send` editor-socket event;
+  `via agent inbox` drains it.
+
+Each agent pane is spawned with `VIA_AGENT_ID`/`VIA_AGENT_ROLE` so an agent knows
+its own identity.
+
+### Plugin (src/plugin.rs)
+
+The skills (and, later, agents/workflows/tools) via projects into the agent's
+skill directory. A tiny embedded base (`via-editor`, `via-agents`) ships in the
+binary so things work out of the box; users can point via at a local plugin
+directory (`plugin_dir` / `VIA_PLUGIN_DIR` / `--plugin-dir`) whose `skills/*` are
+overlaid on top. `via plugin install` (also run automatically at startup)
+projects them into the detected agent family's skill roots.
 
 ### Other notable pieces
 
@@ -210,10 +257,16 @@ and are mitigated by the native + GPU nature of the stack.
 - A "via-editor" skill is auto-installed for ACP agents so they can pull
   diagnostics without hallucinating file state.
 - Multi-agent spawning: the orchestrator (primary agent) or Neovim Lua
-  (`require('via').agent.spawn(...)`) can request additional visible agent
-  panes at runtime. Each pane carries a `PaneRole::AgentTerminal { id, label }`
-  and is routed via the same mediator/UI command path. The Lua module talks
-  over the editor Unix socket using the existing JSON event protocol.
+  (`require('via').agent.spawn(...)`) can request additional agent panes at
+  runtime. A spawned agent whose command ends in `acp` (see
+  `config::is_acp_command`) gets an ACP transcript pane and a mediator-owned
+  session; anything else gets a `PaneRole::AgentTerminal { id, label, command }`
+  PTY pane. Spawned helpers join the registry and are reachable via Alt+1..9 but
+  do not steal focus or reshape the active layout.
+- Coordination is two-mode: PTY agents are interactive (manual `via agent
+  inbox`), ACP agents are orchestrated (bus sends and pane prompts both go
+  through `client.prompt()`, so a sub's turn starts automatically). Automatic
+  handoff is ACP-only; see "Two coordination modes" above.
 - The vendored Ghostty VT bits are pinned to a specific git rev of a
   libghostty-rs wrapper. This gives a single static binary but makes clean
   builds heavy (Zig + git).
