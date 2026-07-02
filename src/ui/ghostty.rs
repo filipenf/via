@@ -39,7 +39,8 @@ use font::FontRenderer;
 use input::{Key, Modifiers, paste_requested, read_clipboard_text};
 use layout::{
     PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
-    focus_nvim_after_agent_reference, handle_layout_shortcuts, vertical_split_fits,
+    adjust_pane_indices_after_removal, focus_nvim_after_agent_reference, handle_layout_shortcuts,
+    vertical_split_fits,
 };
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
@@ -276,10 +277,11 @@ impl AppPane {
         }
     }
 
-    fn terminate_agent(&mut self) {
+    fn terminate_agent(&mut self) -> Result<()> {
         if let Self::Terminal(pane) = self {
-            pane.terminate_agent();
+            pane.terminate_agent()?;
         }
+        Ok(())
     }
 
     fn is_terminable_sub_agent(&self) -> bool {
@@ -744,12 +746,15 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        self.panes[index].terminate_agent();
+        self.panes[index].terminate_agent()?;
         self.panes.remove(index);
 
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len().saturating_sub(1);
-        }
+        adjust_pane_indices_after_removal(
+            &mut self.pane_layout_mode,
+            &mut self.active_pane,
+            index,
+            self.panes.len(),
+        );
         if self
             .acp_modal
             .as_ref()
@@ -781,15 +786,26 @@ impl WinitGhosttyApp {
 
     /// Drop terminal agent panes whose PTY child has exited and refresh the registry.
     fn prune_exited_agent_panes(&mut self) {
-        let before = self.panes.len();
-        self.panes.retain_mut(|pane| !pane.has_exited_agent());
-        if self.panes.len() == before {
+        let to_remove: Vec<usize> = self
+            .panes
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(index, pane)| pane.has_exited_agent().then_some(index))
+            .collect();
+        if to_remove.is_empty() {
             return;
         }
 
-        if self.active_pane >= self.panes.len() {
-            self.active_pane = self.panes.len().saturating_sub(1);
+        for index in to_remove.into_iter().rev() {
+            self.panes.remove(index);
+            adjust_pane_indices_after_removal(
+                &mut self.pane_layout_mode,
+                &mut self.active_pane,
+                index,
+                self.panes.len(),
+            );
         }
+
         self.write_agent_registry();
         self.relayout();
         self.dirty = true;

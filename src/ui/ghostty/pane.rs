@@ -215,9 +215,10 @@ impl TerminalPane {
         }
     }
 
-    pub(super) fn terminate_child(&mut self) {
+    pub(super) fn terminate_child(&mut self) -> Result<()> {
+        self.view.clear_pty_response_writer()?;
         self.pty = None;
-        let _ = self.view.clear_pty_response_writer();
+        Ok(())
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {

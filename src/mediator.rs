@@ -491,11 +491,28 @@ impl Mediator {
             };
             match establish_acp_with_retries(&id, &role, program, args, &cwd).await {
                 Ok(session) => {
+                    // Serialize with `TerminateAgent`, which removes `id` from `expected` and
+                    // `acp_sessions` while holding the `acp_sessions` lock. If the user terminated
+                    // the agent while this handshake was in flight, `expected` no longer contains
+                    // `id`, so drop the freshly built session instead of inserting an orphan —
+                    // `AcpClient::drop` kills the subprocess. Without this, the detached task would
+                    // resurrect a session (and stdout reader) for a pane that no longer exists.
+                    let mut sessions_guard = sessions.lock().await;
+                    let still_wanted = expected.lock().await.remove(&id);
+                    connecting.lock().await.remove(&id);
+                    if !still_wanted {
+                        drop(sessions_guard);
+                        drop(session);
+                        info!(
+                            agent_id = %id,
+                            "ACP agent terminated during handshake; discarding completed session"
+                        );
+                        return;
+                    }
                     let client = Arc::clone(&session.client);
                     let model = session.model.clone();
-                    sessions.lock().await.insert(id.clone(), session);
-                    expected.lock().await.remove(&id);
-                    connecting.lock().await.remove(&id);
+                    sessions_guard.insert(id.clone(), session);
+                    drop(sessions_guard);
                     let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
                         agent_id: id.clone(),
                         model,
@@ -1028,8 +1045,14 @@ impl Mediator {
                     tracing::warn!(%id, "refusing to terminate primary agent");
                 } else {
                     info!(%id, "terminate agent requested");
-                    self.acp_sessions.lock().await.remove(id);
-                    self.expected_acp_agents.lock().await.remove(id);
+                    // Hold the acp_sessions lock while clearing `expected` so a connect task
+                    // finishing its handshake concurrently observes the removal and discards its
+                    // session (see connect_acp_agent) rather than resurrecting a dead agent.
+                    {
+                        let mut sessions = self.acp_sessions.lock().await;
+                        self.expected_acp_agents.lock().await.remove(id);
+                        sessions.remove(id);
+                    }
                     self.pending_acp_prompts.lock().await.remove(id);
                     self.acp_launch_configs.lock().await.remove(id);
                     self.connecting_acp_agents.lock().await.remove(id);
