@@ -84,9 +84,9 @@ Next steps:
 ACP is also how via does **automatic** agent-to-agent handoff. The two agent
 modes split coordination cleanly:
 
-- **PTY = interactive/manual.** A `via agent send` to a PTY agent only injects an
-  inbox ping; that agent reads `via agent inbox` and acts on its own. via never
-  auto-submits into an interactive pane.
+- **PTY = interactive/manual.** A `via agent send` to a PTY agent is mailbox-only;
+  that agent reads `via agent inbox` and acts on its own. via never auto-submits
+  or injects coordination pings into an interactive pane.
 - **ACP = orchestrated/automatic.** Inbound text for an ACP agent — typed into
   its pane or delivered over the bus — resolves to its session and goes through a
   single primitive, `client.prompt()`, which starts the agent's next turn with

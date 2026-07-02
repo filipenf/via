@@ -16,6 +16,7 @@ const OPEN_FILE_LUA_TEMPLATE: &str = include_str!("../nvim/open_file.lua");
 const OPEN_SYMBOL_LUA_TEMPLATE: &str = include_str!("../nvim/open_symbol.lua");
 const REVIEW_LUA_TEMPLATE: &str = include_str!("../nvim/review.lua");
 const DIAGNOSTICS_LUA_TEMPLATE: &str = include_str!("../nvim/diagnostics.lua");
+const REFRESH_LUA_TEMPLATE: &str = include_str!("../nvim/refresh.lua");
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiagnosticsOutput {
@@ -124,6 +125,44 @@ pub async fn get_diagnostics(socket_path: &Path, file: Option<&Path>) -> Result<
     let report: DiagnosticsReport =
         serde_json::from_str(&json).context("failed to parse diagnostics JSON from Neovim")?;
     Ok(report)
+}
+
+pub async fn refresh_buffers(socket_path: &Path, file: Option<&Path>) -> Result<RefreshReport> {
+    if !socket_path.exists() {
+        bail!(
+            "Neovim RPC socket does not exist at {}. Start via before running session refresh.",
+            socket_path.display()
+        );
+    }
+
+    let (nvim, io_handle) = connect(socket_path).await?;
+    let file_path = file
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let file_literal = lua_string_literal(&file_path);
+    let replacements: [(&str, &str); 1] = [("__FILE_PATH__", file_literal.as_str())];
+    let code = exec_lua_chunk(REFRESH_LUA_TEMPLATE, &replacements);
+
+    let value = nvim
+        .exec_lua(&code, Vec::new())
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to refresh Neovim buffers: {error}"))?;
+    let json: String = value
+        .try_unpack()
+        .map_err(|error| anyhow::anyhow!("unexpected refresh payload from Neovim: {error:?}"))?;
+
+    io_handle.abort();
+
+    let report: RefreshReport =
+        serde_json::from_str(&json).context("failed to parse refresh JSON from Neovim")?;
+    Ok(report)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RefreshReport {
+    pub refreshed: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
 }
 
 pub async fn open_review(socket_path: &Path, working_directory: &Path) -> Result<()> {
@@ -428,5 +467,11 @@ mod tests {
     #[test]
     fn diagnostics_refreshes_buffers_before_reading() {
         assert!(DIAGNOSTICS_LUA_TEMPLATE.contains("checktime"));
+    }
+
+    #[test]
+    fn refresh_checks_loaded_buffers() {
+        assert!(REFRESH_LUA_TEMPLATE.contains("checktime"));
+        assert!(REFRESH_LUA_TEMPLATE.contains("bufnr(resolved, false)"));
     }
 }
