@@ -54,6 +54,9 @@ pub enum AgentCommand {
         /// Show messages without removing them from the mailbox.
         #[arg(long)]
         peek: bool,
+        /// Block until a message arrives or this many seconds elapse.
+        #[arg(long, value_name = "SECONDS")]
+        wait: Option<u64>,
     },
     /// Print this agent's identity and session.
     Whoami {
@@ -73,7 +76,7 @@ pub fn run(command: AgentCommand) -> Result<()> {
             no_focus,
             no_notify,
         } => run_send(to, message, !no_focus, !no_notify),
-        AgentCommand::Inbox { json, peek } => run_inbox(json, peek),
+        AgentCommand::Inbox { json, peek, wait } => run_inbox(json, peek, wait),
         AgentCommand::Whoami { json } => run_whoami(json),
     }
 }
@@ -205,7 +208,7 @@ fn run_send(to: Option<String>, message: String, focus: bool, notify: bool) -> R
     Ok(())
 }
 
-fn run_inbox(json: bool, peek: bool) -> Result<()> {
+fn run_inbox(json: bool, peek: bool, wait: Option<u64>) -> Result<()> {
     let session = session::resolve_session()?;
     let Some(id) = self_id() else {
         bail!(
@@ -214,7 +217,8 @@ fn run_inbox(json: bool, peek: bool) -> Result<()> {
         );
     };
 
-    let messages = agent_bus::drain_inbox(&session.agents_dir, &id, peek)?;
+    let timeout = wait.map(Duration::from_secs);
+    let messages = agent_bus::drain_inbox_with_wait(&session.agents_dir, &id, peek, timeout)?;
 
     if json {
         println!("{}", serde_json::to_string_pretty(&messages)?);
