@@ -1239,6 +1239,16 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    fn temp_agents_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "via-mediator-{label}-{}-{}",
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn test_config() -> Config {
         Config {
             nvim_command: "nvim".to_string(),
@@ -1258,6 +1268,20 @@ mod tests {
             plugin_dir: None,
             agent_presets: crate::config::default_agent_presets(),
         }
+    }
+
+    fn test_config_with_agents_dir(agents_dir: PathBuf) -> Config {
+        Config {
+            agents_dir,
+            ..test_config()
+        }
+    }
+
+    fn mediator_with_ui_receiver(config: Config) -> (Mediator, mpsc::Receiver<UiCommand>) {
+        let mut mediator = Mediator::new(config);
+        let (ui_tx, ui_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
+        mediator.ui_commands = ui_tx;
+        (mediator, ui_rx)
     }
 
     fn parse_tool_result(payload: &str) -> serde_json::Value {
@@ -1298,6 +1322,89 @@ mod tests {
                 .expect("error string")
                 .contains("unsupported tool method")
         );
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_without_command_uses_preset_role_and_resolved_acp_command() {
+        let agents_dir = temp_agents_dir("spawn-default-acp");
+        let config = Config {
+            agent_command: Some("unknown-agent".to_string()),
+            acp_agent: Some("false acp".to_string()),
+            orchestration_enabled: true,
+            agents_dir: agents_dir.clone(),
+            ..test_config()
+        };
+        let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(config);
+
+        mediator
+            .apply_editor_event(EditorEvent::SpawnAgent {
+                id: "reviewer".to_string(),
+                role: None,
+                command: None,
+            })
+            .await;
+
+        let command = tokio::time::timeout(Duration::from_millis(100), ui_rx.recv())
+            .await
+            .expect("spawn command")
+            .expect("ui command");
+        assert_eq!(
+            command,
+            UiCommand::SpawnAgent {
+                id: "reviewer".to_string(),
+                role: Some("reviewer".to_string()),
+                command: Some("false acp".to_string()),
+            }
+        );
+
+        assert_eq!(
+            mediator
+                .acp_launch_configs
+                .lock()
+                .await
+                .get("reviewer")
+                .map(|launch| (launch.role.clone(), launch.command.clone())),
+            Some((Some("reviewer".to_string()), "false acp".to_string()))
+        );
+        std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn agent_send_to_pty_recipient_is_mailbox_only() {
+        let agents_dir = temp_agents_dir("pty-mailbox-only");
+        agent_bus::write_registry(
+            &agents_dir,
+            &[agent_bus::AgentRecord {
+                id: "agent".to_string(),
+                role: Some("primary".to_string()),
+                command: Some("opencode".to_string()),
+                mode: Some(agent_bus::AgentMode::Pty),
+                primary: true,
+            }],
+        )
+        .unwrap();
+        let (mut mediator, mut ui_rx) =
+            mediator_with_ui_receiver(test_config_with_agents_dir(agents_dir.clone()));
+
+        mediator
+            .apply_editor_event(EditorEvent::AgentSend {
+                agent_id: Some("agent".to_string()),
+                from: None,
+                content: "check your inbox".to_string(),
+                focus: true,
+            })
+            .await;
+
+        let messages = agent_bus::drain_inbox(&agents_dir, "agent", true).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "check your inbox");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), ui_rx.recv())
+                .await
+                .is_err(),
+            "PTY bus send should not emit AgentInput ping"
+        );
+        std::fs::remove_dir_all(&agents_dir).ok();
     }
 
     #[test]

@@ -118,6 +118,19 @@ All tests live in `src/**` as `#[cfg(test)] mod tests`. There is no separate
 `tests/` crate today (the combination of native winit window + PTYs + Neovim
 makes fully hermetic GUI integration tests expensive to maintain).
 
+For a live-session orchestration smoke test, start via with an ACP-capable
+primary agent such as `opencode`, then run this from a via-launched pane:
+
+```sh
+scripts/e2e-agent-orchestration.sh
+# or: mise run e2e-agents
+```
+
+The script is intentionally opt-in, not CI-gated. It drives real `via agent`
+commands against the active `VIA_SESSION`: spawns `reviewer` and `orchestrator`,
+checks ACP registry mode, verifies ACP prompt delivery, verifies PTY mailbox-only
+send behavior, checks missing-recipient failure, and terminates spawned panes.
+
 We have Criterion micro-benchmarks for the two most user-visible
 performance-sensitive surfaces:
 
@@ -161,6 +174,9 @@ In Neovim:
 - `<leader>ab` or `:ViaBufferSend` — explicitly send the current buffer (or
   visual selection) to the agent. This is the single source of truth for
   context.
+- `via session refresh [--file PATH]` — ask Neovim to reload externally changed
+  buffers after agent edits. via also runs `:checktime` on `FocusGained` and
+  `BufEnter`.
 - Shift-click file paths or `symbol://Foo::bar` references in the agent output
   to open them in the Neovim pane.
 

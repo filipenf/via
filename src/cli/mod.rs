@@ -132,6 +132,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_session_refresh() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "session",
+            "refresh",
+            "--file",
+            "src/main.rs",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Session {
+                command: SessionCommand::Refresh {
+                    json: true,
+                    file: Some(path),
+                },
+            }) if path == Path::new("src/main.rs")
+        ));
+    }
+
+    #[test]
     fn parses_agent_list_json() {
         let cli = Cli::try_parse_from(["via", "agent", "list", "--json"]).unwrap();
         assert!(matches!(

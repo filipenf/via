@@ -25,6 +25,13 @@ pub enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Ask Neovim to reload externally changed buffers.
+    Refresh {
+        #[arg(long)]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub async fn run(command: SessionCommand) -> Result<()> {
@@ -32,7 +39,24 @@ pub async fn run(command: SessionCommand) -> Result<()> {
         SessionCommand::List { json } => run_list(json),
         SessionCommand::Get { json } => run_get(json),
         SessionCommand::Diagnostics { file, json } => run_diagnostics(file.as_deref(), json).await,
+        SessionCommand::Refresh { file, json } => run_refresh(file.as_deref(), json).await,
     }
+}
+
+async fn run_refresh(file: Option<&Path>, json: bool) -> Result<()> {
+    let session = session::resolve_session()?;
+    let report = nvim::refresh_buffers(&session.nvim_socket, file).await?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
+    match report.path {
+        Some(path) => println!("refreshed={} path={}", report.refreshed, path.display()),
+        None => println!("refreshed={}", report.refreshed),
+    }
+    Ok(())
 }
 
 fn run_list(json: bool) -> Result<()> {

@@ -58,6 +58,13 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
 
 4. If `summary.errors > 0`, fix issues and re-run diagnostics before finishing.
 
+If files were edited outside Neovim and you want to refresh buffers without reading diagnostics:
+
+```bash
+via session refresh
+via session refresh --file src/lib.rs
+```
+
 ## Command reference
 
 | Command | Purpose |
@@ -65,6 +72,7 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
 | `via session list` | List all running via sessions |
 | `via session get` | Show the session resolved from `VIA_SESSION` |
 | `via session diagnostics [--file PATH] --json` | Refresh unchanged Neovim buffers with `:checktime`, then export diagnostics |
+| `via session refresh [--file PATH] [--json]` | Ask Neovim to reload externally changed buffers |
 | `via plugin install` | Install or update the via plugin skills |
 | `via plugin status` | Show install paths and state |
 | `via plugin cleanup` | Remove the base skills from every known location |

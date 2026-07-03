@@ -283,6 +283,13 @@ end
 
 local group = vim.api.nvim_create_augroup("viaContextSync", { clear = true })
 
+vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
+  group = group,
+  callback = function()
+    vim.cmd("silent! checktime")
+  end,
+})
+
 -- Diagnostics are still pushed automatically (useful for the agent to see errors/warnings)
 vim.api.nvim_create_autocmd("DiagnosticChanged", {
   group = group,

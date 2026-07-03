@@ -18,6 +18,9 @@ clippy = { run = "cargo clippy -- -D warnings", description = "Run clippy with w
 # Unit tests
 test = { run = "cargo test", description = "Run unit tests" }
 
+# Opt-in live-session E2E smoke. Requires running inside a via session with ACP-capable agent.
+"e2e-agents" = { run = "scripts/e2e-agent-orchestration.sh", description = "Run live via agent orchestration smoke test" }
+
 # Criterion benchmarks for layout + link hot paths.
 # Use full `cargo bench` locally for real measurements; CI runs a quick sample.
 bench = { run = "cargo bench", description = "Run Criterion benchmarks (layout + links)" }
