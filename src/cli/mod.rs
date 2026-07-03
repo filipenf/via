@@ -206,13 +206,14 @@ mod tests {
 
     #[test]
     fn parses_agent_inbox() {
-        let cli = Cli::try_parse_from(["via", "agent", "inbox", "--peek"]).unwrap();
+        let cli = Cli::try_parse_from(["via", "agent", "inbox", "--peek", "--wait", "30"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(Command::Agent {
                 command: AgentCommand::Inbox {
                     json: false,
                     peek: true,
+                    wait: Some(30),
                 },
             })
         ));

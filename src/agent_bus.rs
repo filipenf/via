@@ -17,6 +17,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -163,6 +165,44 @@ pub fn drain_inbox(agents_dir: &Path, id: &str, peek: bool) -> Result<Vec<Messag
     }
 
     Ok(messages)
+}
+
+/// Poll interval while waiting for new inbox messages.
+const INBOX_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Like [`drain_inbox`], but when the mailbox is empty and `timeout` is set, block until a
+/// message arrives or the timeout elapses.
+pub fn drain_inbox_with_wait(
+    agents_dir: &Path,
+    id: &str,
+    peek: bool,
+    timeout: Option<Duration>,
+) -> Result<Vec<Message>> {
+    let messages = drain_inbox(agents_dir, id, peek)?;
+    if !messages.is_empty() {
+        return Ok(messages);
+    }
+
+    let Some(timeout) = timeout else {
+        return Ok(messages);
+    };
+
+    if timeout.is_zero() {
+        return Ok(messages);
+    }
+
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(INBOX_WAIT_POLL_INTERVAL));
+
+        let messages = drain_inbox(agents_dir, id, peek)?;
+        if !messages.is_empty() {
+            return Ok(messages);
+        }
+    }
+
+    Ok(Vec::new())
 }
 
 /// Send a single newline-delimited JSON line to the editor Unix socket (fire-and-forget),
@@ -340,6 +380,67 @@ mod tests {
 
         assert!(drain_inbox(&dir, "reviewer", false).unwrap().is_empty());
         assert!(!bad.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drain_inbox_with_wait_returns_immediately_when_messages_present() {
+        let dir = temp_dir("inbox-wait-present");
+        enqueue(
+            &dir,
+            &Message {
+                from: "reviewer".to_string(),
+                to: "agent".to_string(),
+                ts: 42,
+                text: "ready".to_string(),
+            },
+        )
+        .unwrap();
+
+        let messages =
+            drain_inbox_with_wait(&dir, "agent", false, Some(Duration::from_secs(5))).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "ready");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drain_inbox_with_wait_blocks_until_message_arrives() {
+        let dir = temp_dir("inbox-wait-arrival");
+        let dir_for_thread = dir.clone();
+        let handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            enqueue(
+                &dir_for_thread,
+                &Message {
+                    from: "reviewer".to_string(),
+                    to: "agent".to_string(),
+                    ts: 99,
+                    text: "delayed".to_string(),
+                },
+            )
+            .unwrap();
+        });
+
+        let started = Instant::now();
+        let messages =
+            drain_inbox_with_wait(&dir, "agent", false, Some(Duration::from_secs(2))).unwrap();
+        handle.join().unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "delayed");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn drain_inbox_with_wait_times_out_when_empty() {
+        let dir = temp_dir("inbox-wait-timeout");
+        let started = Instant::now();
+        let messages =
+            drain_inbox_with_wait(&dir, "agent", false, Some(Duration::from_millis(120))).unwrap();
+        assert!(messages.is_empty());
+        assert!(started.elapsed() >= Duration::from_millis(100));
         std::fs::remove_dir_all(&dir).ok();
     }
 
