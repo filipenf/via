@@ -275,6 +275,7 @@ impl TerminalPane {
                 rect,
                 active,
                 &self.view.theme,
+                redrawn || force_redraw,
                 damage,
             );
             true

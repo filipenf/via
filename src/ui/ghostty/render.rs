@@ -49,6 +49,7 @@ pub(super) fn draw_pane_focus_chrome(
     rect: PaneRect,
     active: bool,
     theme: &TerminalTheme,
+    apply_inactive_tint: bool,
     damage: &mut Vec<DamageRect>,
 ) {
     if rect.width == 0 || rect.height == 0 {
@@ -58,7 +59,7 @@ pub(super) fn draw_pane_focus_chrome(
     let border_color = pane_focus_border_color(active, theme);
     draw_pane_border(buffer, width, height, rect, border_color);
 
-    if !active {
+    if !active && apply_inactive_tint {
         let inset = 1;
         if rect.width > inset * 2 && rect.height > inset * 2 {
             draw_pane_tint(
@@ -1126,5 +1127,56 @@ mod tests {
         let dg = ((a >> 8) & 0xff).abs_diff((b >> 8) & 0xff);
         let db = (a & 0xff).abs_diff(b & 0xff);
         dr + dg + db
+    }
+
+    #[test]
+    fn inactive_tint_skipped_on_chrome_only_redraw() {
+        use super::super::layout::PaneRect;
+
+        let theme = TerminalTheme::default();
+        let width = 100usize;
+        let height = 100usize;
+        let rect = PaneRect {
+            x: 10,
+            y: 10,
+            width: 20,
+            height: 20,
+        };
+        let mut buffer = vec![0x00ff00; width * height];
+        let mut damage = Vec::new();
+
+        draw_pane_focus_chrome(
+            &mut buffer,
+            width,
+            height,
+            rect,
+            false,
+            &theme,
+            true,
+            &mut damage,
+        );
+        let after_content_redraw = buffer.clone();
+
+        draw_pane_focus_chrome(
+            &mut buffer,
+            width,
+            height,
+            rect,
+            false,
+            &theme,
+            false,
+            &mut damage,
+        );
+
+        let inset = 2;
+        for row in (rect.y + inset)..(rect.y + rect.height - inset) {
+            for col in (rect.x + inset)..(rect.x + rect.width - inset) {
+                let idx = row * width + col;
+                assert_eq!(
+                    buffer[idx], after_content_redraw[idx],
+                    "interior pixel at ({col}, {row}) changed on chrome-only redraw"
+                );
+            }
+        }
     }
 }
