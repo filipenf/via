@@ -12,8 +12,11 @@ mod nvim;
 mod plugin;
 mod pty;
 mod session;
+mod task_delivery;
+mod task_store;
 pub mod ui;
 mod util;
+mod workspace;
 
 use anyhow::Result;
 use clap::Parser;

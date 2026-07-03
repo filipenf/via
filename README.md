@@ -3,48 +3,64 @@
 A Rust terminal application that bridges Neovim and AI agents via libghostty's
 VT engine.
 
-## why via?
+## Why via?
 
-I built via because I didn't like the way most AI plugins for nvim work. The
-fundamental problem is that managing the AI panes inside nvim is tricky, you get
-a lot of flickering, screen incorrectly laid out and hard to navigate, etc.
+Via is my attempt at making terminal-only AI-assisted coding better. There are
+plenty of Neovim plugins that put the AI assistant in a side pane, but my
+experience working with them wasn't very enjoyable: too much flickering, weird
+pane positioning, and so on. I thought wrapping Neovim + an agent in a dedicated
+terminal window could deliver a smoother UX.
 
-So via is my attempt to solve those problems by bridging the AI agent with nvim.
-It creates separate panes (libghostty terminals) for each and connects them.
+The idea is simple: glue the best code editor together with the AI coding
+harness of your choice, and add a few features that make the combination feel
+like a lightweight IDE.
 
-**neovim to Agent**
+By default you get an editor pane and an agent pane that automatically adjust
+when the window is resized, plus simple shortcuts to switch panes or give either
+one fullscreen focus.
+
+It is currently my daily driver for AI-assisted coding. I use it mostly with
+cursor-agent (~80%) and opencode (~20%), and I also test other agents like
+claude-code and crush.
+
+### Neovim to Agent
 
 - Send the current selection or buffer with `<leader>ab` (or `:ViaBufferSend`)
+- Multiple agents via the ACP protocol
+- Agent orchestration (e.g. spawn a reviewer, take the feedback, apply changes)
 
-**Agent to nvim**
+### Agent to Neovim
 
-- Shift+click on a file name will open that file in nvim and focus the nvim pane
-  (fullscreen nvim if the agent was fullscreen, otherwise keep the split)
-- Shift+click on a symbol will open the Symbol search pane in neovim with the
-  same focus behavior
+- Shift+click on a filename to open that file in Neovim and focus the Neovim
+  pane (enter fullscreen Neovim if the agent was fullscreen; otherwise keep the
+  split)
+- Shift+click on a symbol to open the symbol search pane in Neovim with the same
+  focus behavior
 
 ## Multi-agent orchestration
 
-The **default** layout is Neovim + one **interactive PTY agent** (`--agent opencode`).
-For everyday edits you work in that pane; no ACP process runs at startup.
+The **default** layout is Neovim plus one **interactive PTY agent**
+(`--agent opencode`). For everyday edits you work in that pane; no ACP process
+runs at startup.
 
-**Orchestration is opt-in:** spawn an ACP orchestrator and helpers when you need
+**Orchestration is opt-in.** Spawn an ACP orchestrator and helpers when you need
 automatic multi-agent handoff:
 
 ```bash
 via agent spawn --id orchestrator          # preset role: orchestrator
 via agent spawn --id reviewer              # preset role: reviewer
-via agent spawn --id coder               # preset role: coder
+via agent spawn --id coder                 # preset role: coder
 via agent send --to reviewer -m "review this diff"
 ```
 
-Spawned agents resolve to ACP when the configured driver supports it (`opencode` →
-`opencode acp`). If your main driver doesn't support ACP (ie claude, crush), you
-can pick a different agent for orchestration using `--acp-agent`. The primary
-PTY pane keeps id `agent`; the coordinator is `orchestrator`.
+Spawned agents resolve to ACP when the configured driver supports it (`opencode`
+→ `opencode acp`). If your main driver doesn't support ACP (e.g. claude, crush),
+you can pick a different agent for orchestration with `--acp-agent`. The primary
+PTY pane keeps the id `agent`; the coordinator is `orchestrator`.
 
-**Policy:** via transports (panes, bus, ACP); agents orchestrate via skills and
-`via agent` — workflows stay out of the mediator.
+**Design policy:** Via provides the transports (panes, bus, ACP). Agents
+orchestrate themselves using skills and the `via agent` CLI; multi-agent
+workflows are not encoded in the mediator.
 
 Configure spawn defaults in `~/.config/via/via.conf`:
 
@@ -75,7 +91,7 @@ is injected into `~/.local/share/via/lua/` at startup). Example usage:
 ```lua
 local via = require('via')
 via.agent.spawn("reviewer", "reviewer")                 -- spawn a reviewer pane
-via.agent.del("reviewer")                                 -- terminate a sub-agent when done
+via.agent.del("reviewer")                               -- terminate a sub-agent when done
 via.agent.send("reviewer", "please review this diff", false) -- send without stealing focus
 via.agent.send("orchestrator", "hello orchestrator")    -- send after spawning orchestrator
 for _, agent in ipairs(via.agent.list()) do print(agent.id) end -- discover running agents
@@ -83,34 +99,32 @@ for _, agent in ipairs(via.agent.list()) do print(agent.id) end -- discover runn
 
 **Agent-to-agent communication (the agent bus)**
 
-Agents running inside via can discover, spawn, and message each other through the
-`via agent` CLI (documented for agents in the bundled `via-agents` skill). Each
-agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
+Agents running inside via can discover, spawn, and message each other through
+the `via agent` CLI (documented for agents in the bundled `via-agents` skill).
+Each agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
 
 ```bash
 via agent whoami                                  # this agent's id/role/session
 via agent list                                    # agents running in this session
 via agent spawn --id reviewer --role reviewer     # ask via to open a reviewer pane
 via agent send --to reviewer -m "review this"     # queue a message + deliver it
-via agent inbox                                    # read (and clear) your mailbox
+via agent inbox                                   # read (and clear) your mailbox
 ```
 
-Coordination: **PTY** panes (`agent`, or explicit non-ACP spawn) are mailbox-only on
-send. **ACP** spawned agents get prompts automatically. Orchestration spawn requires a
-known ACP mapping for the configured agent.
+Coordination notes:
+
+- **PTY** panes (`agent`, or explicit non-ACP spawns) are mailbox-only on send.
+- **ACP** spawned agents receive prompts automatically.
+- Orchestration spawns require a known ACP mapping for the configured driver.
 
 ## Work in progress
 
-This is very much an experimental project, although I used it as my daily "IDE"
-it has some rough edges still. Some things I have planned:
+This is still an experimental project. Although I use it as my daily "IDE", it
+has some rough edges. Some things I have planned:
 
 - Review process: make it easier to switch between agent/review and send
-  feedback to the agent directly from the vim pane (may use some existing nvim
-  plugin for this)
-- Diagnostics integration: `via session diagnostics --json`; plugin skills
-  auto-install (`via plugin install` / `status`)
-- Better use of LSP: the symbol search could be further updated to highlight
-  known symbols on the agent pane
+  feedback to the agent directly from the Neovim pane (may use an existing
+  Neovim plugin for this)
 
 ## Runtime requirements
 
@@ -198,7 +212,8 @@ skills when installing the plugin, so you can ship your own agents/workflows
 without modifying via.
 
 Use `--persist` to write the resolved user-facing config to `via.conf` before
-running. For example, this writes `agent = "opencode"` (PTY primary) plus defaults:
+running. For example, this writes `agent = "opencode"` (PTY primary) plus
+defaults:
 
 ```sh
 via --agent opencode --persist
@@ -211,15 +226,18 @@ you want to load a custom script from disk during development.
 
 ## Release
 
-Create and publish a GitHub release for a tag, such as `v0.1.0`. The release
+Create and publish a GitHub release for a tag such as `v0.1.0`. The release
 workflow builds `via` in release mode, packages the binary and README into
 `via-<tag>-linux-x86_64.tgz`, and uploads the archive plus its SHA-256 checksum
 to the release.
 
 ## Detached mode
 
-On linux via detaches to avoid keeping the terminal waiting for it to finish.
-Logs, sockets, and temp files are stored in `/tmp/via-<pid>/`
+On Linux, via detaches to avoid keeping the terminal waiting for it to finish.
+Runtime files for each live process live under
+`$XDG_DATA_HOME/via/instances/<pid>/` (default
+`~/.local/share/via/instances/<pid>/`). Stale instance directories can be pruned
+in bulk from that folder.
 
 The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip
 detaching and keep the terminal attached (for example during development), set

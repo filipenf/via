@@ -108,6 +108,35 @@ PTY orchestration loops can use `--wait` instead of `sleep` + immediate `inbox`:
 the command returns as soon as a message lands, or after the timeout with an
 empty result.
 
+## Task boards (workspace-scoped)
+
+Tasks survive via restarts; they live on a **board** within a **workspace** (hash
+of project `cwd`), not in the ephemeral instance directory.
+
+```bash
+via task board list
+via task board new --id phase2 --title "Phase 2 work"
+via task board use default
+
+via task list
+via task create "Implement delivery hook" --id task-1
+via task claim task-1
+via task update task-1 --status review
+via task done task-1
+```
+
+`via task` works from a via agent pane (uses instance `cwd`) or from the project
+directory without a live instance.
+
+When a live via instance is running, task transitions also deliver to agents:
+
+- **Assignee** — notified on create, assignee change, or status change (ACP
+  agents get a live prompt; PTY agents read `via agent inbox`)
+- **Review gate** — moving a task to `review` also notifies the primary `agent`
+  pane for human sign-off
+
+Use `via agent send` for ad-hoc messages; tasks are for structured workflow.
+
 ## Command reference
 
 | Command                                                       | Purpose                                           |
@@ -118,10 +147,14 @@ empty result.
 | `via agent terminate --id ID`                                 | Close a sub-agent (not the primary `agent` pane)  |
 | `via agent send [--to ID] -m TEXT [--no-focus] [--no-notify]` | Deliver to a registered agent (errors if missing) |
 | `via agent inbox [--json] [--peek] [--wait SECONDS]`          | Read your mailbox (optionally block for new mail) |
+| `via task board list\|new\|use`                               | Manage task boards in the workspace               |
+| `via task list\|create\|show\|claim\|update\|done`            | Tasks on the active board                         |
 
 ## Sandbox notes
 
-These commands use local Unix sockets and files under the session runtime
-directory.
+These commands use local Unix sockets and files under the **instance** runtime
+directory (`instances/<pid>/`) for the agent bus; tasks use `workspaces/` under
+the via data directory.
 
-If you see "VIA_SESSION is not set", you are not inside a via-launched pane.
+If you see "VIA_SESSION is not set", you are not inside a via-launched pane
+(agent bus commands only). `via task` can still run from the project directory.
