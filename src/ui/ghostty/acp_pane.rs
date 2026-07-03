@@ -398,6 +398,7 @@ impl AcpPane {
                 rect,
                 active,
                 &self.theme,
+                redrawn || force_redraw,
                 damage,
             );
             true
