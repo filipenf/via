@@ -55,7 +55,7 @@ mod unix {
         }
 
         let pid = std::process::id();
-        let root = crate::config::via_data_dir().join(format!("via-{pid}"));
+        let root = crate::config::instance_dir(pid);
         std::fs::create_dir_all(root.join("logs"))
             .with_context(|| format!("create runtime directory {}", root.display()))?;
         println!("via runtime directory: {}", root.display());

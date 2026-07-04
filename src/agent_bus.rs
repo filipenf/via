@@ -20,7 +20,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use crate::session::SessionManifest;
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::config::is_acp_command;
@@ -203,6 +204,48 @@ pub fn drain_inbox_with_wait(
     }
 
     Ok(Vec::new())
+}
+
+/// Enqueue a message for a registered agent and optionally notify the mediator for live ACP delivery.
+pub fn send_to_registered_agent(
+    session: &SessionManifest,
+    from: impl Into<String>,
+    to: impl AsRef<str>,
+    message: impl Into<String>,
+    focus: bool,
+    notify: bool,
+) -> Result<()> {
+    let to = to.as_ref();
+    let from = from.into();
+    let message = message.into();
+
+    let agents = read_registry(&session.agents_dir)?;
+    if !agents.iter().any(|agent| agent.id == to) {
+        bail!("no agent named '{to}' is registered in this instance");
+    }
+
+    let envelope = Message {
+        from: from.clone(),
+        to: to.to_string(),
+        ts: crate::util::now_millis(),
+        text: message.clone(),
+    };
+    enqueue(&session.agents_dir, &envelope).context("queue message")?;
+
+    if notify {
+        let payload = serde_json::json!({
+            "type": "agent_send",
+            "agent_id": to,
+            "from": from,
+            "content": message,
+            "focus": focus,
+        });
+        if let Err(error) = notify_editor_socket(&session.editor_socket, &payload) {
+            eprintln!("warning: queued message but failed to notify mediator: {error}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Send a single newline-delimited JSON line to the editor Unix socket (fire-and-forget),

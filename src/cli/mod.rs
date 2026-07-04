@@ -1,6 +1,7 @@
 mod agent;
 mod plugin;
 mod session;
+mod task;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -8,6 +9,7 @@ use clap::{Parser, Subcommand};
 pub use agent::AgentCommand;
 pub use plugin::PluginCommand;
 pub use session::SessionCommand;
+pub use task::TaskCommand;
 
 /// via — bridge Neovim and AI agents.
 #[derive(Parser)]
@@ -82,6 +84,10 @@ pub enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
 }
 
 pub async fn run(command: Command) -> Result<()> {
@@ -89,6 +95,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Session { command } => session::run(command).await,
         Command::Agent { command } => agent::run(command),
         Command::Plugin { command } => plugin::run(command),
+        Command::Task { command } => task::run(command),
     }
 }
 

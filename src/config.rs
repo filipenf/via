@@ -11,15 +11,22 @@ use serde::Deserialize;
 /// Ensures the embedded Lua files are written to disk exactly once per process.
 static LUA_ASSETS_INITIALIZED: OnceLock<()> = OnceLock::new();
 
+/// Ephemeral per-process directory: `<data dir>/instances/<pid>/`.
+///
+/// Holds sockets, agent bus, logs, and the instance manifest. A separate top-level
+/// `instances/` tree makes stale runtime dirs easy to prune.
+pub fn instance_dir(pid: u32) -> PathBuf {
+    via_data_dir().join("instances").join(pid.to_string())
+}
+
 /// Directory for sockets, the context bridge script, and other per-process files.
 ///
-/// After a detached start this is `<data dir>/via-<pid>/` from `VIA_RUNTIME_ROOT`. Otherwise it is
-/// the via data directory itself (see [`via_data_dir`]), unless overridden per-path via environment
-/// variables.
+/// Set explicitly via `VIA_RUNTIME_ROOT` after detached bootstrap; otherwise
+/// [`instance_dir`] for the current pid.
 pub fn runtime_base_dir() -> PathBuf {
     env::var_os("VIA_RUNTIME_ROOT")
         .map(PathBuf::from)
-        .unwrap_or_else(via_data_dir)
+        .unwrap_or_else(|| instance_dir(std::process::id()))
 }
 
 /// via's data directory: `$XDG_DATA_HOME/via`, falling back to `$HOME/.local/share/via`, then the
@@ -635,18 +642,9 @@ pub fn is_acp_command(command: &str) -> bool {
     command.split_whitespace().last() == Some("acp")
 }
 
-/// Per-process directory for the agent registry (`registry.json`) and per-agent mailboxes.
-/// Per-session agent bus directory (`registry.json`, `inbox/<id>/…`).
-///
-/// Detached runs use `<runtime>/agents/` (runtime is already `via-<pid>/`). Foreground runs keep
-/// a pid suffix because they share the global via data directory with other sessions.
+/// Per-instance agent bus directory (`registry.json`, `inbox/<id>/…`).
 pub fn default_agents_dir() -> PathBuf {
-    let base = runtime_base_dir();
-    if env::var_os("VIA_RUNTIME_ROOT").is_some() {
-        base.join("agents")
-    } else {
-        base.join(format!("agents-{}", std::process::id()))
-    }
+    runtime_base_dir().join("agents")
 }
 
 fn ensure_lua_assets() {

@@ -26,9 +26,9 @@ terminal wrapper is the nervous system."
 
 **Orchestration policy:** via **transports** — panes, sockets, ACP sessions, and
 the file-backed mailbox — it does not encode multi-agent workflows in Rust.
-Agents **orchestrate** themselves via skills, CLI (`via agent`), and (eventually)
-MCP tools. The primary interactive pane is always a PTY; spawned helpers use ACP
-when the configured driver supports it.
+Agents **orchestrate** themselves via skills, CLI (`via agent`), and
+(eventually) MCP tools. The primary interactive pane is always a PTY; spawned
+helpers use ACP when the configured driver supports it.
 
 ## Core components and data flow
 
@@ -128,9 +128,9 @@ Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
 
 ### Agent side: Normal mode (PTY) vs ACP mode (src/acp.rs + mediator + pty.rs)
 
-- Normal mode (PTY, e.g. `VIA_AGENT="opencode"`): a `PtySession` is spawned
-  for the agent. Output is fed to a libghostty `Terminal` in the agent pane.
-  Context is injected by writing text into the PTY.
+- Normal mode (PTY, e.g. `VIA_AGENT="opencode"`): a `PtySession` is spawned for
+  the agent. Output is fed to a libghostty `Terminal` in the agent pane. Context
+  is injected by writing text into the PTY.
 - ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
   as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, context is
   sent as `context/update` messages. The UI for this path is the Ratatui ACP
@@ -141,12 +141,13 @@ prompt, tool result serialization). It is not a full agent SDK.
 
 ### Two coordination modes
 
-- **PTY = interactive / manual (default primary).** `--agent opencode` starts a PTY
-  pane (bus id `agent`). Bus sends are mailbox-only; read with `via agent inbox`.
-- **ACP = orchestrated / automatic (spawned).** Spawn `orchestrator`, `reviewer`, etc.;
-  via drives them over ACP. Bus sends and pane prompts go through `client.prompt()`.
-  Auto handoff is ACP-only. The PTY `agent` pane remains for interactive work alongside
-  spawned ACP helpers.
+- **PTY = interactive / manual (default primary).** `--agent opencode` starts a
+  PTY pane (bus id `agent`). Bus sends are mailbox-only; read with
+  `via agent inbox`.
+- **ACP = orchestrated / automatic (spawned).** Spawn `orchestrator`,
+  `reviewer`, etc.; via drives them over ACP. Bus sends and pane prompts go
+  through `client.prompt()`. Auto handoff is ACP-only. The PTY `agent` pane
+  remains for interactive work alongside spawned ACP helpers.
 
 `--agent "… acp"` is rejected at startup; the primary pane is always a PTY.
 
@@ -171,50 +172,114 @@ The Rust side (`nvim.rs`) uses `nvim-rs` over the nvim socket to execute these
 
 Session discovery for CLI tools (`via session diagnostics`, the agent skill) is
 done exclusively via the `VIA_SESSION` environment variable (written into child
-envs by the main process and pointing at a small JSON manifest under the runtime
-dir). There is deliberately no "guess the newest socket" fallback.
+envs by the main process and pointing at the **instance** manifest under
+`instances/<pid>/session.json`). There is deliberately no "guess the newest
+socket" fallback.
 
-### Config, sessions, and CLI (src/config.rs, src/session.rs, src/cli/\*)
+### Storage model: instances, workspaces, boards
+
+Naming convention used in via:
+
+| Term          | Meaning                                    | Lifetime  | On disk                              |
+| ------------- | ------------------------------------------ | --------- | ------------------------------------ |
+| **Instance**  | Live via process (pid, sockets, agent bus) | Ephemeral | `instances/<pid>/`                   |
+| **Workspace** | Project scope (hash of canonical `cwd`)    | Durable   | `workspaces/<id>/`                   |
+| **Board**     | Task board within a workspace              | Durable   | `workspaces/<id>/boards/<board-id>/` |
+
+Under `$XDG_DATA_HOME/via` (default `~/.local/share/via`):
+
+```text
+instances/<pid>/              # ephemeral runtime (prune stale dirs here)
+  session.json                # instance manifest (VIA_SESSION)
+  agents/                     # registry + inbox (agent bus)
+  logs/
+  *.sock
+
+workspaces/<workspace-id>/    # durable per-project state
+  meta.json                   # cwd, created_at
+  active_board                # pointer to selected board
+  boards/<board-id>/
+    meta.json
+    tasks/*.json              # one file per task (task_store)
+```
+
+- **Instance** — `SessionGuard` creates `instances/<pid>/` at startup and
+  removes it on clean shutdown. Detached mode sets `VIA_RUNTIME_ROOT` to the
+  same path. `via session list` discovers live instances by scanning
+  `instances/*/session.json`.
+- **Workspace** — id is a stable 16-hex FNV-1a hash of the canonical working
+  directory (`src/workspace.rs`). Created lazily on first task operation.
+- **Board** — switch task context with `via task board new|use|list`. Tasks on
+  the active board survive via restarts; agent mailboxes do not
+  (instance-scoped).
+
+ACP **sessions** (JSON-RPC `new_session`) are a separate concept — subprocess
+conversation handles inside an instance, not file-backed storage.
+
+### Config, instances, and CLI (src/config.rs, src/session.rs, src/cli/\*)
 
 Config resolution is strict precedence: CLI > env (`VIA_*`) >
-`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command must
-be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects whether spawned
-helpers can resolve to ACP (known-agent table or `acp_agent` override). Spawn presets
-(`[agents.orchestrator]`, `[agents.reviewer]`, `[agents.coder]` in `via.conf`, plus
-built-in defaults) fill missing `role` / `command` when opening helper panes.
+`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command
+must be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects
+whether spawned helpers can resolve to ACP (known-agent table or `acp_agent`
+override). Spawn presets (`[agents.orchestrator]`, `[agents.reviewer]`,
+`[agents.coder]` in `via.conf`, plus built-in defaults) fill missing `role` /
+`command` when opening helper panes.
 
-`SessionGuard` writes (and removes on drop) a per-pid manifest so that
-`via session ...` subcommands and agents running inside the session can find the
-right sockets without extra flags.
+`SessionGuard` writes (and removes on drop) a per-instance manifest under
+`instances/<pid>/` so that `via session ...` subcommands and agents running
+inside the instance can find the right sockets without extra flags.
 
-CLI subcommands live under `via session` (list, get, diagnostics), `via agent`
-(list, spawn, send, inbox, whoami — the agent bus), and `via plugin`
-(install/status the plugin skills).
+CLI subcommands live under `via session` (list, get, diagnostics — **live
+instances**), `via agent` (list, spawn, send, inbox, whoami — the agent bus),
+`via task` (list, create, show, claim, update, done — **task boards**), and
+`via plugin` (install/status the plugin skills).
 
 ### Agent bus (src/agent_bus.rs)
 
-Inter-agent discovery and messaging, all file-backed under a per-process
-`agents_dir` (recorded in the session manifest so CLI commands resolve it from
+Inter-agent discovery and messaging, all file-backed under a per-instance
+`agents_dir` (recorded in the instance manifest so CLI commands resolve it from
 `VIA_SESSION`):
 
-- `registry.json` — the list of agent panes, written by the UI whenever it spawns
-  a pane (`write_agent_registry`). This is the discovery surface (`via agent list`,
-  Lua `require('via').agent.list()`).
+- `registry.json` — the list of agent panes, written by the UI whenever it
+  spawns a pane (`write_agent_registry`). This is the discovery surface
+  (`via agent list`, Lua `require('via').agent.list()`).
 - `inbox/<id>/*.json` — per-recipient mailbox files under `<runtime>/agents/`.
-  `via agent send` appends one file per message (the source of truth) and notifies
-  the mediator for ACP delivery via the `agent_send` editor-socket event;
-  `via agent inbox` drains it.
+  `via agent send` appends one file per message (the source of truth) and
+  notifies the mediator for ACP delivery via the `agent_send` editor-socket
+  event; `via agent inbox` drains it.
 
-Each agent pane is spawned with `VIA_AGENT_ID`/`VIA_AGENT_ROLE` so an agent knows
-its own identity.
+Each agent pane is spawned with `VIA_AGENT_ID`/`VIA_AGENT_ROLE` so an agent
+knows its own identity.
+
+### Task board (src/task_store.rs, src/workspace.rs, src/cli/task.rs)
+
+Structured work items on top of mailbox strings. Tasks live on a **board**
+within a **workspace** — not in the ephemeral instance directory.
+
+- `Task` — `id`, `title`, `status`, `assignee`, `blocked_by`, timestamps,
+  optional `body`
+- Status — `queued | in_progress | review | done | blocked`
+- Storage — one JSON file per task under
+  `workspaces/<id>/boards/<board-id>/tasks/`
+- CLI — `via task list|create|show|claim|update|done`;
+  `via task board list|new|use`
+- `via task` resolves workspace from instance `cwd` (when `VIA_SESSION` is set)
+  or current directory; no live instance required for read/write
+- **Delivery** (`src/task_delivery.rs`) — when a live instance is running,
+  `create` / `claim` / `update` / `done` enqueue mailbox messages and notify the
+  mediator (same path as `via agent send`):
+  - assignee notified on create, assignee change, or status change (skips
+    self-notification when the actor is the assignee)
+  - `review` status additionally notifies the primary `agent` pane (human gate)
 
 ### Plugin (src/plugin.rs)
 
 The skills (and, later, agents/workflows/tools) via projects into the agent's
 skill directory. A tiny embedded base (`via-editor`, `via-agents`) ships in the
 binary so things work out of the box; users can point via at a local plugin
-directory (`plugin_dir` / `VIA_PLUGIN_DIR` / `--plugin-dir`) whose `skills/*` are
-overlaid on top. `via plugin install` (also run automatically at startup)
+directory (`plugin_dir` / `VIA_PLUGIN_DIR` / `--plugin-dir`) whose `skills/*`
+are overlaid on top. `via plugin install` (also run automatically at startup)
 projects them into the detected agent family's skill roots.
 
 ### Other notable pieces
@@ -263,10 +328,10 @@ and are mitigated by the native + GPU nature of the stack.
   session; anything else gets a `PaneRole::AgentTerminal { id, label, command }`
   PTY pane. Spawned helpers join the registry and are reachable via Alt+1..9 but
   do not steal focus or reshape the active layout.
-- Coordination is two-mode: PTY agents are interactive (manual `via agent
-  inbox`), ACP agents are orchestrated (bus sends and pane prompts both go
-  through `client.prompt()`, so a sub's turn starts automatically). Automatic
-  handoff is ACP-only; see "Two coordination modes" above.
+- Coordination is two-mode: PTY agents are interactive (manual
+  `via agent inbox`), ACP agents are orchestrated (bus sends and pane prompts
+  both go through `client.prompt()`, so a sub's turn starts automatically).
+  Automatic handoff is ACP-only; see "Two coordination modes" above.
 - The vendored Ghostty VT bits are pinned to a specific git rev of a
   libghostty-rs wrapper. This gives a single static binary but makes clean
   builds heavy (Zig + git).

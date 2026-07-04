@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use clap::Subcommand;
 
-use crate::agent_bus::{self, Message};
+use crate::agent_bus;
 use crate::session;
 
 #[derive(Subcommand)]
@@ -181,28 +181,7 @@ fn run_send(to: Option<String>, message: String, focus: bool, notify: bool) -> R
         bail!("no agent named '{to}' is registered in this session");
     }
 
-    let envelope = Message {
-        from: from.clone(),
-        to: to.clone(),
-        ts: crate::util::now_millis(),
-        text: message.clone(),
-    };
-    // Always enqueue for durability (and so `--no-notify` / PTY agents can read it later).
-    agent_bus::enqueue(&session.agents_dir, &envelope).context("queue message")?;
-
-    if notify {
-        // Mediator delivers ACP prompts; non-ACP recipients are mailbox-only.
-        let payload = serde_json::json!({
-            "type": "agent_send",
-            "agent_id": to,
-            "from": from,
-            "content": message,
-            "focus": focus,
-        });
-        if let Err(error) = agent_bus::notify_editor_socket(&session.editor_socket, &payload) {
-            eprintln!("warning: queued message but failed to notify mediator: {error}");
-        }
-    }
+    agent_bus::send_to_registered_agent(&session, from, &to, message, focus, notify)?;
 
     println!("sent message to '{to}'");
     Ok(())
