@@ -439,6 +439,12 @@ impl AcpPane {
             .add_modifier(Modifier::BOLD);
         let thought_style = Style::default().fg(Color::Indexed(14));
         let tool_style = Style::default().fg(Color::Indexed(13));
+        let code_style = Style::default()
+            .fg(Color::Indexed(15))
+            .bg(code_block_background(self.theme.background));
+        let code_fence_style = Style::default()
+            .fg(Color::Indexed(8))
+            .bg(code_block_background(self.theme.background));
 
         let mut header_lines = vec![Line::from(vec![
             Span::styled(self.header_label.as_str(), title_style),
@@ -481,18 +487,23 @@ impl AcpPane {
                     TranscriptKind::Tool => ("Tool", tool_style),
                     TranscriptKind::System => ("System", muted_style),
                 };
-                transcript.push(Line::from(vec![
-                    Span::styled(label, style),
-                    Span::raw(format!(": {}", entry.text)),
-                ]));
-                transcript.push(Line::from(""));
+                transcript.extend(format_entry(
+                    label,
+                    style,
+                    &entry.text,
+                    code_style,
+                    code_fence_style,
+                ));
             }
         }
         if let Some(text) = self.last_submitted.as_deref() {
-            transcript.push(Line::from(Span::styled(
-                format!("Last prompt: {text}"),
+            transcript.extend(format_entry(
+                "Last prompt",
                 muted_style,
-            )));
+                text,
+                code_style,
+                code_fence_style,
+            ));
         }
 
         let transcript_width = chunks[1].width.max(1);
@@ -617,6 +628,57 @@ fn render_progress(
     );
 }
 
+fn code_block_background(theme_bg: u32) -> Color {
+    let r = ((theme_bg >> 16) & 0xff) as i32;
+    let g = ((theme_bg >> 8) & 0xff) as i32;
+    let b = (theme_bg & 0xff) as i32;
+    // Lighten dark themes and darken light themes for subtle contrast.
+    let luminance = (r * 299 + g * 587 + b * 114) / 1000;
+    let offset = if luminance > 128 { -16 } else { 16 };
+    let clamp = |v: i32| v.clamp(0, 255) as u8;
+    Color::Rgb(clamp(r + offset), clamp(g + offset), clamp(b + offset))
+}
+
+/// Format one transcript entry into a sequence of `Line`s.
+///
+/// The speaker label is placed on its own line, body text is split on newlines
+/// so paragraph breaks are preserved, and fenced code blocks (```) get a
+/// distinct background style.
+fn format_entry(
+    label: &str,
+    label_style: Style,
+    text: &str,
+    code_style: Style,
+    code_fence_style: Style,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(Span::styled(label.to_string(), label_style)));
+
+    let mut in_code_block = false;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            lines.push(Line::from(Span::styled(
+                trimmed.to_string(),
+                code_fence_style,
+            )));
+            continue;
+        }
+        if in_code_block {
+            lines.push(Line::from(Span::styled(line.to_string(), code_style)));
+        } else if line.is_empty() {
+            lines.push(Line::from(""));
+        } else {
+            lines.push(Line::from(Span::raw(line.to_string())));
+        }
+    }
+
+    // Separator between entries.
+    lines.push(Line::from(""));
+    lines
+}
+
 fn ratatui_size_for_window(
     width: usize,
     height: usize,
@@ -625,5 +687,78 @@ fn ratatui_size_for_window(
     RatatuiPaneSize {
         cols: (width / metrics.cell_width).min(u16::MAX as usize) as u16,
         rows: (height / metrics.cell_height).min(u16::MAX as usize) as u16,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::{Color, Modifier, Style};
+
+    use super::{code_block_background, format_entry};
+
+    fn test_style() -> Style {
+        Style::default()
+            .fg(Color::Indexed(10))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    fn code_style() -> Style {
+        Style::default()
+            .fg(Color::Indexed(15))
+            .bg(Color::Rgb(40, 40, 40))
+    }
+
+    fn fence_style() -> Style {
+        Style::default()
+            .fg(Color::Indexed(8))
+            .bg(Color::Rgb(40, 40, 40))
+    }
+
+    #[test]
+    fn format_entry_splits_paragraphs() {
+        let lines = format_entry(
+            "Agent",
+            test_style(),
+            "First paragraph.\n\nSecond paragraph.",
+            code_style(),
+            fence_style(),
+        );
+        assert_eq!(lines.len(), 5); // label + 2 lines + blank + separator
+        assert_eq!(lines[0].spans[0].content, "Agent");
+        assert_eq!(lines[1].spans[0].content, "First paragraph.");
+        assert!(lines[2].spans.is_empty(), "blank line between paragraphs");
+        assert_eq!(lines[3].spans[0].content, "Second paragraph.");
+        assert!(lines[4].spans.is_empty(), "trailing separator");
+    }
+
+    #[test]
+    fn format_entry_styles_code_blocks() {
+        let text = "Here is some code:\n```rust\nlet x = 1;\n```\nDone.";
+        let lines = format_entry("Agent", test_style(), text, code_style(), fence_style());
+
+        assert_eq!(lines[0].spans[0].content, "Agent");
+        assert_eq!(lines[1].spans[0].content, "Here is some code:");
+
+        // Opening fence.
+        assert_eq!(lines[2].spans[0].content, "```rust");
+        assert_eq!(lines[2].spans[0].style, fence_style());
+
+        // Code body.
+        assert_eq!(lines[3].spans[0].content, "let x = 1;");
+        assert_eq!(lines[3].spans[0].style, code_style());
+
+        // Closing fence.
+        assert_eq!(lines[4].spans[0].content, "```");
+        assert_eq!(lines[4].spans[0].style, fence_style());
+
+        assert_eq!(lines[5].spans[0].content, "Done.");
+    }
+
+    #[test]
+    fn code_block_background_contrasts_with_theme() {
+        let dark = code_block_background(0x0c0c0c);
+        let light = code_block_background(0xeeeeee);
+        assert_ne!(dark, Color::Rgb(12, 12, 12));
+        assert_ne!(light, Color::Rgb(238, 238, 238));
     }
 }
