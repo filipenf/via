@@ -272,6 +272,8 @@ within a **workspace** — not in the ephemeral instance directory.
   - assignee notified on create, assignee change, or status change (skips
     self-notification when the actor is the assignee)
   - `review` status additionally notifies the primary `agent` pane (human gate)
+    and sends a `review_requested` editor-socket signal so the mediator opens
+    the configured review surface (`nvim` diff or hunk pane) automatically
 
 ### Plugin (src/plugin.rs)
 

@@ -119,6 +119,9 @@ pub enum UiCommand {
     },
     /// Close a sub-agent pane and tear down its session (PTY or ACP).
     TerminateAgent { id: String },
+    /// Task transitioned to `review`; surfaced to the UI when the review
+    /// backend is not the Neovim diff (e.g. hunk pane) so the human can see the gate.
+    ReviewGateOpened { task_id: String, title: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -158,6 +161,13 @@ pub enum EditorEvent {
     },
     TerminateAgent {
         id: String,
+    },
+    /// A task transitioned to `review` (sent by the task delivery path over the
+    /// editor socket). This is the task-level human gate: distinct from ACP
+    /// `session/request_permission` tool modals.
+    ReviewGateOpened {
+        task_id: String,
+        title: String,
     },
 }
 

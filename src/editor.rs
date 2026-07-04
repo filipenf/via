@@ -83,6 +83,9 @@ impl EditorState {
             EditorEvent::TerminateAgent { .. } => {
                 // one-shot request, handled by mediator/ui
             }
+            EditorEvent::ReviewGateOpened { .. } => {
+                // one-shot request, handled by mediator (opens review UI)
+            }
         }
     }
 }
@@ -132,6 +135,11 @@ enum WireEditorEvent {
     },
     TerminateAgent {
         id: String,
+    },
+    ReviewRequested {
+        task_id: String,
+        #[serde(default)]
+        title: String,
     },
 }
 
@@ -270,6 +278,9 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             EditorEvent::SpawnAgent { id, role, command }
         }
         WireEditorEvent::TerminateAgent { id } => EditorEvent::TerminateAgent { id },
+        WireEditorEvent::ReviewRequested { task_id, title } => {
+            EditorEvent::ReviewGateOpened { task_id, title }
+        }
     })
 }
 
@@ -372,6 +383,36 @@ mod tests {
             .unwrap(),
             EditorEvent::TerminateAgent {
                 id: "reviewer".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_review_requested_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"review_requested","task_id":"t1","title":"Do thing"}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::ReviewGateOpened {
+                task_id: "t1".to_string(),
+                title: "Do thing".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_review_requested_event_without_title() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"review_requested","task_id":"t1"}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::ReviewGateOpened {
+                task_id: "t1".to_string(),
+                title: String::new(),
             }
         );
     }
