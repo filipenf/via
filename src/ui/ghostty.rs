@@ -1785,6 +1785,18 @@ impl WinitGhosttyApp {
                         error!(%e, "failed to terminate agent pane");
                     }
                 }
+                UiCommand::ReviewGateOpened { task_id, title } => {
+                    info!(%task_id, %title, "review gate surfaced to UI");
+                    if self.config.review_backend == ReviewBackend::Hunk && !self.review_active {
+                        if let Err(e) = self.toggle_hunk_review() {
+                            error!(%e, "failed to open hunk review");
+                        } else {
+                            changed = true;
+                            self.dirty = true;
+                            self.force_redraw = true;
+                        }
+                    }
+                }
             }
         }
 

@@ -1,6 +1,6 @@
 [package]
 name = "via"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 # MSRV. Keep this in sync with clippy.toml and CI expectations.
 rust-version = "1.85"

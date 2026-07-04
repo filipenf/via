@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
 use crate::agent_bus;
 use crate::config::Config;
+use crate::config::ReviewBackend;
 use crate::editor::{self, EditorState};
 use crate::event::{
     AcpAgentEvent, AcpModalKind, AgentEvent, EditorEvent, Event, UiCommand, UiEvent,
@@ -1059,6 +1060,30 @@ impl Mediator {
                     self.acp_tool_titles
                         .retain(|(agent_id, _), _| agent_id != id);
                     self.send_ui_command(UiCommand::TerminateAgent { id: id.clone() });
+                }
+            }
+            EditorEvent::ReviewGateOpened { task_id, title } => {
+                info!(%task_id, %title, "review gate opened");
+                match self.config.review_backend {
+                    ReviewBackend::Nvim => {
+                        if let Err(error) = nvim::open_review(
+                            &self.config.nvim_socket_path,
+                            &self.config.working_directory,
+                        )
+                        .await
+                        {
+                            error!(%error, %task_id, "failed to open review in Neovim");
+                        }
+                    }
+                    ReviewBackend::Hunk => {
+                        // Hunk review is a UI-only pane toggle; from the
+                        // mediator we can't flip it directly. Surface the
+                        // request to the UI so the human sees the gate.
+                        self.send_ui_command(UiCommand::ReviewGateOpened {
+                            task_id: task_id.clone(),
+                            title: title.clone(),
+                        });
+                    }
                 }
             }
         }

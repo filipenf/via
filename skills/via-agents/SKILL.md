@@ -132,8 +132,11 @@ When a live via instance is running, task transitions also deliver to agents:
 
 - **Assignee** — notified on create, assignee change, or status change (ACP
   agents get a live prompt; PTY agents read `via agent inbox`)
-- **Review gate** — moving a task to `review` also notifies the primary `agent`
-  pane for human sign-off
+- **Review gate** — moving a task to `review` notifies the primary `agent`
+  pane for human sign-off **and** opens the configured review surface
+  (`review_backend = "nvim"` opens a Neovim diff of working-tree changes;
+  `review_backend = "hunk"` opens the inline hunk pane). This is the task-level
+  human gate — distinct from ACP `session/request_permission` tool modals.
 
 Use `via agent send` for ad-hoc messages; tasks are for structured workflow.
 
