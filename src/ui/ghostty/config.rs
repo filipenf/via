@@ -238,6 +238,33 @@ impl Default for TerminalMetrics {
     }
 }
 
+impl TerminalTheme {
+    /// Generate a DSR 997 sequence that notifies a running terminal application
+    /// that the terminal's color scheme (dark/light) has changed.
+    ///
+    /// opentui-based apps (OpenCode, etc.) enable Mode 2031 color-scheme
+    /// updates at startup and listen for `CSI ? 997 ; {1|2} n` to re-query
+    /// the terminal's foreground/background colors via OSC 10/11.  Sending
+    /// this notification after applying a new theme makes those apps pick up
+    /// the new colors without being restarted.
+    pub(super) fn color_scheme_notification(&self) -> Vec<u8> {
+        let mode = if is_light_background(self.background) {
+            2 // light
+        } else {
+            1 // dark
+        };
+        format!("\x1b[?997;{mode}n").into_bytes()
+    }
+}
+
+fn is_light_background(color: u32) -> bool {
+    let r = (color >> 16) & 0xff;
+    let g = (color >> 8) & 0xff;
+    let b = color & 0xff;
+
+    r * 299 + g * 587 + b * 114 > 127_500
+}
+
 impl Default for TerminalTheme {
     fn default() -> Self {
         let mut palette = default_ansi_256_palette();
