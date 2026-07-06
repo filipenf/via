@@ -256,6 +256,16 @@ impl AppPane {
         }
     }
 
+    /// Forward the new theme to the running program inside the pane. For PTY
+    /// panes this injects a DSR 997 color-scheme notification, letting agents
+    /// such as OpenCode update their `system` theme without a restart.
+    fn notify_theme_changed(&mut self, theme: &config::TerminalTheme) -> Result<()> {
+        match self {
+            Self::Terminal(pane) => pane.write_all(&theme.color_scheme_notification()),
+            Self::Acp(_) => Ok(()),
+        }
+    }
+
     fn clear_selection(&mut self) -> bool {
         match self {
             Self::Terminal(pane) => pane.clear_selection(),
@@ -1498,9 +1508,11 @@ impl WinitGhosttyApp {
         self.font_renderer.theme = loaded_config.theme;
         for pane in &mut self.panes {
             pane.apply_theme(&self.terminal_config.theme);
+            pane.notify_theme_changed(&self.terminal_config.theme)?;
         }
         if let Some(review_pane) = &mut self.review_pane {
             review_pane.apply_theme(&self.terminal_config.theme);
+            review_pane.write_all(&self.terminal_config.theme.color_scheme_notification())?;
         }
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
@@ -2172,6 +2184,25 @@ mod tests {
         assert_eq!(config.theme.background, 0x0f0d21);
         assert_eq!(config.theme.foreground, 0xffffff);
         assert_eq!(config.theme.palette[4], 0xb0c3f8);
+    }
+
+    #[test]
+    fn emits_color_scheme_notification() {
+        let mut dark = TerminalConfig::default();
+        dark.apply_entry("background", "#0f0d21");
+        assert_eq!(
+            dark.theme.color_scheme_notification(),
+            b"\x1b[?997;1n",
+            "dark background sends DSR 997 ; 1"
+        );
+
+        let mut light = TerminalConfig::default();
+        light.apply_entry("background", "#eff1f5");
+        assert_eq!(
+            light.theme.color_scheme_notification(),
+            b"\x1b[?997;2n",
+            "light background sends DSR 997 ; 2"
+        );
     }
 
     #[test]
