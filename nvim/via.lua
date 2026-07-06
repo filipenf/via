@@ -156,4 +156,8 @@ end, {
   end,
 })
 
+-- Load the task board UI (:ViaTasks) if available.
+-- Wrapped in pcall so a load error doesn't break the core via module.
+pcall(require, 'via.tasks')
+
 return M

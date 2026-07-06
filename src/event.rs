@@ -169,6 +169,20 @@ pub enum EditorEvent {
         task_id: String,
         title: String,
     },
+    /// A task was created on the active board.
+    TaskCreated {
+        id: String,
+    },
+    /// A task was updated on the active board. `fields` lists which fields
+    /// changed (`"status"`, `"assignee"`, `"title"`, `"body"`, `"blocked_by"`).
+    TaskUpdated {
+        id: String,
+        fields: Vec<String>,
+    },
+    /// A task was deleted from the active board.
+    TaskDeleted {
+        id: String,
+    },
 }
 
 /// ACP protocol payload from an agent subprocess (routing id lives on `AgentEvent::Acp`).
