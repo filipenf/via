@@ -1,46 +1,25 @@
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use serde::{Deserialize, Serialize};
-
-use crate::acp::{self, AcpClient, ContextUpdateParams, PromptResource};
+use crate::acp::{self, ContextUpdateParams, PromptResource};
+use crate::acp_runtime::{AcpConnectCtx, AcpRuntime};
 use crate::agent_bus;
+use crate::agent_delivery::AgentDelivery;
 use crate::config::Config;
 use crate::config::ReviewBackend;
 use crate::editor::{self, EditorState};
-use crate::event::{
-    AcpAgentEvent, AcpModalKind, AgentEvent, EditorEvent, Event, UiCommand, UiEvent,
-};
+use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim::{self, FileTarget};
 
+use crate::config::ORCHESTRATOR_AGENT_ID;
+
 const EVENT_BUFFER_SIZE: usize = 128;
-
-/// Upper bound on the ACP spawn + initialize + new_session handshake. A misbehaving
-/// subprocess that never replies must not pin the connect task forever.
-const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
-const ACP_HANDSHAKE_MAX_ATTEMPTS: u32 = 3;
-const ACP_HANDSHAKE_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-#[derive(Clone)]
-struct PendingAcpPrompt {
-    content: String,
-    /// False when the ACP pane already rendered the user message locally.
-    mirror_on_delivery: bool,
-}
-
-#[derive(Clone)]
-struct AcpLaunchConfig {
-    role: Option<String>,
-    command: String,
-}
 
 #[derive(Debug, Deserialize)]
 struct AgentToolRequest {
@@ -81,285 +60,12 @@ fn selection_resource_uri(path: &Path, start_line: u32, end_line: u32) -> String
     format!("file://{}#L{start_line}-L{end_line}", path.display())
 }
 
-/// One connected ACP agent: its JSON-RPC client and active session id.
-#[derive(Clone)]
-struct AcpSession {
-    client: Arc<Mutex<AcpClient>>,
-    session_id: String,
-    model: Option<String>,
-}
-
-/// Spawn an ACP agent process, run the initialize handshake, and create a session.
-/// Used both for the primary at startup and for sub-agents spawned at runtime.
-async fn establish_acp(
-    agent_id: &str,
-    role: &str,
-    command: &str,
-    args: &[&str],
-    cwd: &Path,
-) -> Result<AcpSession> {
-    let handshake = async {
-        let mut client = AcpClient::spawn(
-            agent_id,
-            command,
-            args,
-            &[
-                (agent_bus::VIA_AGENT_ID_ENV, agent_id),
-                (agent_bus::VIA_AGENT_ROLE_ENV, role),
-            ],
-        )
-        .await?;
-        let init = client.initialize().await?;
-        let agent_name = init
-            .agent_info
-            .as_ref()
-            .map(|info| info.name.as_str())
-            .unwrap_or("unknown");
-        let agent_version = init
-            .agent_info
-            .as_ref()
-            .map(|info| info.version.as_str())
-            .unwrap_or("unknown");
-        tracing::info!(
-            agent_id,
-            agent = agent_name,
-            version = agent_version,
-            protocol_version = init.protocol_version,
-            "ACP agent initialized"
-        );
-
-        let session = client.new_session(cwd).await?;
-        let model = session.selected_model();
-        tracing::info!(agent_id, session_id = %session.session_id, ?model, "ACP session created");
-
-        Ok::<AcpSession, anyhow::Error>(AcpSession {
-            client: Arc::new(Mutex::new(client)),
-            session_id: session.session_id,
-            model,
-        })
-    };
-
-    tokio::time::timeout(ACP_HANDSHAKE_TIMEOUT, handshake)
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "ACP handshake for agent '{agent_id}' timed out after {}s",
-                ACP_HANDSHAKE_TIMEOUT.as_secs()
-            )
-        })?
-}
-
-fn truncate_acp_status_error(message: &str) -> String {
-    const MAX_LEN: usize = 160;
-    let collapsed = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() <= MAX_LEN {
-        collapsed
-    } else {
-        format!(
-            "{}…",
-            collapsed
-                .chars()
-                .take(MAX_LEN.saturating_sub(1))
-                .collect::<String>()
-        )
-    }
-}
-
-/// Surface handshake failure in the agent pane. Queued prompts are kept unless the user
-/// explicitly discards them via the retry modal.
-fn notify_acp_handshake_failed(
-    ui_commands: &mpsc::Sender<UiCommand>,
-    agent_id: &str,
-    err: &anyhow::Error,
-    queued_count: usize,
-) {
-    let err_msg = err.to_string();
-    if queued_count == 0 {
-        tracing::error!(%agent_id, %err, "failed to connect ACP sub-agent");
-    } else {
-        warn!(
-            agent_id = %agent_id,
-            count = queued_count,
-            %err,
-            "ACP sub-agent handshake failed with queued prompts"
-        );
-        let _ = ui_commands.try_send(UiCommand::AcpTranscriptChunk {
-            agent_id: agent_id.to_string(),
-            kind: "system".to_string(),
-            text: format!(
-                "via: agent connection failed — {queued_count} message(s) queued — {err_msg}"
-            ),
-        });
-        let _ = ui_commands.try_send(UiCommand::AcpProgress {
-            agent_id: agent_id.to_string(),
-            id: "__turn".to_string(),
-            label: String::new(),
-            active: false,
-        });
-        let _ = ui_commands.try_send(UiCommand::AcpModalPrompt {
-            agent_id: agent_id.to_string(),
-            jsonrpc_id: serde_json::Value::Null,
-            title: "Agent connection failed".to_string(),
-            message: format!(
-                "{err_msg}\n\n{queued_count} message(s) are queued and will be sent once the agent connects."
-            ),
-            options: vec![
-                crate::event::AcpPermissionOption {
-                    option_id: "retry".to_string(),
-                    name: "Retry connection".to_string(),
-                },
-                crate::event::AcpPermissionOption {
-                    option_id: "discard".to_string(),
-                    name: format!("Discard {queued_count} queued message(s)"),
-                },
-            ],
-            kind: crate::event::AcpModalKind::HandshakeRetry,
-        });
-    }
-    let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
-        agent_id: agent_id.to_string(),
-        model: None,
-        provider_error: Some(truncate_acp_status_error(&format!(
-            "Connection failed: {err_msg}"
-        ))),
-        clear_provider_error: false,
-    });
-}
-
-async fn establish_acp_with_retries(
-    agent_id: &str,
-    role: &str,
-    program: &str,
-    args: &[&str],
-    cwd: &Path,
-) -> Result<AcpSession> {
-    let mut last_err = None;
-    for attempt in 1..=ACP_HANDSHAKE_MAX_ATTEMPTS {
-        match establish_acp(agent_id, role, program, args, cwd).await {
-            Ok(session) => return Ok(session),
-            Err(err) => {
-                if attempt < ACP_HANDSHAKE_MAX_ATTEMPTS {
-                    warn!(
-                        agent_id,
-                        attempt,
-                        %err,
-                        "ACP handshake failed; retrying"
-                    );
-                    tokio::time::sleep(ACP_HANDSHAKE_RETRY_DELAY).await;
-                }
-                last_err = Some(err);
-            }
-        }
-    }
-    Err(last_err.expect("at least one failed attempt"))
-}
-
-fn mirror_acp_prompts_to_ui(
-    agent_id: &str,
-    contents: &[String],
-    ui_commands: &mpsc::Sender<UiCommand>,
-) {
-    for content in contents {
-        if ui_commands
-            .try_send(UiCommand::AcpTranscriptChunk {
-                agent_id: agent_id.to_string(),
-                kind: "user_message_chunk".to_string(),
-                text: content.clone(),
-            })
-            .is_err()
-        {
-            warn!(agent_id, "failed to mirror ACP prompt to UI");
-        }
-    }
-}
-
-fn spawn_acp_prompt_delivery(
-    agent_id: &str,
-    session: AcpSession,
-    contents: Vec<String>,
-    ui_commands: mpsc::Sender<UiCommand>,
-    mirror_to_ui: bool,
-) {
-    if contents.is_empty() {
-        return;
-    }
-    if mirror_to_ui {
-        mirror_acp_prompts_to_ui(agent_id, &contents, &ui_commands);
-    }
-    let client = Arc::clone(&session.client);
-    let session_id = session.session_id.clone();
-    let agent_id = agent_id.to_string();
-    let count = contents.len();
-    tokio::spawn(async move {
-        let mut guard = client.lock().await;
-        for (index, content) in contents.into_iter().enumerate() {
-            info!(
-                agent_id = %agent_id,
-                session_id = %session_id,
-                prompt = index + 1,
-                total = count,
-                bytes = content.len(),
-                "delivering ACP session/prompt"
-            );
-            if let Err(err) = guard.prompt(&session_id, &content, None).await {
-                error!(agent_id = %agent_id, %err, session_id = %session_id, "failed to deliver ACP prompt");
-                let _ = ui_commands.try_send(UiCommand::AcpTranscriptChunk {
-                    agent_id: agent_id.to_string(),
-                    kind: "system".to_string(),
-                    text: format!("via: failed to deliver prompt — {err}"),
-                });
-                break;
-            }
-        }
-    });
-}
-
-/// Drain mailbox + pending prompts and deliver when the session is connected.
-async fn deliver_acp_prompts_if_ready(
-    agent_id: &str,
-    sessions: &Arc<Mutex<HashMap<String, AcpSession>>>,
-    pending: &Arc<Mutex<HashMap<String, Vec<PendingAcpPrompt>>>>,
-    agents_dir: &Path,
-    ui_commands: &mpsc::Sender<UiCommand>,
-) -> bool {
-    let Some(session) = sessions.lock().await.get(agent_id).cloned() else {
-        return false;
-    };
-    let mut pending_guard = pending.lock().await;
-    let queued = pending_guard.remove(agent_id).unwrap_or_default();
-    let mut contents = Vec::new();
-    let mut mirror_to_ui = false;
-    for prompt in queued {
-        if prompt.mirror_on_delivery {
-            mirror_to_ui = true;
-        }
-        contents.push(prompt.content);
-    }
-    if let Ok(messages) = agent_bus::drain_inbox(agents_dir, agent_id, false) {
-        mirror_to_ui = true;
-        contents.extend(messages.into_iter().map(|message| message.text));
-    }
-    drop(pending_guard);
-    if contents.is_empty() {
-        return true;
-    }
-    info!(
-        agent_id,
-        count = contents.len(),
-        "ACP session ready — delivering queued prompts"
-    );
-    spawn_acp_prompt_delivery(
-        agent_id,
-        session,
-        contents,
-        ui_commands.clone(),
-        mirror_to_ui,
-    );
-    true
-}
-
-use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
-
+/// The via mediator: a thin router between editor, UI, ACP runtime, and store.
+///
+/// ACP session lifecycle + delivery live in [`crate::acp_runtime`] and
+/// [`crate::agent_delivery`]; this struct owns those, the editor state, the LSP
+/// bridge handle, and the `@tool` JSON protocol over PTY stdout. Workflow
+/// policy stays in skills/config — no new match-arm logic here.
 pub struct Mediator {
     config: Config,
     events: mpsc::Receiver<Event>,
@@ -368,22 +74,10 @@ pub struct Mediator {
     in_flight_symbol_open: Option<JoinHandle<()>>,
     lsp_handle: Option<lsp_bridge::LspBridgeHandle>,
     agent_output_buffer: String,
-    /// Connected ACP agents keyed by bus id ("orchestrator" plus any spawned subs).
-    /// Shared so async connect tasks can insert new sessions without `&mut self`.
-    acp_sessions: Arc<Mutex<HashMap<String, AcpSession>>>,
+    acp_runtime: AcpRuntime,
+    agent_delivery: AgentDelivery,
     /// Event sender retained after `spawn()` so dynamically connected agents can start readers.
     event_sender: Option<EventSender>,
-    /// (agent id, tool call id) → latest title from `session/update` (for permission UI).
-    /// Keyed by agent id as well so concurrent ACP agents can't collide on tool_call_id.
-    acp_tool_titles: HashMap<(String, String), String>,
-    /// Prompts for ACP sub-agents that arrived before the handshake finished.
-    pending_acp_prompts: Arc<Mutex<HashMap<String, Vec<PendingAcpPrompt>>>>,
-    /// Sub-agent ids spawned (or connecting) as ACP — used to queue bus messages until ready.
-    expected_acp_agents: Arc<Mutex<HashSet<String>>>,
-    /// Launch command/role for spawned ACP sub-agents (for reconnect after handshake failure).
-    acp_launch_configs: Arc<Mutex<HashMap<String, AcpLaunchConfig>>>,
-    /// Sub-agents with an in-flight connect task (prevents duplicate handshake attempts).
-    connecting_acp_agents: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Clone)]
@@ -415,211 +109,22 @@ impl Mediator {
             in_flight_symbol_open: None,
             lsp_handle: None,
             agent_output_buffer: String::new(),
-            acp_sessions: Arc::new(Mutex::new(HashMap::new())),
+            acp_runtime: AcpRuntime::new(),
+            agent_delivery: AgentDelivery::new(),
             event_sender: None,
-            acp_tool_titles: HashMap::new(),
-            pending_acp_prompts: Arc::new(Mutex::new(HashMap::new())),
-            expected_acp_agents: Arc::new(Mutex::new(HashSet::new())),
-            acp_launch_configs: Arc::new(Mutex::new(HashMap::new())),
-            connecting_acp_agents: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
-    /// Look up a connected ACP session by exact id (no fallback).
-    async fn acp_session(&self, agent_id: &str) -> Option<AcpSession> {
-        self.acp_sessions.lock().await.get(agent_id).cloned()
-    }
-
-    /// True when a bus recipient is (or will be) an ACP agent rather than a PTY pane.
-    async fn recipient_is_acp(&self, agent_id: &str) -> bool {
-        if self.expected_acp_agents.lock().await.contains(agent_id) {
-            return true;
+    /// Build the context passed to ACP connect/retry tasks: pending queue +
+    /// agents dir + cwd + reader/event channels.
+    fn connect_ctx(&self) -> AcpConnectCtx {
+        AcpConnectCtx {
+            pending: self.agent_delivery.pending_arc(),
+            agents_dir: self.config.agents_dir.clone(),
+            cwd: self.config.working_directory.clone(),
+            event_sender: self.event_sender.clone(),
+            ui_commands: self.ui_commands.clone(),
         }
-        agent_bus::read_registry(&self.config.agents_dir)
-            .ok()
-            .and_then(|records| records.into_iter().find(|record| record.id == agent_id))
-            .is_some_and(|record| agent_bus::agent_record_is_acp(&record))
-    }
-
-    async fn queue_acp_prompt(&self, agent_id: &str, content: String, mirror_on_delivery: bool) {
-        info!(agent_id, "queuing ACP prompt until session is ready");
-        self.pending_acp_prompts
-            .lock()
-            .await
-            .entry(agent_id.to_string())
-            .or_default()
-            .push(PendingAcpPrompt {
-                content,
-                mirror_on_delivery,
-            });
-    }
-
-    async fn deliver_acp_prompts_if_ready(&self, agent_id: &str) -> bool {
-        deliver_acp_prompts_if_ready(
-            agent_id,
-            &self.acp_sessions,
-            &self.pending_acp_prompts,
-            &self.config.agents_dir,
-            &self.ui_commands,
-        )
-        .await
-    }
-
-    fn connect_acp_agent(&self, id: String, role: Option<String>, command: String) {
-        let sessions = Arc::clone(&self.acp_sessions);
-        let pending = Arc::clone(&self.pending_acp_prompts);
-        let expected = Arc::clone(&self.expected_acp_agents);
-        let connecting = Arc::clone(&self.connecting_acp_agents);
-        let event_sender = self.event_sender.clone();
-        let ui_commands = self.ui_commands.clone();
-        let agents_dir = self.config.agents_dir.clone();
-        let cwd = self.config.working_directory.clone();
-        let role = role.unwrap_or_else(|| id.clone());
-        tokio::spawn(async move {
-            {
-                let mut connecting_guard = connecting.lock().await;
-                if connecting_guard.contains(&id) {
-                    return;
-                }
-                connecting_guard.insert(id.clone());
-            }
-
-            let tokens: Vec<&str> = command.split_whitespace().collect();
-            let [program, args @ ..] = tokens.as_slice() else {
-                connecting.lock().await.remove(&id);
-                expected.lock().await.remove(&id);
-                return;
-            };
-            match establish_acp_with_retries(&id, &role, program, args, &cwd).await {
-                Ok(session) => {
-                    // Serialize with `TerminateAgent`, which removes `id` from `expected` and
-                    // `acp_sessions` while holding the `acp_sessions` lock. If the user terminated
-                    // the agent while this handshake was in flight, `expected` no longer contains
-                    // `id`, so drop the freshly built session instead of inserting an orphan —
-                    // `AcpClient::drop` kills the subprocess. Without this, the detached task would
-                    // resurrect a session (and stdout reader) for a pane that no longer exists.
-                    let mut sessions_guard = sessions.lock().await;
-                    let still_wanted = expected.lock().await.remove(&id);
-                    connecting.lock().await.remove(&id);
-                    if !still_wanted {
-                        drop(sessions_guard);
-                        drop(session);
-                        info!(
-                            agent_id = %id,
-                            "ACP agent terminated during handshake; discarding completed session"
-                        );
-                        return;
-                    }
-                    let client = Arc::clone(&session.client);
-                    let model = session.model.clone();
-                    sessions_guard.insert(id.clone(), session);
-                    drop(sessions_guard);
-                    let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
-                        agent_id: id.clone(),
-                        model,
-                        provider_error: None,
-                        clear_provider_error: true,
-                    });
-                    if let Some(events) = event_sender {
-                        client.lock().await.spawn_reader(events);
-                    }
-                    deliver_acp_prompts_if_ready(
-                        &id,
-                        &sessions,
-                        &pending,
-                        &agents_dir,
-                        &ui_commands,
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    connecting.lock().await.remove(&id);
-                    let queued_count = pending.lock().await.get(&id).map(|v| v.len()).unwrap_or(0);
-                    notify_acp_handshake_failed(&ui_commands, &id, &err, queued_count);
-                }
-            }
-        });
-    }
-
-    async fn retry_acp_connect_if_needed(&self, agent_id: &str) {
-        if self.acp_sessions.lock().await.contains_key(agent_id) {
-            return;
-        }
-        if self.connecting_acp_agents.lock().await.contains(agent_id) {
-            return;
-        }
-        let Some(config) = self.acp_launch_configs.lock().await.get(agent_id).cloned() else {
-            return;
-        };
-        self.expected_acp_agents
-            .lock()
-            .await
-            .insert(agent_id.to_string());
-        self.connect_acp_agent(
-            agent_id.to_string(),
-            config.role.clone(),
-            config.command.clone(),
-        );
-    }
-
-    async fn handle_acp_handshake_action(
-        &self,
-        agent_id: &str,
-        action: crate::event::AcpHandshakeAction,
-    ) {
-        match action {
-            crate::event::AcpHandshakeAction::Retry => {
-                self.send_acp_session_status(agent_id, None, None, true);
-                self.retry_acp_connect_if_needed(agent_id).await;
-            }
-            crate::event::AcpHandshakeAction::DiscardQueued => {
-                let removed = self
-                    .pending_acp_prompts
-                    .lock()
-                    .await
-                    .remove(agent_id)
-                    .unwrap_or_default();
-                if !removed.is_empty() {
-                    self.send_ui_command(UiCommand::AcpTranscriptChunk {
-                        agent_id: agent_id.to_string(),
-                        kind: "system".to_string(),
-                        text: format!("via: discarded {} queued message(s)", removed.len()),
-                    });
-                }
-                self.send_acp_session_status(agent_id, None, None, true);
-            }
-            crate::event::AcpHandshakeAction::Dismiss => {}
-        }
-    }
-
-    fn send_acp_session_status(
-        &self,
-        agent_id: &str,
-        model: Option<&str>,
-        provider_error: Option<&str>,
-        clear_provider_error: bool,
-    ) {
-        self.send_ui_command(UiCommand::AcpSessionStatus {
-            agent_id: agent_id.to_string(),
-            model: model.map(str::to_string),
-            provider_error: provider_error.map(str::to_string),
-            clear_provider_error,
-        });
-    }
-
-    /// Resolve the ACP session to use for a prompt, preferring an explicit id, then the
-    /// primary/orchestrator, then any single connected agent.
-    async fn acp_session_for_prompt(&self, agent_id: Option<&str>) -> Option<AcpSession> {
-        let map = self.acp_sessions.lock().await;
-        if let Some(id) = agent_id {
-            if let Some(session) = map.get(id) {
-                return Some(session.clone());
-            }
-        }
-        if let Some(session) = map.get(ORCHESTRATOR_AGENT_ID) {
-            return Some(session.clone());
-        }
-        map.values().next().cloned()
     }
 
     pub fn spawn(mut self) -> MediatorHandle {
@@ -632,26 +137,8 @@ impl Mediator {
         };
         self.event_sender = Some(events.clone());
 
-        // Start a stdout reader for each ACP agent connected before startup (the primary).
-        let sessions = Arc::clone(&self.acp_sessions);
-        let ui_commands = self.ui_commands.clone();
-        let reader_events = events.clone();
-        tokio::spawn(async move {
-            let map = sessions.lock().await;
-            for (agent_id, session) in map.iter() {
-                let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
-                    agent_id: agent_id.clone(),
-                    model: session.model.clone(),
-                    provider_error: None,
-                    clear_provider_error: false,
-                });
-                let client = Arc::clone(&session.client);
-                let events = reader_events.clone();
-                tokio::spawn(async move {
-                    client.lock().await.spawn_reader(events);
-                });
-            }
-        });
+        self.acp_runtime
+            .spawn_initial_readers(events.clone(), self.ui_commands.clone());
 
         let editor_listener = editor::spawn_listener(
             self.config.editor_socket_path.clone(),
@@ -713,7 +200,6 @@ impl Mediator {
                 }
                 Event::Ui(UiEvent::OpenRequested { path, line }) => {
                     let target = FileTarget { path, line };
-
                     if let Err(error) = nvim::open_file(
                         &self.config.nvim_socket_path,
                         &self.config.working_directory,
@@ -728,7 +214,6 @@ impl Mediator {
                     if let Some(task) = self.in_flight_symbol_open.take() {
                         task.abort();
                     }
-
                     let socket_path = self.config.nvim_socket_path.clone();
                     self.in_flight_symbol_open = Some(tokio::spawn(async move {
                         if let Err(error) = nvim::open_symbol(&socket_path, &symbol).await {
@@ -750,142 +235,94 @@ impl Mediator {
                     if text.trim().is_empty() {
                         continue;
                     }
-
-                    let target = agent_id.as_deref().unwrap_or(ORCHESTRATOR_AGENT_ID);
-
-                    let prompt_resource = self
-                        .editor_state
-                        .visual_selection
-                        .as_ref()
-                        .filter(|selection| !selection.text.trim().is_empty())
-                        .map(|selection| PromptResource {
-                            uri: selection_resource_uri(
-                                &selection.path,
-                                selection.start_line,
-                                selection.end_line,
-                            ),
-                            mime_type: Some("text/plain".to_string()),
-                            text: selection.text.clone(),
-                        });
-
-                    if let Some(session) = self.acp_session(target).await {
-                        let client = Arc::clone(&session.client);
-                        let session_id = session.session_id;
-                        tokio::spawn(async move {
-                            let mut guard = client.lock().await;
-                            if let Err(error) =
-                                guard.prompt(&session_id, &text, prompt_resource).await
-                            {
-                                debug!(%error, "failed to send ACP prompt");
-                            }
-                        });
-                    } else if self.recipient_is_acp(target).await {
-                        self.queue_acp_prompt(target, text, false).await;
-                        if !self.deliver_acp_prompts_if_ready(target).await {
-                            self.retry_acp_connect_if_needed(target).await;
-                        }
-                    } else {
-                        debug!("agent prompt submitted without an active ACP session");
-                    }
+                    self.handle_prompt_submitted(text, agent_id).await;
                 }
                 Event::Ui(UiEvent::AcpHandshakeAction { agent_id, action }) => {
-                    self.handle_acp_handshake_action(&agent_id, action).await;
+                    let ctx = self.connect_ctx();
+                    self.acp_runtime
+                        .handle_handshake_action(&agent_id, action, &ctx)
+                        .await;
                 }
                 Event::Ui(UiEvent::AcpJsonRpcResult {
                     agent_id,
                     id,
                     result,
                 }) => {
-                    let Some(session) = self.acp_session(&agent_id).await else {
-                        continue;
-                    };
-                    let client = Arc::clone(&session.client);
-                    tokio::spawn(async move {
-                        let mut guard = client.lock().await;
-                        if let Err(err) = guard.send_jsonrpc_result(id, result).await {
-                            debug!(%err, "failed to send ACP JSON-RPC result to agent");
-                        }
-                    });
+                    if let Some(session) = self.acp_runtime.session(&agent_id).await {
+                        let client = Arc::clone(&session.client);
+                        tokio::spawn(async move {
+                            let mut guard = client.lock().await;
+                            if let Err(err) = guard.send_jsonrpc_result(id, result).await {
+                                debug!(%err, "failed to send ACP JSON-RPC result to agent");
+                            }
+                        });
+                    }
                 }
                 Event::Editor(event) => self.apply_editor_event(event).await,
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
                     self.handle_agent_output(chunk).await;
                 }
-                Event::Agent(AgentEvent::Acp { agent_id, event }) => match event {
-                    AcpAgentEvent::TranscriptChunk { kind, text } => {
-                        if kind == "agent_message_chunk" && !text.is_empty() {
-                            self.send_acp_session_status(&agent_id, None, None, true);
-                        }
-                        self.send_ui_command(UiCommand::AcpTranscriptChunk {
-                            agent_id,
-                            kind,
-                            text,
-                        });
-                    }
-                    AcpAgentEvent::Progress { id, label, active } => {
-                        if active && !label.is_empty() {
-                            self.acp_tool_titles
-                                .insert((agent_id.clone(), id.clone()), label.clone());
-                        } else if !active {
-                            self.acp_tool_titles.remove(&(agent_id.clone(), id.clone()));
-                        }
-                        self.send_ui_command(UiCommand::AcpProgress {
-                            agent_id,
-                            id,
-                            label,
-                            active,
-                        });
-                    }
-                    AcpAgentEvent::PermissionRequest {
-                        jsonrpc_id,
-                        session_id,
-                        tool_call_id,
-                        mut title,
-                        options,
-                    } => {
-                        if title == "Permission required" || title.trim().is_empty() {
-                            let title_key = (agent_id.clone(), tool_call_id.clone());
-                            if let Some(t) = self.acp_tool_titles.get(&title_key) {
-                                title = t.clone();
-                            }
-                        }
-                        self.send_ui_command(UiCommand::AcpModalPrompt {
-                            agent_id,
-                            jsonrpc_id,
-                            title,
-                            message: format!("Session `{session_id}`\nTool call `{tool_call_id}`"),
-                            options,
-                            kind: AcpModalKind::SessionPermission,
-                        });
-                    }
-                    AcpAgentEvent::AskQuestion {
-                        jsonrpc_id,
-                        title,
-                        question_id,
-                        prompt,
-                        options,
-                    } => {
-                        self.send_ui_command(UiCommand::AcpModalPrompt {
-                            agent_id,
-                            jsonrpc_id,
-                            title,
-                            message: prompt,
-                            options,
-                            kind: AcpModalKind::AskQuestion { question_id },
-                        });
-                    }
-                    AcpAgentEvent::SessionStatus { provider_error } => {
-                        self.send_acp_session_status(
-                            &agent_id,
-                            None,
-                            provider_error.as_deref(),
-                            false,
-                        );
-                    }
-                },
+                Event::Agent(AgentEvent::Acp { agent_id, event }) => {
+                    self.acp_runtime
+                        .handle_agent_event(&self.ui_commands, agent_id, event)
+                        .await;
+                }
                 Event::Agent(event) => debug!(?event, "agent event received"),
                 event => debug!(?event, "mediator event received"),
             }
+        }
+    }
+
+    /// `AgentPromptSubmitted`: send a prompt to an ACP session, or queue it for
+    /// delivery once the handshake completes (retrying the connect if needed).
+    async fn handle_prompt_submitted(&mut self, text: String, agent_id: Option<String>) {
+        let target = agent_id.as_deref().unwrap_or(ORCHESTRATOR_AGENT_ID);
+
+        let prompt_resource = self
+            .editor_state
+            .visual_selection
+            .as_ref()
+            .filter(|selection| !selection.text.trim().is_empty())
+            .map(|selection| PromptResource {
+                uri: selection_resource_uri(
+                    &selection.path,
+                    selection.start_line,
+                    selection.end_line,
+                ),
+                mime_type: Some("text/plain".to_string()),
+                text: selection.text.clone(),
+            });
+
+        if let Some(session) = self.acp_runtime.session(target).await {
+            let client = Arc::clone(&session.client);
+            let session_id = session.session_id;
+            tokio::spawn(async move {
+                let mut guard = client.lock().await;
+                if let Err(error) = guard.prompt(&session_id, &text, prompt_resource).await {
+                    debug!(%error, "failed to send ACP prompt");
+                }
+            });
+        } else if self
+            .acp_runtime
+            .recipient_is_acp(&self.config.agents_dir, target)
+            .await
+        {
+            self.agent_delivery.queue_prompt(target, text, false).await;
+            if !self
+                .acp_runtime
+                .deliver_if_ready(
+                    &self.agent_delivery.pending_arc(),
+                    target,
+                    &self.config.agents_dir,
+                    &self.ui_commands,
+                )
+                .await
+            {
+                let ctx = self.connect_ctx();
+                self.acp_runtime.retry_connect_if_needed(target, &ctx).await;
+            }
+        } else {
+            debug!("agent prompt submitted without an active ACP session");
         }
     }
 
@@ -900,7 +337,7 @@ impl Mediator {
         match &event {
             EditorEvent::ActiveBufferChanged { path, line, column } => {
                 // Editor context follows the primary ACP agent when one is connected.
-                if let Some(session) = self.acp_session_for_prompt(None).await {
+                if let Some(session) = self.acp_runtime.session_for_prompt(None).await {
                     let path = path.clone();
                     let line = *line;
                     let column = *column;
@@ -938,7 +375,7 @@ impl Mediator {
                 let display_path = path
                     .strip_prefix(&self.config.working_directory)
                     .unwrap_or(path);
-                if let Some(session) = self.acp_session_for_prompt(None).await {
+                if let Some(session) = self.acp_runtime.session_for_prompt(None).await {
                     let client = Arc::clone(&session.client);
                     let session_id = session.session_id;
                     let path = path.clone();
@@ -973,7 +410,11 @@ impl Mediator {
                 focus: _focus,
             } => {
                 let target = agent_id.as_deref().unwrap_or(ORCHESTRATOR_AGENT_ID);
-                if self.recipient_is_acp(target).await {
+                if self
+                    .acp_runtime
+                    .recipient_is_acp(&self.config.agents_dir, target)
+                    .await
+                {
                     info!(
                         agent_id = target,
                         from = ?from,
@@ -981,14 +422,26 @@ impl Mediator {
                         "ACP agent message received"
                     );
                     if from.is_none() {
-                        self.queue_acp_prompt(target, content.clone(), true).await;
+                        self.agent_delivery
+                            .queue_prompt(target, content.clone(), true)
+                            .await;
                     }
-                    if !self.deliver_acp_prompts_if_ready(target).await {
+                    if !self
+                        .acp_runtime
+                        .deliver_if_ready(
+                            &self.agent_delivery.pending_arc(),
+                            target,
+                            &self.config.agents_dir,
+                            &self.ui_commands,
+                        )
+                        .await
+                    {
                         info!(
                             agent_id = target,
                             "ACP message queued until session handshake completes"
                         );
-                        self.retry_acp_connect_if_needed(target).await;
+                        let ctx = self.connect_ctx();
+                        self.acp_runtime.retry_connect_if_needed(target, &ctx).await;
                     }
                 } else if from.is_none() {
                     // Lua/editor path: persist to mailbox (CLI send enqueues before notifying).
@@ -1023,15 +476,10 @@ impl Mediator {
                     let resolved = launch.command;
 
                     if launch.acp {
-                        self.expected_acp_agents.lock().await.insert(id.clone());
-                        self.acp_launch_configs.lock().await.insert(
-                            id.clone(),
-                            AcpLaunchConfig {
-                                role: role.clone(),
-                                command: resolved.clone(),
-                            },
-                        );
-                        self.connect_acp_agent(id.clone(), role.clone(), resolved.clone());
+                        let ctx = self.connect_ctx();
+                        self.acp_runtime
+                            .register_spawn(id.clone(), role.clone(), resolved.clone(), ctx)
+                            .await;
                     }
 
                     self.send_ui_command(UiCommand::SpawnAgent {
@@ -1042,24 +490,17 @@ impl Mediator {
                 }
             }
             EditorEvent::TerminateAgent { id } => {
-                if id == PRIMARY_PTY_AGENT_ID {
+                if AcpRuntime::is_primary_pty(id) {
                     tracing::warn!(%id, "refusing to terminate primary agent");
                 } else {
                     info!(%id, "terminate agent requested");
-                    // Hold the acp_sessions lock while clearing `expected` so a connect task
-                    // finishing its handshake concurrently observes the removal and discards its
-                    // session (see connect_acp_agent) rather than resurrecting a dead agent.
-                    {
-                        let mut sessions = self.acp_sessions.lock().await;
-                        self.expected_acp_agents.lock().await.remove(id);
-                        sessions.remove(id);
-                    }
-                    self.pending_acp_prompts.lock().await.remove(id);
-                    self.acp_launch_configs.lock().await.remove(id);
-                    self.connecting_acp_agents.lock().await.remove(id);
-                    self.acp_tool_titles
-                        .retain(|(agent_id, _), _| agent_id != id);
-                    self.send_ui_command(UiCommand::TerminateAgent { id: id.clone() });
+                    // Order matters: terminate first (holds the sessions lock while
+                    // clearing `expected`) so a connect task finishing its handshake
+                    // concurrently observes the removal and discards its session.
+                    // Only then clear pending — otherwise a connect task can drain
+                    // the mailbox + pending and spawn delivery for a dead agent.
+                    self.acp_runtime.terminate(&self.ui_commands, id).await;
+                    self.agent_delivery.discard_queued(id).await;
                 }
             }
             EditorEvent::ReviewGateOpened { task_id, title } => {
@@ -1263,6 +704,7 @@ impl MediatorHandle {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::time::Duration;
 
     fn temp_agents_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1384,7 +826,8 @@ mod tests {
 
         assert_eq!(
             mediator
-                .acp_launch_configs
+                .acp_runtime
+                .launch_configs_arc()
                 .lock()
                 .await
                 .get("reviewer")
