@@ -94,6 +94,15 @@ pub enum TaskCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Hand a task to the human for review. Sets status to `review` and assignee
+    /// to `human`, then fires the review gate (opens the review surface +
+    /// notifies the primary agent pane). Shorthand for
+    /// `update <id> --status review --assignee human`.
+    Review {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -180,6 +189,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             json,
         }),
         TaskCommand::Done { id, json } => run_done(id, json),
+        TaskCommand::Review { id, json } => run_review(id, json),
     }
 }
 
@@ -395,6 +405,28 @@ fn run_done(id: String, json: bool) -> Result<()> {
     print_task_result(&task, json, "done")
 }
 
+/// `via task review <id>`: set status to `review` + assignee to `human`, then
+/// fire the review gate. This is the explicit "hand this to the human" move —
+/// distinct from `update <id> --status review` which marks ready for review
+/// without reassigning. The review-gate fire (open review surface, notify
+/// primary agent pane) happens inside `deliver_task_notifications` when it
+/// detects the status transition to `review`.
+fn run_review(id: String, json: bool) -> Result<()> {
+    let ctx = tasks_context()?;
+    let previous = get_task(&ctx.tasks_dir, &id)?;
+    let task = update_task(
+        &ctx.tasks_dir,
+        &id,
+        TaskUpdate {
+            status: Some(TaskStatus::Review),
+            assignee: Some(Some(crate::config::HUMAN_ASSIGNEE_ID.to_string())),
+            ..TaskUpdate::default()
+        },
+    )?;
+    task_delivery::deliver_task_notifications(&task, previous.as_ref(), self_id().as_deref());
+    print_task_result(&task, json, "review")
+}
+
 fn print_task_result(task: &Task, json: bool, verb: &str) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(task)?);
@@ -440,6 +472,8 @@ mod tests {
     use clap::Parser;
 
     use crate::cli::{Cli, Command};
+    use crate::test_support::{temp_dir, write_session_manifest};
+    use crate::workspace::resolve_tasks_context;
 
     #[test]
     fn parses_task_list_json() {
@@ -588,7 +622,90 @@ mod tests {
     }
 
     #[test]
+    fn parses_task_review() {
+        let cli =
+            Cli::try_parse_from(["via", "task", "review", "p4-task-review", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Task {
+                command: TaskCommand::Review { id, json: true },
+            }) if id == "p4-task-review"
+        ));
+    }
+
+    #[test]
     fn task_status_arg_maps_to_store() {
         assert_eq!(TaskStatus::InProgress, TaskStatusArg::InProgress.into());
+    }
+
+    /// `via task review <id>` sets status to `review` and assignee to `human`.
+    #[test]
+    fn run_review_sets_status_and_assignee() {
+        let dir = temp_dir("task-review");
+        let manifest_path = write_session_manifest(&dir);
+
+        // Create a task on the board for this workspace.
+        let ctx = resolve_tasks_context(&dir).unwrap();
+        create_task(
+            &ctx.tasks_dir,
+            CreateTask {
+                title: "Review me".to_string(),
+                id: Some("review-test".to_string()),
+                assignee: Some("coder".to_string()),
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+
+        // Serialize with the global env lock because `cargo test` runs these
+        // tests in parallel in the same process.
+        let _env_guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("VIA_SESSION", &manifest_path);
+        }
+
+        let result = run_review("review-test".to_string(), false);
+
+        unsafe {
+            std::env::remove_var("VIA_SESSION");
+        }
+
+        result.unwrap();
+
+        let task = get_task(&ctx.tasks_dir, "review-test").unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Review);
+        assert_eq!(
+            task.assignee.as_deref(),
+            Some(crate::config::HUMAN_ASSIGNEE_ID)
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `via task review <id>` on a missing task bails with a clear error.
+    #[test]
+    fn run_review_missing_task_errors() {
+        let dir = temp_dir("task-review-missing");
+        let manifest_path = write_session_manifest(&dir);
+
+        // Serialize with the global env lock because `cargo test` runs these
+        // tests in parallel in the same process.
+        let _env_guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("VIA_SESSION", &manifest_path);
+        }
+
+        let result = run_review("nonexistent".to_string(), false);
+
+        unsafe {
+            std::env::remove_var("VIA_SESSION");
+        }
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("task not found"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

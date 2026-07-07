@@ -467,6 +467,11 @@ impl Mediator {
                         %id,
                         "spawn agent ignored: orchestration unavailable (no ACP mapping for configured agent)"
                     );
+                } else if crate::config::is_reserved_agent_id(id) {
+                    warn!(
+                        %id,
+                        "spawn agent ignored: reserved id (primary PTY pane or human role), not a spawnable pane"
+                    );
                 } else {
                     info!(%id, role = ?role, command = ?command, "spawn agent requested");
                     let (role, command) =
@@ -526,6 +531,15 @@ impl Mediator {
                         });
                     }
                 }
+            }
+            EditorEvent::TaskCreated { id } => {
+                debug!(%id, "task created signal received");
+            }
+            EditorEvent::TaskUpdated { id, fields } => {
+                debug!(%id, ?fields, "task updated signal received");
+            }
+            EditorEvent::TaskDeleted { id } => {
+                debug!(%id, "task deleted signal received");
             }
         }
 
@@ -703,18 +717,9 @@ impl MediatorHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::temp_dir;
     use std::path::PathBuf;
     use std::time::Duration;
-
-    fn temp_agents_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "via-mediator-{label}-{}-{}",
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     fn test_config() -> Config {
         Config {
@@ -793,7 +798,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_agent_without_command_uses_preset_role_and_resolved_acp_command() {
-        let agents_dir = temp_agents_dir("spawn-default-acp");
+        let agents_dir = temp_dir("spawn-default-acp");
         let config = Config {
             agent_command: Some("unknown-agent".to_string()),
             acp_agent: Some("false acp".to_string()),
@@ -838,8 +843,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_rejects_human_reserved_id() {
+        let agents_dir = temp_dir("spawn-human-rejected");
+        let config = Config {
+            agent_command: Some("opencode".to_string()),
+            orchestration_enabled: true,
+            agents_dir: agents_dir.clone(),
+            ..test_config()
+        };
+        let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(config);
+
+        mediator
+            .apply_editor_event(EditorEvent::SpawnAgent {
+                id: "human".to_string(),
+                role: None,
+                command: None,
+            })
+            .await;
+
+        // No UI command should be emitted — the mediator rejects the reserved id.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), ui_rx.recv())
+                .await
+                .is_err(),
+            "spawn of 'human' should not emit UiCommand::SpawnAgent"
+        );
+        // No ACP launch config should be recorded.
+        assert!(
+            mediator
+                .acp_runtime
+                .launch_configs_arc()
+                .lock()
+                .await
+                .get("human")
+                .is_none(),
+        );
+        std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
     async fn agent_send_to_pty_recipient_is_mailbox_only() {
-        let agents_dir = temp_agents_dir("pty-mailbox-only");
+        let agents_dir = temp_dir("pty-mailbox-only");
         agent_bus::write_registry(
             &agents_dir,
             &[agent_bus::AgentRecord {

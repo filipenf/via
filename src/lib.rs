@@ -16,6 +16,8 @@ mod pty;
 mod session;
 mod task_delivery;
 mod task_store;
+#[cfg(test)]
+mod test_support;
 pub mod ui;
 mod util;
 mod workspace;

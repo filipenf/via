@@ -109,6 +109,19 @@ cargo fmt -- --check
 cargo clippy -- -D warnings
 ```
 
+Neovim Lua tests (the `:ViaTasks` PM UI and other `nvim/` integration):
+
+```sh
+scripts/test-nvim.sh       # headless nvim; requires nvim >= 0.9 for `-l`
+# or: mise run test-nvim
+```
+
+These live under `nvim/tests/` and use a tiny built-in harness (no
+busted/plenary). Pure helpers (`parse_row`, `format_row`, `build_content`,
+`validate_rows`) are tested directly; `save()` is tested with the command
+runner (`M.run`) stubbed, so no real `via` binary or live session is needed.
+CI runs this as the `nvim lua tests` job.
+
 We use:
 
 - `rustfmt.toml` at the root (edition + a few style choices).

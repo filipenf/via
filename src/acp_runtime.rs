@@ -731,18 +731,8 @@ impl Default for AcpRuntime {
 mod tests {
     use super::*;
     use crate::agent_delivery::AgentDelivery;
+    use crate::test_support::temp_dir;
     use std::collections::HashSet;
-    use std::path::PathBuf;
-
-    fn temp_agents_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "via-acp-runtime-{label}-{}-{}",
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
 
     async fn recipient_is_acp_via_expected(
         expected: &Arc<Mutex<HashSet<String>>>,
@@ -785,7 +775,7 @@ mod tests {
         let delivery = AgentDelivery::new();
         let sessions = Arc::new(Mutex::new(HashMap::new()));
         let (ui_tx, _ui_rx) = mpsc::channel::<UiCommand>(8);
-        let agents_dir = temp_agents_dir("no-session");
+        let agents_dir = temp_dir("no-session");
         let delivered = deliver_if_ready(
             "reviewer",
             &sessions,
@@ -804,7 +794,7 @@ mod tests {
         // verify the mailbox-drain half directly: enqueue a bus message, then call
         // deliver_if_ready against an empty session map and confirm it returns false
         // but the message is still in the mailbox (no spurious drain).
-        let agents_dir = temp_agents_dir("mailbox-no-drain");
+        let agents_dir = temp_dir("mailbox-no-drain");
         agent_bus::enqueue(
             &agents_dir,
             &agent_bus::Message {
@@ -837,7 +827,7 @@ mod tests {
 
     #[tokio::test]
     async fn recipient_is_acp_checks_expected_then_registry() {
-        let agents_dir = temp_agents_dir("recipient-check");
+        let agents_dir = temp_dir("recipient-check");
         let expected = Arc::new(Mutex::new(HashSet::new()));
 
         // Unknown id, empty registry → false.

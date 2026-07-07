@@ -18,6 +18,9 @@ clippy = { run = "cargo clippy -- -D warnings", description = "Run clippy with w
 # Unit tests
 test = { run = "cargo test", description = "Run unit tests" }
 
+# Neovim Lua tests (:ViaTasks PM UI, etc.). Requires nvim >= 0.9 on PATH.
+"test-nvim" = { run = "scripts/test-nvim.sh", description = "Run the Neovim Lua test suite (headless nvim)" }
+
 # Opt-in live-session E2E smoke. Requires running inside a via session with ACP-capable agent.
 "e2e-agents" = { run = "scripts/e2e-agent-orchestration.sh", description = "Run live via agent orchestration smoke test" }
 

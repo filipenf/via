@@ -269,17 +269,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "via-task-store-{}-{}-{}",
-            label,
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
+    use crate::test_support::temp_dir;
 
     #[test]
     fn task_status_serializes_in_progress_as_snake_case() {

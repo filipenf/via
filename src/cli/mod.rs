@@ -212,6 +212,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_agent_assign_with_task() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "agent",
+            "assign",
+            "--id",
+            "reviewer",
+            "--role",
+            "reviewer",
+            "-m",
+            "review this",
+            "--task",
+            "p4-assign-cmd",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Assign {
+                    id,
+                    role,
+                    command: None,
+                    message,
+                    task: Some(tid),
+                    no_focus: false,
+                },
+            }) if id == "reviewer"
+                && role.as_deref() == Some("reviewer")
+                && message == "review this"
+                && tid == "p4-assign-cmd"
+        ));
+    }
+
+    #[test]
+    fn parses_agent_assign_to_human() {
+        let cli =
+            Cli::try_parse_from(["via", "agent", "assign", "--id", "human", "-m", "your turn"])
+                .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Assign {
+                    id,
+                    role: None,
+                    command: None,
+                    message,
+                    task: None,
+                    no_focus: false,
+                },
+            }) if id == "human" && message == "your turn"
+        ));
+    }
+
+    #[test]
     fn parses_agent_inbox() {
         let cli = Cli::try_parse_from(["via", "agent", "inbox", "--peek", "--wait", "30"]).unwrap();
         assert!(matches!(

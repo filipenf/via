@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::io::Write;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::OnceLock;
@@ -525,6 +524,21 @@ pub const PRIMARY_PTY_AGENT_ID: &str = "agent";
 /// Bus id of the ACP orchestrator when orchestration is active.
 pub const ORCHESTRATOR_AGENT_ID: &str = "orchestrator";
 
+/// Reserved assignee id for the human operator. Not a pane — never spawned,
+/// never appears in `via agent list`, never receives ACP prompts. Delivery to
+/// `human` is the review-gate signal (when a task is in `review`) or a mailbox
+/// notify to the primary `agent` pane (otherwise). Used by `via agent assign
+/// --id human --task <tid>` and `via task review <id>` to explicitly hand work
+/// to the user.
+pub const HUMAN_ASSIGNEE_ID: &str = "human";
+
+/// True for ids that are reserved roles, not spawnable agent panes. Rejecting
+/// these in `via agent spawn` / `terminate` keeps the registry honest about
+/// what's actually running.
+pub fn is_reserved_agent_id(id: &str) -> bool {
+    id == PRIMARY_PTY_AGENT_ID || id == HUMAN_ASSIGNEE_ID
+}
+
 /// Built-in spawn presets; `via.conf` `[agents.*]` entries override per field.
 pub fn default_agent_presets() -> HashMap<String, AgentPreset> {
     fn preset(role: &str) -> AgentPreset {
@@ -656,25 +670,22 @@ fn ensure_lua_assets() {
                 dir.display()
             );
         });
+        // Base Lua assets are always re-asserted (overwrite if content differs)
+        // so updates to the embedded files propagate on restart. User
+        // customizations live in the plugin_dir, not here.
         for (filename, content) in [
             (
                 "context_bridge.lua",
                 include_str!("../nvim/context_bridge.lua"),
             ),
             ("via.lua", include_str!("../nvim/via.lua")),
+            ("via/tasks.lua", include_str!("../nvim/tasks.lua")),
         ] {
             let path = dir.join(filename);
-            if !path.exists() {
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&path)
-                {
-                    if f.write_all(content.as_bytes()).is_err() {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
             }
+            let _ = std::fs::write(&path, content);
         }
     });
 }
@@ -712,6 +723,15 @@ mod tests {
         assert!(!is_acp_command("opencode"));
         assert!(!is_acp_command("opencode acp --foo"));
         assert!(!is_acp_command(""));
+    }
+
+    #[test]
+    fn reserved_agent_ids_are_primary_and_human() {
+        assert!(is_reserved_agent_id(PRIMARY_PTY_AGENT_ID));
+        assert!(is_reserved_agent_id(HUMAN_ASSIGNEE_ID));
+        assert!(!is_reserved_agent_id("orchestrator"));
+        assert!(!is_reserved_agent_id("reviewer"));
+        assert!(!is_reserved_agent_id("coder"));
     }
 
     #[test]

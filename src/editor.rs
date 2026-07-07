@@ -86,6 +86,15 @@ impl EditorState {
             EditorEvent::ReviewGateOpened { .. } => {
                 // one-shot request, handled by mediator (opens review UI)
             }
+            EditorEvent::TaskCreated { .. } => {
+                // one-shot signal, forwarded to UI by mediator
+            }
+            EditorEvent::TaskUpdated { .. } => {
+                // one-shot signal, forwarded to UI by mediator
+            }
+            EditorEvent::TaskDeleted { .. } => {
+                // one-shot signal, forwarded to UI by mediator
+            }
         }
     }
 }
@@ -140,6 +149,17 @@ enum WireEditorEvent {
         task_id: String,
         #[serde(default)]
         title: String,
+    },
+    TaskCreated {
+        id: String,
+    },
+    TaskUpdated {
+        id: String,
+        #[serde(default)]
+        fields: Vec<String>,
+    },
+    TaskDeleted {
+        id: String,
     },
 }
 
@@ -281,6 +301,9 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
         WireEditorEvent::ReviewRequested { task_id, title } => {
             EditorEvent::ReviewGateOpened { task_id, title }
         }
+        WireEditorEvent::TaskCreated { id } => EditorEvent::TaskCreated { id },
+        WireEditorEvent::TaskUpdated { id, fields } => EditorEvent::TaskUpdated { id, fields },
+        WireEditorEvent::TaskDeleted { id } => EditorEvent::TaskDeleted { id },
     })
 }
 
@@ -413,6 +436,52 @@ mod tests {
             EditorEvent::ReviewGateOpened {
                 task_id: "t1".to_string(),
                 title: String::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_created_event() {
+        assert_eq!(
+            parse_editor_event(r#"{"type":"task_created","id":"t1"}"#, Path::new("/repo")).unwrap(),
+            EditorEvent::TaskCreated {
+                id: "t1".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_updated_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"task_updated","id":"t1","fields":["status","assignee"]}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::TaskUpdated {
+                id: "t1".to_string(),
+                fields: vec!["status".to_string(), "assignee".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_updated_event_without_fields() {
+        assert_eq!(
+            parse_editor_event(r#"{"type":"task_updated","id":"t1"}"#, Path::new("/repo")).unwrap(),
+            EditorEvent::TaskUpdated {
+                id: "t1".to_string(),
+                fields: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_task_deleted_event() {
+        assert_eq!(
+            parse_editor_event(r#"{"type":"task_deleted","id":"t1"}"#, Path::new("/repo")).unwrap(),
+            EditorEvent::TaskDeleted {
+                id: "t1".to_string(),
             }
         );
     }
