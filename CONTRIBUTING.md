@@ -137,8 +137,8 @@ performance-sensitive surfaces:
 - Layout calculations (`src/ui/ghostty/layout.rs`): split decisions, column
   reservation, focus-after-reference.
 - Link / OSC 8 / symbol scanning (`src/ui/ghostty/links.rs`):
-  `reference_target_from_row` and URI variants, exercised on every visible row
-  of agent output.
+  `reference_target_from_row` and URI variants, used for Ctrl+click routing and
+  Ctrl-held clickable cues in visible agent output.
 
 **If your change touches layout math or the reference scanner, run `cargo bench`
 locally (before/after) and include a short summary or `target/criterion/` report
@@ -177,8 +177,10 @@ In Neovim:
 - `via session refresh [--file PATH]` — ask Neovim to reload externally changed
   buffers after agent edits. via also runs `:checktime` on `FocusGained` and
   `BufEnter`.
-- Shift-click file paths or `symbol://Foo::bar` references in the agent output
-  to open them in the Neovim pane.
+- Hold Ctrl in the agent output to highlight clickable filenames, symbols, and
+  OSC 8 hyperlinks. Ctrl-click file paths or `symbol://Foo::bar` references to
+  open them in the Neovim pane; Ctrl-click external OSC 8 hyperlinks to open
+  them in the system browser.
 
 See the main [README.md](README.md) for configuration (`~/.config/via/via.conf`,
 env vars, `--agent-pane-cols`, review backends, font tweaks, etc.) and the

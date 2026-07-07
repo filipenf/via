@@ -7,6 +7,7 @@ use crate::pty::TerminalSize;
 pub enum ReferenceTarget {
     File(FileTarget),
     Symbol(String),
+    Url(String),
 }
 
 pub fn reference_target_from_row(
@@ -14,20 +15,40 @@ pub fn reference_target_from_row(
     column: usize,
     working_directory: &Path,
 ) -> Option<ReferenceTarget> {
-    let spans = file_reference_spans(row, working_directory);
-
-    if let Some(span) = spans
+    reference_spans_from_row(row, working_directory)
         .into_iter()
         .find(|span| column >= span.start && column < span.end)
-    {
-        return Some(ReferenceTarget::File(span.target));
-    }
+        .map(|span| span.target)
+}
 
-    let spans = symbol_reference_spans(row);
+pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<ReferenceSpan> {
+    let mut spans: Vec<ReferenceSpan> = file_reference_spans(row, working_directory)
+        .into_iter()
+        .map(|span| ReferenceSpan {
+            start: span.start,
+            end: span.end,
+            target: ReferenceTarget::File(span.target),
+        })
+        .collect();
+
+    spans.extend(
+        symbol_reference_spans(row)
+            .into_iter()
+            .map(|span| ReferenceSpan {
+                start: span.start,
+                end: span.end,
+                target: ReferenceTarget::Symbol(span.symbol),
+            }),
+    );
+
     spans
-        .into_iter()
-        .find(|span| column >= span.start && column < span.end)
-        .map(|span| ReferenceTarget::Symbol(span.symbol))
+}
+
+#[derive(Debug)]
+pub struct ReferenceSpan {
+    pub start: usize,
+    pub end: usize,
+    pub target: ReferenceTarget,
 }
 
 fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
@@ -115,7 +136,7 @@ fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
         let token: String = chars[start..index].iter().collect();
         let token = trim_symbol_token(&token);
 
-        if !looks_like_symbol(&token) {
+        if !looks_like_scanned_symbol(&token) {
             continue;
         }
 
@@ -447,11 +468,19 @@ fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
 }
 
 pub fn reference_target_from_uri(uri: &str, working_directory: &Path) -> Option<ReferenceTarget> {
+    if is_http_url(uri) {
+        return Some(ReferenceTarget::Url(uri.to_string()));
+    }
+
     if let Some(target) = file_target_from_uri(uri, working_directory) {
         return Some(ReferenceTarget::File(target));
     }
 
     symbol_target_from_uri(uri).map(ReferenceTarget::Symbol)
+}
+
+fn is_http_url(uri: &str) -> bool {
+    uri.starts_with("http://") || uri.starts_with("https://")
 }
 
 pub(super) fn file_target_from_uri(uri: &str, working_directory: &Path) -> Option<FileTarget> {
@@ -622,6 +651,10 @@ fn looks_like_symbol(token: &str) -> bool {
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '-' | '#'))
 }
 
+fn looks_like_scanned_symbol(token: &str) -> bool {
+    looks_like_symbol(token) && (token.contains("::") || token.contains('#'))
+}
+
 fn is_symbol_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric()
         || matches!(
@@ -672,8 +705,16 @@ mod tests {
 
     #[test]
     fn ignores_non_file_and_non_symbol_uri() {
-        assert!(
-            reference_target_from_uri("https://example.com/Foo::bar", Path::new("/repo")).is_none()
+        assert!(reference_target_from_uri("ftp://example.com/file", Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn resolves_http_uri_as_url_target() {
+        assert_eq!(
+            reference_target_from_uri("https://example.com/Foo::bar", Path::new("/repo")),
+            Some(ReferenceTarget::Url(
+                "https://example.com/Foo::bar".to_string()
+            ))
         );
     }
 
@@ -692,6 +733,27 @@ mod tests {
     #[test]
     fn ignores_invalid_symbol_like_token_in_row() {
         assert!(reference_target_from_row("see 123Foo::bar", 6, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn ignores_plain_words_as_symbol_references_from_row() {
+        assert!(
+            reference_target_from_row("these are plain words", 1, Path::new("/repo")).is_none()
+        );
+        assert!(
+            reference_target_from_row("these are plain words", 10, Path::new("/repo")).is_none()
+        );
+    }
+
+    #[test]
+    fn scanned_reference_spans_skip_plain_words() {
+        let spans = reference_spans_from_row("open Foo::bar in src/main.rs", Path::new("/repo"));
+
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].start, 17);
+        assert_eq!(spans[0].end, 28);
+        assert_eq!(spans[1].start, 5);
+        assert_eq!(spans[1].end, 13);
     }
 
     #[test]

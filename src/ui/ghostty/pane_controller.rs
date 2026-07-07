@@ -39,6 +39,9 @@ pub(super) enum PaneCommand {
     SymbolOpenRequested {
         symbol: String,
     },
+    UrlOpenRequested {
+        url: String,
+    },
     AgentPromptSubmitted {
         text: String,
     },
@@ -220,6 +223,24 @@ impl TerminalPaneController {
                     command: None,
                 })
             }
+        }
+    }
+
+    pub(super) fn handle_modifiers_changed(
+        &mut self,
+        modifiers: Modifiers,
+        working_directory: &Path,
+    ) -> PaneEventOutcome {
+        if matches!(self.role, PaneRole::Editor) {
+            return PaneEventOutcome::default();
+        }
+        let dirty = self
+            .pane
+            .set_reference_cues_enabled(modifiers.ctrl, working_directory);
+        PaneEventOutcome {
+            dirty,
+            force_redraw: dirty,
+            command: None,
         }
     }
 
@@ -422,7 +443,7 @@ impl TerminalPaneController {
         let mut outcome = PaneEventOutcome::default();
         if just_pressed {
             let is_reference_click =
-                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.shift;
+                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.ctrl;
             if !is_reference_click {
                 outcome.dirty |= self.start_selection(local_x, local_y);
             }
@@ -468,7 +489,7 @@ impl TerminalPaneController {
                 info!(
                     path = %target.path.display(),
                     line = ?target.line,
-                    "file reference shift-clicked"
+                    "file reference ctrl-clicked"
                 );
                 *command = Some(PaneCommand::OpenRequested {
                     path: target.path,
@@ -477,8 +498,13 @@ impl TerminalPaneController {
                 true
             }
             ReferenceTarget::Symbol(symbol) => {
-                info!(symbol = %symbol, "symbol reference shift-clicked");
+                info!(symbol = %symbol, "symbol reference ctrl-clicked");
                 *command = Some(PaneCommand::SymbolOpenRequested { symbol });
+                true
+            }
+            ReferenceTarget::Url(url) => {
+                info!(%url, "url reference ctrl-clicked");
+                *command = Some(PaneCommand::UrlOpenRequested { url });
                 true
             }
         }
@@ -539,9 +565,9 @@ mod tests {
     use super::super::config::{TerminalMetrics, TerminalTheme};
     use super::*;
 
-    fn shift_modifiers() -> Modifiers {
+    fn ctrl_modifiers() -> Modifiers {
         Modifiers {
-            shift: true,
+            ctrl: true,
             ..Modifiers::default()
         }
     }
@@ -683,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn agent_role_opens_symbol_references_on_shift_click() {
+    fn agent_role_opens_symbol_references_on_ctrl_click() {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
@@ -691,7 +717,7 @@ mod tests {
         });
         pane.process_for_test(b"see Foo::bar here", true);
 
-        let without_shift = pane
+        let without_ctrl = pane
             .handle_mouse_input(
                 ElementState::Pressed,
                 MouseButton::Left,
@@ -701,7 +727,7 @@ mod tests {
                 Path::new("/repo"),
             )
             .unwrap();
-        assert!(without_shift.command.is_none());
+        assert!(without_ctrl.command.is_none());
         pane.handle_mouse_input(
             ElementState::Released,
             MouseButton::Left,
@@ -718,7 +744,7 @@ mod tests {
                 MouseButton::Left,
                 5 * test_metrics().cell_width,
                 0,
-                shift_modifiers(),
+                ctrl_modifiers(),
                 Path::new("/repo"),
             )
             .unwrap();
@@ -749,7 +775,21 @@ mod tests {
     }
 
     #[test]
-    fn agent_role_opens_file_references_on_shift_click() {
+    fn review_role_updates_reference_cues_on_modifier_change() {
+        let mut pane = test_controller(PaneRole::ReviewTerminal);
+        pane.process_for_test(b"open src/main.rs:42", true);
+
+        let outcome = pane.handle_modifiers_changed(ctrl_modifiers(), Path::new("/repo"));
+        assert!(outcome.dirty);
+        assert!(outcome.force_redraw);
+
+        let outcome = pane.handle_modifiers_changed(Modifiers::default(), Path::new("/repo"));
+        assert!(outcome.dirty);
+        assert!(outcome.force_redraw);
+    }
+
+    #[test]
+    fn agent_role_opens_file_references_on_ctrl_click() {
         let mut pane = test_controller(PaneRole::AgentTerminal {
             id: "agent".to_string(),
             label: "agent".to_string(),
@@ -758,7 +798,7 @@ mod tests {
         pane.process_for_test(b"open src/main.rs:42", true);
         let x = 6 * test_metrics().cell_width;
 
-        let without_shift = pane
+        let without_ctrl = pane
             .handle_mouse_input(
                 ElementState::Pressed,
                 MouseButton::Left,
@@ -768,7 +808,7 @@ mod tests {
                 Path::new("/repo"),
             )
             .unwrap();
-        assert!(without_shift.command.is_none());
+        assert!(without_ctrl.command.is_none());
         pane.handle_mouse_input(
             ElementState::Released,
             MouseButton::Left,
@@ -785,7 +825,7 @@ mod tests {
                 MouseButton::Left,
                 x,
                 0,
-                shift_modifiers(),
+                ctrl_modifiers(),
                 Path::new("/repo"),
             )
             .unwrap();
@@ -795,6 +835,67 @@ mod tests {
             Some(PaneCommand::OpenRequested { ref path, line })
                 if path == Path::new("/repo/src/main.rs") && line == Some(42)
         ));
+    }
+
+    #[test]
+    fn agent_role_opens_http_osc8_links_on_ctrl_click() {
+        let mut pane = TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: "agent".to_string(),
+                label: "agent".to_string(),
+                command: None,
+            },
+            TerminalPane::new("agent", 400, 100, test_metrics(), &TerminalTheme::default())
+                .unwrap(),
+            1.0,
+        );
+        pane.process_for_test(
+            b"\x1b]8;;https://example.com/path\x1b\\link\x1b]8;;\x1b\\",
+            true,
+        );
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                ctrl_modifiers(),
+                Path::new("/repo"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome.command,
+            Some(PaneCommand::UrlOpenRequested { ref url })
+                if url == "https://example.com/path"
+        ));
+    }
+
+    #[test]
+    fn agent_role_ignores_shift_click_references() {
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+            command: None,
+        });
+        pane.process_for_test(b"open src/main.rs:42", true);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                6 * test_metrics().cell_width,
+                0,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                Path::new("/repo"),
+            )
+            .unwrap();
+
+        assert!(outcome.command.is_none());
     }
 
     #[test]

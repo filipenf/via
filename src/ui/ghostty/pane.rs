@@ -20,9 +20,10 @@ use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 use super::links::{
-    Osc8Tracker, ReferenceTarget, reference_target_from_row, reference_target_from_uri,
+    Osc8Tracker, ReferenceTarget, reference_spans_from_row, reference_target_from_row,
+    reference_target_from_uri,
 };
-use super::render::{DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
+use super::render::{CueSpan, DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
 
 const SCROLLBACK_ROWS: usize = 10_000;
 const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
@@ -294,6 +295,15 @@ impl TerminalPane {
         self.view.reference_at(row, column, working_directory)
     }
 
+    pub(super) fn set_reference_cues_enabled(
+        &mut self,
+        enabled: bool,
+        working_directory: &Path,
+    ) -> bool {
+        self.view
+            .set_reference_cues_enabled(enabled, working_directory)
+    }
+
     pub(super) fn metrics(&self) -> TerminalMetrics {
         self.view.metrics
     }
@@ -331,6 +341,7 @@ struct TerminalView {
     osc8_enabled: bool,
     selection_anchor: Option<(usize, usize)>,
     selection_focus: Option<(usize, usize)>,
+    cue_spans: Vec<CueSpan>,
     size: TerminalSize,
     metrics: TerminalMetrics,
     theme: TerminalTheme,
@@ -386,6 +397,7 @@ impl TerminalView {
             osc8_enabled,
             selection_anchor: None,
             selection_focus: None,
+            cue_spans: Vec::new(),
             size,
             metrics,
             theme: TerminalTheme::default(),
@@ -538,6 +550,58 @@ impl TerminalView {
         had_selection
     }
 
+    fn set_reference_cues_enabled(&mut self, enabled: bool, working_directory: &Path) -> bool {
+        let spans = if enabled {
+            self.visible_reference_spans(working_directory)
+        } else {
+            Vec::new()
+        };
+        if self.cue_spans == spans {
+            return false;
+        }
+        self.cue_spans = spans;
+        true
+    }
+
+    fn visible_reference_spans(&mut self, working_directory: &Path) -> Vec<CueSpan> {
+        let mut spans = Vec::new();
+        for row in 0..self.size.rows as usize {
+            for span in self
+                .hyperlink_tracker
+                .links()
+                .get(row)
+                .into_iter()
+                .flatten()
+            {
+                if reference_target_from_uri(&span.uri, working_directory).is_some() {
+                    spans.push(CueSpan {
+                        row,
+                        start_col: span.start,
+                        end_col: span.end,
+                    });
+                }
+            }
+
+            let Some(row_text) = self.row_text(row) else {
+                continue;
+            };
+            for span in reference_spans_from_row(&row_text, working_directory) {
+                let cue = CueSpan {
+                    row,
+                    start_col: span.start,
+                    end_col: span.end,
+                };
+                if !spans.iter().any(|existing| contains_span(*existing, cue)) {
+                    spans.retain(|existing| !contains_span(cue, *existing));
+                    spans.push(cue);
+                }
+            }
+        }
+        spans.sort_by_key(|span| (span.row, span.start_col, span.end_col));
+        spans.dedup();
+        spans
+    }
+
     fn selection_range(&self) -> Option<SelectionRange> {
         let (start, end) = self.selection_bounds()?;
         Some(SelectionRange {
@@ -664,6 +728,7 @@ impl TerminalView {
             origin_y,
             self.metrics,
             selection,
+            &self.cue_spans,
             force_redraw,
             damage,
         )
@@ -727,6 +792,12 @@ impl TerminalView {
 
         Some(text)
     }
+}
+
+fn contains_span(container: CueSpan, contained: CueSpan) -> bool {
+    container.row == contained.row
+        && container.start_col <= contained.start_col
+        && container.end_col >= contained.end_col
 }
 
 fn drain_pty_output(
@@ -999,6 +1070,50 @@ mod tests {
                 line: Some(9),
             }))
         );
+    }
+
+    #[test]
+    fn reference_lookup_returns_http_osc8_url() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(
+            b"\x1b]8;;https://example.com/path\x1b\\link\x1b]8;;\x1b\\",
+            true,
+        );
+
+        assert_eq!(
+            view.reference_at(0, 0, Path::new("/repo")),
+            Some(ReferenceTarget::Url("https://example.com/path".to_string()))
+        );
+    }
+
+    #[test]
+    fn ctrl_cues_include_osc8_and_fallback_reference_spans() {
+        let mut view = test_view_with_size(40, 3);
+
+        view.process(
+            b"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\ src/lib.rs:9",
+            true,
+        );
+
+        assert!(view.set_reference_cues_enabled(true, Path::new("/repo")));
+        assert_eq!(
+            view.cue_spans,
+            vec![
+                CueSpan {
+                    row: 0,
+                    start_col: 0,
+                    end_col: 4,
+                },
+                CueSpan {
+                    row: 0,
+                    start_col: 5,
+                    end_col: 17,
+                },
+            ]
+        );
+        assert!(view.set_reference_cues_enabled(false, Path::new("/repo")));
+        assert!(view.cue_spans.is_empty());
     }
 
     #[test]
