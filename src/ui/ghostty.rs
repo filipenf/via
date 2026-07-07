@@ -273,6 +273,17 @@ impl AppPane {
         }
     }
 
+    fn handle_modifiers_changed(
+        &mut self,
+        modifiers: Modifiers,
+        working_directory: &Path,
+    ) -> PaneEventOutcome {
+        match self {
+            Self::Terminal(pane) => pane.handle_modifiers_changed(modifiers, working_directory),
+            Self::Acp(_) => PaneEventOutcome::default(),
+        }
+    }
+
     fn drain_output(&mut self) -> bool {
         match self {
             Self::Terminal(pane) => pane.drain_output(),
@@ -1392,7 +1403,11 @@ impl WinitGhosttyApp {
     fn is_reference_navigation_command(command: &Option<PaneCommand>) -> bool {
         matches!(
             command,
-            Some(PaneCommand::OpenRequested { .. } | PaneCommand::SymbolOpenRequested { .. })
+            Some(
+                PaneCommand::OpenRequested { .. }
+                    | PaneCommand::SymbolOpenRequested { .. }
+                    | PaneCommand::UrlOpenRequested { .. },
+            )
         )
     }
 
@@ -1438,6 +1453,9 @@ impl WinitGhosttyApp {
                     self.focus_nvim_after_reference_navigation();
                     self.events
                         .try_send(Event::Ui(UiEvent::SymbolOpenRequested { symbol }));
+                }
+                PaneCommand::UrlOpenRequested { url } => {
+                    open_url_in_browser(&url);
                 }
                 PaneCommand::AgentPromptSubmitted { text } => {
                     let agent_id = self.panes.get(self.active_pane).and_then(AppPane::agent_id);
@@ -1871,6 +1889,33 @@ impl WinitGhosttyApp {
     }
 }
 
+fn open_url_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "windows")]
+    let program = "rundll32.exe";
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let program = "xdg-open";
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new(program);
+        command.args(["url.dll,FileProtocolHandler", url]);
+        command
+    };
+
+    #[cfg(not(target_os = "windows"))]
+    let mut command = {
+        let mut command = std::process::Command::new(program);
+        command.arg(url);
+        command
+    };
+
+    if let Err(error) = command.spawn() {
+        tracing::warn!(%error, %url, "failed to open url in system browser");
+    }
+}
+
 impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
@@ -1927,6 +1972,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
                     alt: state.alt_key(),
                     super_key: state.super_key(),
                 };
+                self.handle_modifiers_changed();
                 Ok(())
             }
             WindowEvent::Ime(Ime::Commit(text)) => self.handle_text_commit(&text),
@@ -1978,6 +2024,33 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
         } else {
             event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
         }
+    }
+}
+
+impl WinitGhosttyApp {
+    fn handle_modifiers_changed(&mut self) {
+        let mut dirty = false;
+        let mut force_redraw = false;
+
+        if self.review_active {
+            if let Some(review_pane) = &mut self.review_pane {
+                let outcome = review_pane
+                    .handle_modifiers_changed(self.modifiers, &self.config.working_directory);
+                self.apply_pane_outcome(outcome);
+            } else {
+                self.review_active = false;
+            }
+            return;
+        }
+
+        for pane in &mut self.panes {
+            let outcome =
+                pane.handle_modifiers_changed(self.modifiers, &self.config.working_directory);
+            dirty |= outcome.dirty;
+            force_redraw |= outcome.force_redraw;
+        }
+        self.dirty |= dirty;
+        self.force_redraw |= force_redraw;
     }
 }
 
@@ -2120,7 +2193,7 @@ mod tests {
     use layout::PaneRect;
     use links::{
         LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks,
-        reference_target_from_row,
+        reference_target_from_row, reference_target_from_uri,
     };
 
     #[test]
@@ -2721,6 +2794,16 @@ mod tests {
     fn ignores_non_file_uris() {
         assert!(
             file_target_from_uri("https://example.com/src/main.rs", Path::new("/repo")).is_none()
+        );
+    }
+
+    #[test]
+    fn converts_http_uri_to_url_target() {
+        assert_eq!(
+            reference_target_from_uri("https://example.com/src/main.rs", Path::new("/repo")),
+            Some(ReferenceTarget::Url(
+                "https://example.com/src/main.rs".to_string()
+            ))
         );
     }
 

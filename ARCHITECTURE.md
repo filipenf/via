@@ -9,8 +9,9 @@ injection.
 ## High-level goals (from the original brief)
 
 - Unified environment: one programmatically controlled window with split panes.
-- Semantic navigation: OSC 8 hyperlinks let you click file paths / symbols in
-  agent output and instantly focus the right location in Neovim.
+- Semantic navigation: OSC 8 hyperlinks and scanned references let you Ctrl-click
+  file paths / symbols in agent output and instantly focus the right location in
+  Neovim; external OSC 8 hyperlinks open in the system browser.
 - Shared context without manual shuffling: explicit buffer/selection/diagnostics
   hand-off from editor to agent (and back via links + review flows).
 - Low overhead: the coordination layer should be invisible once you're in flow.
@@ -102,9 +103,9 @@ Major submodules:
   All the math that keeps the editor at ≥80 columns and respects the agent's
   `min:max` pane width preference.
 - `pane_controller.rs` + `pane.rs`: wraps a `TerminalPane` (the libghostty
-  surface), handles mouse (shift-click for OSC 8, drag for selection, wheel),
-  key forwarding, alt-screen detection for paging behavior, and review pane
-  special cases.
+  surface), handles mouse (Ctrl-held reference cues, Ctrl-click for OSC 8 /
+  scanned references, drag for selection, wheel), key forwarding, alt-screen
+  detection for paging behavior, and review pane special cases.
 - `links.rs`: the OSC 8 / "reference target" scanner.
   `reference_target_from_row` and URI forms turn `src/main.rs:42` or
   `` `Foo::bar` `` or `symbol://...` into `FileTarget` or `Symbol` that the
@@ -123,8 +124,10 @@ Layout modes (Alt+1/2/Shift variants + Alt+Shift+3 for split direction) live in
 the `WinitGhosttyApp`. The UI also owns an optional review pane (either a `nvim`
 review command or the `hunk` tool).
 
-Mouse handling for references ultimately emits `PaneCommand::OpenRequested` /
-`SymbolOpenRequested` which the mediator turns into Neovim RPC + focus commands.
+Mouse handling for references ultimately emits `PaneCommand::OpenRequested`,
+`SymbolOpenRequested`, or URL-open commands. File and symbol commands route
+through the mediator to Neovim RPC + focus commands; external URLs launch in the
+system browser without changing Neovim focus.
 
 ### Agent side: Normal mode (PTY) vs ACP mode (src/acp.rs + mediator + pty.rs)
 
@@ -300,9 +303,11 @@ projects them into the detected agent family's skill roots.
    focus-after-reflow. These run on every resize and on navigation that changes
    split/max state. Bad math = jank or collapsed panes.
 2. Link/reference scanning (`src/ui/ghostty/links.rs`):
-   `reference_target_from_row` (and the URI variant) is conceptually per-row of
-   agent output. It must be fast even when the agent dumps hundreds of lines
-   containing paths and `` `symbols` ``.
+    `reference_target_from_row` (and the URI variant) is conceptually per-row of
+    agent output. It must be fast even when the agent dumps hundreds of lines
+   containing paths and `` `symbols` ``. Rendering only scans visible agent rows
+   while Ctrl is held, so clickable cues have no steady-state cost during normal
+   output streaming.
 
 We use Criterion for these (see `benches/`) so that changes have a regression
 signal before they land.

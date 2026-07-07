@@ -31,11 +31,14 @@ claude-code and crush.
 
 ### Agent to Neovim
 
-- Shift+click on a filename to open that file in Neovim and focus the Neovim
-  pane (enter fullscreen Neovim if the agent was fullscreen; otherwise keep the
-  split)
-- Shift+click on a symbol to open the symbol search pane in Neovim with the same
-  focus behavior
+- Hold Ctrl in the agent pane to highlight clickable filenames, symbols, and
+  OSC 8 hyperlinks.
+- Ctrl+click on a filename to open that file in Neovim and focus the Neovim pane
+  (enter fullscreen Neovim if the agent was fullscreen; otherwise keep the
+  split).
+- Ctrl+click on a symbol to open the symbol search pane in Neovim with the same
+  focus behavior.
+- Ctrl+click on an external OSC 8 hyperlink to open it in the system browser.
 
 ## Multi-agent orchestration
 

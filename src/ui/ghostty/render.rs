@@ -34,6 +34,15 @@ pub(super) struct SelectionRange {
     pub(super) end_col: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CueSpan {
+    pub(super) row: usize,
+    pub(super) start_col: usize,
+    pub(super) end_col: usize,
+}
+
+const CUE_UNDERLINE_COLOR: u32 = 0x83a598;
+
 pub(super) fn pane_focus_border_color(active: bool, theme: &TerminalTheme) -> u32 {
     if active {
         lerp_color(theme.foreground, theme.cursor, 96)
@@ -153,6 +162,7 @@ pub(super) fn draw_screen(
     origin_y: usize,
     metrics: TerminalMetrics,
     selection: Option<SelectionRange>,
+    cue_spans: &[CueSpan],
     force_redraw: bool,
     damage: &mut Vec<DamageRect>,
 ) -> bool {
@@ -245,6 +255,7 @@ pub(super) fn draw_screen(
         }
 
         if row_dirty {
+            draw_cue_spans_for_row(buffer, width, height, origin_x, y, metrics, cue_spans, row);
             let _ = row_ref.set_dirty(false);
         }
         row += 1;
@@ -292,6 +303,33 @@ pub(super) fn draw_screen(
 
     let _ = snapshot.set_dirty(Dirty::Clean);
     true
+}
+
+fn draw_cue_spans_for_row(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    origin_x: usize,
+    row_y: usize,
+    metrics: TerminalMetrics,
+    cue_spans: &[CueSpan],
+    row: usize,
+) {
+    for span in cue_spans.iter().filter(|span| span.row == row) {
+        if span.end_col <= span.start_col {
+            continue;
+        }
+        draw_rect(
+            buffer,
+            width,
+            height,
+            origin_x + span.start_col * metrics.cell_width,
+            row_y + metrics.cell_height.saturating_sub(2),
+            (span.end_col - span.start_col) * metrics.cell_width,
+            2.min(metrics.cell_height),
+            CUE_UNDERLINE_COLOR,
+        );
+    }
 }
 
 pub(super) fn draw_ratatui_buffer(
