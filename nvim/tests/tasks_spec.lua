@@ -9,6 +9,12 @@ local I = tasks._internal
 -- parse_row
 -- ---------------------------------------------------------------------------
 
+t.it("parse_row: valid row with via: prefix", function()
+  local parsed, err = I.parse_row("via:t1   queued   agent   Hello world")
+  t.is_nil(err)
+  t.eq({ id = "t1", status = "queued", assignee = "agent", title = "Hello world" }, parsed)
+end)
+
 t.it("parse_row: valid row", function()
   local parsed, err = I.parse_row("t1   queued   agent   Hello world")
   t.is_nil(err)
@@ -59,7 +65,23 @@ end)
 -- format_row + round-trip
 -- ---------------------------------------------------------------------------
 
-t.it("format_row: round-trips through parse_row", function()
+t.it("format_row: prefixes task id with via:", function()
+  local row = I.format_row({ id = "t1", status = "queued", assignee = "agent", title = "Title" })
+  t.contains(row, "via:t1")
+end)
+
+t.it("task_id_on_line: returns id only when cursor is on the id column", function()
+  local line = I.format_row({ id = "t1", status = "queued", assignee = "agent", title = "Title" })
+  t.eq("t1", I.task_id_on_line(line, 3))
+  t.is_nil(I.task_id_on_line(line, #line - 1))
+end)
+
+t.it("parse_task_id: strips via: prefix", function()
+  t.eq("phase2-cli", I.parse_task_id("via:phase2-cli"))
+  t.eq("t1", I.parse_task_id("t1"))
+end)
+
+t.it("format_row: round-trips through parse_row (legacy bare id)", function()
   local task = { id = "t1", status = "in_progress", assignee = "coder", title = "Do the thing" }
   local parsed = I.parse_row(I.format_row(task))
   t.eq(task, parsed)

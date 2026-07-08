@@ -64,6 +64,12 @@ silently dropped. Surface unknown IDs as diagnostics, not silent skips.
 
 ## Rust
 
+### Module layout
+
+- Define types (`struct`, `enum`, and their `impl` blocks) at the top of the
+  file: public items first, then `pub(super)` / crate-private, then module-private
+  helpers. Functions and free helpers follow the type definitions.
+
 ### Environment variables in tests
 
 - `std::env::set_var` / `remove_var` are process-global and unsafe to call from

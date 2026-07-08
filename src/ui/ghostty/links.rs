@@ -10,161 +10,11 @@ pub enum ReferenceTarget {
     Url(String),
 }
 
-pub fn reference_target_from_row(
-    row: &str,
-    column: usize,
-    working_directory: &Path,
-) -> Option<ReferenceTarget> {
-    reference_spans_from_row(row, working_directory)
-        .into_iter()
-        .find(|span| column >= span.start && column < span.end)
-        .map(|span| span.target)
-}
-
-pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<ReferenceSpan> {
-    let mut spans: Vec<ReferenceSpan> = file_reference_spans(row, working_directory)
-        .into_iter()
-        .map(|span| ReferenceSpan {
-            start: span.start,
-            end: span.end,
-            target: ReferenceTarget::File(span.target),
-        })
-        .collect();
-
-    spans.extend(
-        symbol_reference_spans(row)
-            .into_iter()
-            .map(|span| ReferenceSpan {
-                start: span.start,
-                end: span.end,
-                target: ReferenceTarget::Symbol(span.symbol),
-            }),
-    );
-
-    spans
-}
-
 #[derive(Debug)]
 pub struct ReferenceSpan {
     pub start: usize,
     pub end: usize,
     pub target: ReferenceTarget,
-}
-
-fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
-    let chars: Vec<char> = row.chars().collect();
-    let mut spans = Vec::new();
-    let mut index = 0;
-
-    while index < chars.len() {
-        while index < chars.len() && !is_file_reference_char(chars[index]) {
-            index += 1;
-        }
-
-        let start = index;
-
-        while index < chars.len() && is_file_reference_char(chars[index]) {
-            index += 1;
-        }
-
-        if start == index {
-            continue;
-        }
-
-        let raw_slice = &chars[start..index];
-        let raw_collected: String = raw_slice.iter().collect();
-
-        let (token_start, token_end, token) = if let Some((n_start, n_end, narrowed)) =
-            narrow_call_wrapped_file_path(&raw_collected)
-        {
-            if looks_like_file_reference(&narrowed) {
-                (n_start, n_end, narrowed)
-            } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
-                (ts, te, t)
-            } else {
-                continue;
-            }
-        } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
-            (ts, te, t)
-        } else {
-            continue;
-        };
-
-        if !looks_like_file_reference(&token) {
-            continue;
-        }
-
-        let target = FileTarget::parse(&token, working_directory);
-
-        spans.push(FileReferenceSpan {
-            start: start + token_start,
-            end: start + token_end,
-            target,
-        });
-    }
-
-    spans
-}
-
-#[derive(Debug)]
-struct FileReferenceSpan {
-    start: usize,
-    end: usize,
-    target: FileTarget,
-}
-
-fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
-    let chars: Vec<char> = row.chars().collect();
-    let mut spans = Vec::new();
-    let mut index = 0;
-
-    while index < chars.len() {
-        while index < chars.len() && !is_symbol_char(chars[index]) {
-            index += 1;
-        }
-
-        let start = index;
-
-        while index < chars.len() && is_symbol_char(chars[index]) {
-            index += 1;
-        }
-
-        if start == index {
-            continue;
-        }
-
-        let token: String = chars[start..index].iter().collect();
-        let token = trim_symbol_token(&token);
-
-        if !looks_like_scanned_symbol(&token) {
-            continue;
-        }
-
-        let leading_trim = chars[start..index]
-            .iter()
-            .take_while(|ch| is_symbol_wrapper(**ch))
-            .count();
-        let trailing_trim = chars[start..index]
-            .iter()
-            .rev()
-            .take_while(|ch| is_symbol_wrapper(**ch))
-            .count();
-
-        spans.push(SymbolReferenceSpan {
-            start: start + leading_trim,
-            end: index.saturating_sub(trailing_trim),
-            symbol: token,
-        });
-    }
-
-    spans
-}
-
-#[derive(Debug)]
-struct SymbolReferenceSpan {
-    start: usize,
-    end: usize,
-    symbol: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -182,6 +32,64 @@ pub(super) struct Osc8Tracker {
     row: usize,
     column: usize,
     index: usize,
+}
+
+#[derive(Debug)]
+struct FileReferenceSpan {
+    start: usize,
+    end: usize,
+    target: FileTarget,
+}
+
+#[derive(Debug)]
+struct SymbolReferenceSpan {
+    start: usize,
+    end: usize,
+    symbol: String,
+}
+
+#[derive(Debug)]
+struct UrlReferenceSpan {
+    start: usize,
+    end: usize,
+    url: String,
+}
+
+fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
+    let mut numbers = [1usize; 2];
+    let mut index = 0usize;
+    let mut value = 0usize;
+    let mut has_value = false;
+
+    for byte in params.iter().copied() {
+        match byte {
+            b'?' => {}
+            b'0'..=b'9' => {
+                has_value = true;
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add((byte - b'0') as usize);
+            }
+            b';' => {
+                if index < numbers.len() {
+                    numbers[index] = if has_value { value } else { 1 };
+                }
+                index += 1;
+                value = 0;
+                has_value = false;
+                if index >= numbers.len() {
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if index < numbers.len() {
+        numbers[index] = if has_value { value } else { 1 };
+    }
+
+    (numbers[0], numbers[1])
 }
 
 impl Osc8Tracker {
@@ -421,6 +329,229 @@ impl Osc8Tracker {
         }
     }
 }
+pub fn reference_target_from_row(
+    row: &str,
+    column: usize,
+    working_directory: &Path,
+) -> Option<ReferenceTarget> {
+    reference_spans_from_row(row, working_directory)
+        .into_iter()
+        .find(|span| column >= span.start && column < span.end)
+        .map(|span| span.target)
+}
+
+pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<ReferenceSpan> {
+    let mut spans: Vec<ReferenceSpan> = url_reference_spans(row)
+        .into_iter()
+        .map(|span| ReferenceSpan {
+            start: span.start,
+            end: span.end,
+            target: ReferenceTarget::Url(span.url),
+        })
+        .collect();
+
+    spans.extend(
+        file_reference_spans(row, working_directory)
+            .into_iter()
+            .map(|span| ReferenceSpan {
+                start: span.start,
+                end: span.end,
+                target: ReferenceTarget::File(span.target),
+            }),
+    );
+
+    spans.extend(
+        symbol_reference_spans(row)
+            .into_iter()
+            .map(|span| ReferenceSpan {
+                start: span.start,
+                end: span.end,
+                target: ReferenceTarget::Symbol(span.symbol),
+            }),
+    );
+
+    spans
+}
+
+fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        while index < chars.len() && !is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        let start = index;
+
+        while index < chars.len() && is_file_reference_char(chars[index]) {
+            index += 1;
+        }
+
+        if start == index {
+            continue;
+        }
+
+        let raw_slice = &chars[start..index];
+        let raw_collected: String = raw_slice.iter().collect();
+
+        let (token_start, token_end, token) = if let Some((n_start, n_end, narrowed)) =
+            narrow_call_wrapped_file_path(&raw_collected)
+        {
+            if looks_like_file_reference(&narrowed) {
+                (n_start, n_end, narrowed)
+            } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
+                (ts, te, t)
+            } else {
+                continue;
+            }
+        } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
+            (ts, te, t)
+        } else {
+            continue;
+        };
+
+        if !looks_like_file_reference(&token) {
+            continue;
+        }
+
+        if is_http_url(&token) {
+            continue;
+        }
+
+        let target = FileTarget::parse(&token, working_directory);
+
+        spans.push(FileReferenceSpan {
+            start: start + token_start,
+            end: start + token_end,
+            target,
+        });
+    }
+
+    spans
+}
+
+fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0;
+
+    while index < chars.len() {
+        while index < chars.len() && !is_symbol_char(chars[index]) {
+            index += 1;
+        }
+
+        let start = index;
+
+        while index < chars.len() && is_symbol_char(chars[index]) {
+            index += 1;
+        }
+
+        if start == index {
+            continue;
+        }
+
+        let raw = &chars[start..index];
+        let (rel_start, rel_end) = symbol_trim_offsets(raw);
+        if rel_start >= rel_end {
+            continue;
+        }
+        let token: String = raw[rel_start..rel_end].iter().collect();
+
+        if !looks_like_scanned_symbol(&token) {
+            continue;
+        }
+
+        spans.push(SymbolReferenceSpan {
+            start: start + rel_start,
+            end: start + rel_end,
+            symbol: token,
+        });
+    }
+
+    spans
+}
+
+fn url_reference_spans(row: &str) -> Vec<UrlReferenceSpan> {
+    let chars: Vec<char> = row.chars().collect();
+    let mut spans = Vec::new();
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        let Some(start) = http_scheme_char_index(&chars, index) else {
+            break;
+        };
+
+        let token_end = url_token_char_end(&chars, start);
+        let raw: String = chars[start..token_end].iter().collect();
+        let url = trim_url_trailing(&raw);
+        let end = start + url.chars().count();
+
+        if !url.is_empty() {
+            spans.push(UrlReferenceSpan {
+                start,
+                end,
+                url: url.to_string(),
+            });
+            index = end;
+        } else {
+            index = start.saturating_add(1);
+        }
+    }
+
+    spans
+}
+
+fn http_scheme_char_index(chars: &[char], from: usize) -> Option<usize> {
+    (from..chars.len()).find(|&i| {
+        starts_with_chars(chars, i, "https://") || starts_with_chars(chars, i, "http://")
+    })
+}
+
+fn starts_with_chars(chars: &[char], start: usize, prefix: &str) -> bool {
+    chars[start..]
+        .iter()
+        .copied()
+        .zip(prefix.chars())
+        .all(|(actual, expected)| actual == expected)
+        && chars.len().saturating_sub(start) >= prefix.chars().count()
+}
+
+fn url_token_char_end(chars: &[char], start: usize) -> usize {
+    let mut index = start;
+    while index < chars.len() {
+        let ch = chars[index];
+        if ch.is_whitespace() || is_url_delimiter(ch) {
+            break;
+        }
+        index += 1;
+    }
+    index
+}
+
+fn is_url_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+    )
+}
+
+fn trim_url_trailing(url: &str) -> &str {
+    let url = url.trim_end_matches([',', ';', '!', ')', ']', '}', '"', '\'']);
+
+    if url.ends_with('.')
+        && !url.ends_with(".html")
+        && !url.ends_with(".htm")
+        && !url.ends_with(".json")
+        && !url.ends_with(".md")
+        && !url.ends_with(".rs")
+    {
+        &url[..url.len() - '.'.len_utf8()]
+    } else {
+        url
+    }
+}
 
 #[cfg(test)]
 pub(super) fn parse_vt_hyperlinks(bytes: &[u8], size: TerminalSize) -> Vec<Vec<LinkSpan>> {
@@ -428,43 +559,6 @@ pub(super) fn parse_vt_hyperlinks(bytes: &[u8], size: TerminalSize) -> Vec<Vec<L
 
     parser.process(bytes);
     parser.rows
-}
-
-fn first_two_csi_numbers(params: &[u8]) -> (usize, usize) {
-    let mut numbers = [1usize; 2];
-    let mut index = 0usize;
-    let mut value = 0usize;
-    let mut has_value = false;
-
-    for byte in params.iter().copied() {
-        match byte {
-            b'?' => {}
-            b'0'..=b'9' => {
-                has_value = true;
-                value = value
-                    .saturating_mul(10)
-                    .saturating_add((byte - b'0') as usize);
-            }
-            b';' => {
-                if index < numbers.len() {
-                    numbers[index] = if has_value { value } else { 1 };
-                }
-                index += 1;
-                value = 0;
-                has_value = false;
-                if index >= numbers.len() {
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if index < numbers.len() {
-        numbers[index] = if has_value { value } else { 1 };
-    }
-
-    (numbers[0], numbers[1])
 }
 
 pub fn reference_target_from_uri(uri: &str, working_directory: &Path) -> Option<ReferenceTarget> {
@@ -628,11 +722,26 @@ fn is_file_reference_char(ch: char) -> bool {
         )
 }
 
-fn trim_symbol_token(token: &str) -> String {
-    token
-        .trim_matches(is_symbol_wrapper)
-        .trim_matches('.')
-        .to_string()
+/// Trim offsets for scanned symbol tokens: wrappers first, then `.`.
+/// Span coordinates and the returned symbol string must use the same offsets.
+fn symbol_trim_offsets(chars: &[char]) -> (usize, usize) {
+    let mut start = 0;
+    let mut end = chars.len();
+
+    while start < end && is_symbol_wrapper(chars[start]) {
+        start += 1;
+    }
+    while end > start && is_symbol_wrapper(chars[end - 1]) {
+        end -= 1;
+    }
+    while start < end && chars[start] == '.' {
+        start += 1;
+    }
+    while end > start && chars[end - 1] == '.' {
+        end -= 1;
+    }
+
+    (start, end)
 }
 
 fn looks_like_symbol(token: &str) -> bool {
@@ -672,6 +781,63 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    fn char_column(row: &str, needle: &str) -> usize {
+        let byte = row.find(needle).expect("needle in row");
+        row[..byte].chars().count()
+    }
+
+    #[test]
+    fn resolves_http_url_from_row() {
+        let row = "see https://example.com/docs/page.html for details";
+        let col = char_column(row, "https://") + 4;
+
+        assert_eq!(
+            reference_target_from_row(row, col, Path::new("/repo")),
+            Some(ReferenceTarget::Url(
+                "https://example.com/docs/page.html".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn does_not_treat_http_url_as_file_reference() {
+        let row = "see https://example.com/page.html for details";
+        let col = char_column(row, "page");
+
+        assert!(matches!(
+            reference_target_from_row(row, col, Path::new("/repo")),
+            Some(ReferenceTarget::Url(url)) if url == "https://example.com/page.html"
+        ));
+    }
+
+    #[test]
+    fn resolves_http_url_after_multibyte_utf8_prefix() {
+        let row = "日本語 https://example.com/path 後";
+        let col = char_column(row, "example");
+
+        assert_eq!(
+            reference_target_from_row(row, col, Path::new("/repo")),
+            Some(ReferenceTarget::Url("https://example.com/path".to_string()))
+        );
+    }
+
+    #[test]
+    fn scanned_reference_spans_include_http_urls() {
+        let spans = reference_spans_from_row(
+            "docs at https://example.com/a.rs and src/main.rs",
+            Path::new("/repo"),
+        );
+
+        assert!(spans.iter().any(|span| matches!(
+            &span.target,
+            ReferenceTarget::Url(url) if url == "https://example.com/a.rs"
+        )));
+        assert!(spans.iter().any(|span| matches!(
+            &span.target,
+            ReferenceTarget::File(target) if target.path.ends_with("src/main.rs")
+        )));
+    }
 
     #[test]
     fn resolves_file_reference_from_row() {
@@ -728,6 +894,27 @@ mod tests {
         let target = reference_target_from_row("call (`Foo::bar`)", 8, Path::new("/repo")).unwrap();
 
         assert_eq!(target, ReferenceTarget::Symbol("Foo::bar".to_string()));
+    }
+
+    #[test]
+    fn symbol_span_excludes_trailing_and_leading_dots() {
+        let row = "see Foo::bar. and .Baz::qux here";
+        let spans = reference_spans_from_row(row, Path::new("/repo"));
+        let symbols: Vec<_> = spans
+            .iter()
+            .filter_map(|span| match &span.target {
+                ReferenceTarget::Symbol(symbol) => Some((span.start, span.end, symbol.as_str())),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            symbols,
+            vec![(4, 12, "Foo::bar"), (19, 27, "Baz::qux")]
+        );
+        let chars: Vec<char> = row.chars().collect();
+        assert_eq!(&chars[4..12], &['F', 'o', 'o', ':', ':', 'b', 'a', 'r'][..]);
+        assert_eq!(&chars[19..27], &['B', 'a', 'z', ':', ':', 'q', 'u', 'x'][..]);
     }
 
     #[test]
