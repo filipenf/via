@@ -24,18 +24,27 @@ local function drop(p)
   end
 end
 
-local function systemlist(cmd)
-  local out = vim.fn.systemlist(cmd)
-  if vim.v.shell_error ~= 0 then
+local function systemlist(cmd, cwd)
+  local result = vim.system(cmd, { cwd = cwd, text = true }):wait()
+  if result.code ~= 0 then
     return {}
   end
   local cleaned = {}
-  for _, item in ipairs(out) do
+  for item in (result.stdout or ""):gmatch("[^\n]+") do
     if item ~= "" then
       table.insert(cleaned, item)
     end
   end
   return cleaned
+end
+
+local function system_ok(cmd, cwd)
+  return vim.system(cmd, { cwd = cwd }):wait().code == 0
+end
+
+local function first_system_line(cmd)
+  local out = systemlist(cmd)
+  return out[1]
 end
 
 local function path_set(paths)
@@ -59,20 +68,23 @@ local function filter_by_set(candidates, set)
   return matched
 end
 
-local function vcs_kind()
-  if vim.fn.isdirectory(".jj") == 1 then
-    return "jj"
+local function vcs_root()
+  local jj_root = first_system_line({ "jj", "root", "--no-pager" })
+  if jj_root then
+    return "jj", jj_root
   end
-  if vim.fn.isdirectory(".git") == 1 or vim.fn.filereadable(".git") == 1 then
-    return "git"
+
+  local git_root = first_system_line({ "git", "rev-parse", "--show-toplevel" })
+  if git_root then
+    return "git", git_root
   end
-  return nil
+
+  return nil, nil
 end
 
-local function git_base_ref()
+local function git_base_ref(root)
   for _, ref in ipairs({ "main", "master", "@{upstream}" }) do
-    vim.fn.system({ "git", "rev-parse", "--verify", ref })
-    if vim.v.shell_error == 0 then
+    if system_ok({ "git", "rev-parse", "--verify", ref }, root) then
       return ref
     end
   end
@@ -96,22 +108,22 @@ local function parse_git_porcelain(lines)
   return paths
 end
 
-local function working_tree_paths(kind)
+local function working_tree_paths(kind, root)
   if kind == "jj" then
-    return systemlist({ "jj", "diff", "--name-only", "--no-pager" })
+    return systemlist({ "jj", "diff", "--name-only", "--no-pager" }, root)
   end
-  return parse_git_porcelain(systemlist({ "git", "status", "--porcelain" }))
+  return parse_git_porcelain(systemlist({ "git", "status", "--porcelain" }, root))
 end
 
-local function branch_changed_paths(kind)
+local function branch_changed_paths(kind, root)
   if kind == "jj" then
-    return systemlist({ "jj", "diff", "--from", "trunk()", "--name-only", "--no-pager" })
+    return systemlist({ "jj", "diff", "--from", "trunk()", "--name-only", "--no-pager" }, root)
   end
-  local base = git_base_ref()
+  local base = git_base_ref(root)
   if not base then
     return {}
   end
-  return systemlist({ "git", "diff", "--name-only", base .. "...HEAD" })
+  return systemlist({ "git", "diff", "--name-only", base .. "...HEAD" }, root)
 end
 
 local function open_buffer_matches(fname)
@@ -198,9 +210,9 @@ local function resolve_and_open()
     return
   end
 
-  local kind = vcs_kind()
+  local kind, root = vcs_root()
   if kind then
-    local wt = filter_by_set(candidates, path_set(working_tree_paths(kind)))
+    local wt = filter_by_set(candidates, path_set(working_tree_paths(kind, root)))
     if #wt == 1 then
       drop(wt[1])
       return
@@ -208,7 +220,7 @@ local function resolve_and_open()
     if #wt > 1 then
       candidates = wt
     else
-      local branch = filter_by_set(candidates, path_set(branch_changed_paths(kind)))
+      local branch = filter_by_set(candidates, path_set(branch_changed_paths(kind, root)))
       if #branch == 1 then
         drop(branch[1])
         return

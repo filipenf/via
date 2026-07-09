@@ -13,6 +13,7 @@ mod mediator;
 mod nvim;
 mod plugin;
 mod pty;
+mod reference_index;
 mod session;
 mod task_delivery;
 mod task_store;

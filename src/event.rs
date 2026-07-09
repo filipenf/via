@@ -117,6 +117,12 @@ pub enum UiCommand {
     /// Task transitioned to `review`; surfaced to the UI when the review
     /// backend is not the Neovim diff (e.g. hunk pane) so the human can see the gate.
     ReviewGateOpened { task_id: String, title: String },
+    /// Updated file reference index for Ctrl-held cue scoring.
+    FileIndexChanged {
+        buffers: Vec<std::path::PathBuf>,
+        vcs_working_tree: Vec<std::path::PathBuf>,
+        vcs_branch: Vec<std::path::PathBuf>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -172,6 +178,12 @@ pub enum EditorEvent {
     /// A task was deleted from the active board.
     TaskDeleted {
         id: String,
+    },
+    /// Snapshot of open buffers + VCS paths for Ctrl+click cue scoring.
+    FileIndexChanged {
+        buffers: Vec<PathBuf>,
+        vcs_working_tree: Vec<PathBuf>,
+        vcs_branch: Vec<PathBuf>,
     },
 }
 

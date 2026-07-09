@@ -2,10 +2,11 @@ local socket = vim.g.via_editor_socket
 local lsp_bridge_socket = vim.g.via_lsp_bridge_socket
 local uv = vim.uv or vim.loop
 local pending_selection_update = false
+local pending_file_index_update = false
 local lsp_pipe = nil
 local clients = {}
-local next_request_id = 0
-local pending_requests = {}
+local last_file_index_payload = nil
+local handle_lsp_request
 
 local function encode(payload)
   if vim.json and vim.json.encode then
@@ -122,6 +123,140 @@ local function send_diagnostics()
   })
 end
 
+local function systemlist(cmd, cwd)
+  local result = vim.system(cmd, { cwd = cwd, text = true }):wait()
+  if result.code ~= 0 then
+    return {}
+  end
+  local cleaned = {}
+  for item in (result.stdout or ""):gmatch("[^\n]+") do
+    if item ~= "" then
+      table.insert(cleaned, item)
+    end
+  end
+  return cleaned
+end
+
+local function system_ok(cmd, cwd)
+  return vim.system(cmd, { cwd = cwd }):wait().code == 0
+end
+
+local function first_system_line(cmd)
+  local out = systemlist(cmd)
+  return out[1]
+end
+
+local function vcs_root()
+  local jj_root = first_system_line({ "jj", "root", "--no-pager" })
+  if jj_root then
+    return "jj", jj_root
+  end
+
+  local git_root = first_system_line({ "git", "rev-parse", "--show-toplevel" })
+  if git_root then
+    return "git", git_root
+  end
+
+  return nil, nil
+end
+
+local function git_base_ref(root)
+  for _, ref in ipairs({ "main", "master", "@{upstream}" }) do
+    if system_ok({ "git", "rev-parse", "--verify", ref }, root) then
+      return ref
+    end
+  end
+  return nil
+end
+
+local function parse_git_porcelain(lines)
+  local paths = {}
+  for _, entry in ipairs(lines) do
+    local renamed = entry:match("^.. .* %-> (.+)$")
+    if renamed then
+      table.insert(paths, renamed)
+    else
+      local plain = entry:match("^.. (.+)$")
+      if plain then
+        table.insert(paths, plain)
+      end
+    end
+  end
+  return paths
+end
+
+local function working_tree_paths(kind, root)
+  if kind == "jj" then
+    return systemlist({ "jj", "diff", "--name-only", "--no-pager" }, root)
+  end
+  return parse_git_porcelain(systemlist({ "git", "status", "--porcelain" }, root))
+end
+
+local function branch_changed_paths(kind, root)
+  if kind == "jj" then
+    return systemlist({ "jj", "diff", "--from", "trunk()", "--name-only", "--no-pager" }, root)
+  end
+  local base = git_base_ref(root)
+  if not base then
+    return {}
+  end
+  return systemlist({ "git", "diff", "--name-only", base .. "...HEAD" }, root)
+end
+
+local function open_buffer_paths()
+  local paths = {}
+  local seen = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buflisted then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if name ~= "" and vim.bo[bufnr].buftype == "" then
+        local abs = vim.fn.fnamemodify(name, ":p")
+        if not seen[abs] then
+          seen[abs] = true
+          table.insert(paths, abs)
+        end
+      end
+    end
+  end
+  return paths
+end
+
+local function payload_equal(a, b)
+  if a == b then
+    return true
+  end
+  if type(a) ~= "table" or type(b) ~= "table" then
+    return false
+  end
+  return encode(a) == encode(b)
+end
+
+local function send_file_index()
+  local kind, root = vcs_root()
+  local payload = {
+    type = "file_index_changed",
+    buffers = open_buffer_paths(),
+    vcs_working_tree = kind and working_tree_paths(kind, root) or {},
+    vcs_branch = kind and branch_changed_paths(kind, root) or {},
+  }
+  if payload_equal(payload, last_file_index_payload) then
+    return
+  end
+  last_file_index_payload = payload
+  notify(payload)
+end
+
+local function schedule_file_index()
+  if pending_file_index_update then
+    return
+  end
+  pending_file_index_update = true
+  vim.defer_fn(function()
+    pending_file_index_update = false
+    send_file_index()
+  end, 150)
+end
+
 local function visual_mode()
   local mode = vim.api.nvim_get_mode().mode
 
@@ -218,13 +353,13 @@ end
 
 local function send_clients()
   local list = {}
-  for id, info in pairs(clients) do
+  for _, info in pairs(clients) do
     table.insert(list, info)
   end
   lsp_notify({ type = "lsp_clients", clients = list })
 end
 
-local function handle_lsp_request(msg)
+handle_lsp_request = function(msg)
   local req_id = msg.request_id
   local method = msg.method
   local params = msg.params or {}
@@ -240,7 +375,7 @@ local function handle_lsp_request(msg)
     lsp_notify({ type = "lsp_response", request_id = req_id, error = "no lsp client" })
     return
   end
-  local handler = function(err, result, _ctx, _config)
+  local handler = function(err, result)
     if err then
       lsp_notify({ type = "lsp_response", request_id = req_id, error = tostring(err) })
     else
@@ -259,7 +394,13 @@ vim.api.nvim_create_autocmd({ "FocusGained", "BufEnter" }, {
   group = group,
   callback = function()
     vim.cmd("silent! checktime")
+    schedule_file_index()
   end,
+})
+
+vim.api.nvim_create_autocmd({ "BufAdd", "BufDelete", "BufFilePost", "BufWritePost", "DirChanged", "FileChangedShellPost" }, {
+  group = group,
+  callback = schedule_file_index,
 })
 
 -- Diagnostics are still pushed automatically (useful for the agent to see errors/warnings)
@@ -307,11 +448,13 @@ vim.api.nvim_create_autocmd("LspDetach", {
   end,
 })
 
-vim.keymap.set({ "n", "v" }, "<leader>ab", "<cmd>ViaBufferSend<cr>", { desc = "Send current buffer or selection to agent" })
+vim.keymap.set({ "n", "v" }, "<leader>ab", "<cmd>ViaBufferSend<cr>",
+  { desc = "Send current buffer or selection to agent" })
 
 vim.schedule(function()
   -- Only send diagnostics on startup; buffer/selection context is now explicit via :ViaBufferSend
   send_diagnostics()
+  send_file_index()
   for _, client in ipairs(vim.lsp.get_clients()) do
     clients[client.id] = get_client_info(client)
   end

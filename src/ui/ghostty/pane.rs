@@ -20,8 +20,8 @@ use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
 use super::layout::PaneRect;
 use super::links::{
-    Osc8Tracker, ReferenceTarget, reference_spans_from_row, reference_target_from_row,
-    reference_target_from_uri,
+    Osc8Tracker, ReferenceContext, ReferenceTarget, reference_spans_from_row_ctx,
+    reference_target_from_row_ctx, reference_target_from_uri,
 };
 use super::render::{CueSpan, DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
 
@@ -290,18 +290,17 @@ impl TerminalPane {
         &mut self,
         row: usize,
         column: usize,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> Option<ReferenceTarget> {
-        self.view.reference_at(row, column, working_directory)
+        self.view.reference_at(row, column, ctx)
     }
 
     pub(super) fn set_reference_cues_enabled(
         &mut self,
         enabled: bool,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> bool {
-        self.view
-            .set_reference_cues_enabled(enabled, working_directory)
+        self.view.set_reference_cues_enabled(enabled, ctx)
     }
 
     pub(super) fn metrics(&self) -> TerminalMetrics {
@@ -550,9 +549,9 @@ impl TerminalView {
         had_selection
     }
 
-    fn set_reference_cues_enabled(&mut self, enabled: bool, working_directory: &Path) -> bool {
+    fn set_reference_cues_enabled(&mut self, enabled: bool, ctx: ReferenceContext<'_>) -> bool {
         let spans = if enabled {
-            self.visible_reference_spans(working_directory)
+            self.visible_reference_spans(ctx)
         } else {
             Vec::new()
         };
@@ -563,7 +562,7 @@ impl TerminalView {
         true
     }
 
-    fn visible_reference_spans(&mut self, working_directory: &Path) -> Vec<CueSpan> {
+    fn visible_reference_spans(&mut self, ctx: ReferenceContext<'_>) -> Vec<CueSpan> {
         let mut spans = Vec::new();
         for row in 0..self.size.rows as usize {
             for span in self
@@ -573,7 +572,7 @@ impl TerminalView {
                 .into_iter()
                 .flatten()
             {
-                if reference_target_from_uri(&span.uri, working_directory).is_some() {
+                if reference_target_from_uri(&span.uri, ctx.working_directory).is_some() {
                     spans.push(CueSpan {
                         row,
                         start_col: span.start,
@@ -585,7 +584,7 @@ impl TerminalView {
             let Some(row_text) = self.row_text(row) else {
                 continue;
             };
-            for span in reference_spans_from_row(&row_text, working_directory) {
+            for span in reference_spans_from_row_ctx(&row_text, ctx) {
                 let cue = CueSpan {
                     row,
                     start_col: span.start,
@@ -738,14 +737,14 @@ impl TerminalView {
         &mut self,
         row: usize,
         column: usize,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> Option<ReferenceTarget> {
-        if let Some(target) = self.hyperlink_target_at(row, column, working_directory) {
+        if let Some(target) = self.hyperlink_target_at(row, column, ctx.working_directory) {
             return Some(target);
         }
 
         let row_text = self.row_text(row)?;
-        reference_target_from_row(&row_text, column, working_directory)
+        reference_target_from_row_ctx(&row_text, column, ctx)
     }
 
     fn hyperlink_target_at(
@@ -1052,7 +1051,7 @@ mod tests {
         );
 
         assert_eq!(
-            view.reference_at(0, 2, Path::new("/repo")),
+            view.reference_at(0, 2, ReferenceContext::cwd_only(Path::new("/repo"))),
             Some(ReferenceTarget::Symbol("Foo::bar".to_string()))
         );
     }
@@ -1064,7 +1063,7 @@ mod tests {
         view.process(b"open src/lib.rs:9", true);
 
         assert_eq!(
-            view.reference_at(0, 6, Path::new("/repo")),
+            view.reference_at(0, 6, ReferenceContext::cwd_only(Path::new("/repo"))),
             Some(ReferenceTarget::File(FileTarget {
                 path: PathBuf::from("/repo/src/lib.rs"),
                 line: Some(9),
@@ -1083,7 +1082,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            view.reference_at(0, col, Path::new("/repo")),
+            view.reference_at(0, col, ReferenceContext::cwd_only(Path::new("/repo"))),
             Some(ReferenceTarget::Url("https://example.com/path".to_string()))
         );
     }
@@ -1098,7 +1097,7 @@ mod tests {
         );
 
         assert_eq!(
-            view.reference_at(0, 0, Path::new("/repo")),
+            view.reference_at(0, 0, ReferenceContext::cwd_only(Path::new("/repo"))),
             Some(ReferenceTarget::Url("https://example.com/path".to_string()))
         );
     }
@@ -1112,7 +1111,9 @@ mod tests {
             true,
         );
 
-        assert!(view.set_reference_cues_enabled(true, Path::new("/repo")));
+        assert!(
+            view.set_reference_cues_enabled(true, ReferenceContext::cwd_only(Path::new("/repo")))
+        );
         assert_eq!(
             view.cue_spans,
             vec![
@@ -1128,7 +1129,9 @@ mod tests {
                 },
             ]
         );
-        assert!(view.set_reference_cues_enabled(false, Path::new("/repo")));
+        assert!(
+            view.set_reference_cues_enabled(false, ReferenceContext::cwd_only(Path::new("/repo")))
+        );
         assert!(view.cue_spans.is_empty());
     }
 
