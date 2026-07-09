@@ -37,7 +37,7 @@ pub enum TaskCommand {
     Create {
         /// Task title.
         title: String,
-        /// Optional stable id (auto-generated when omitted).
+        /// Optional stable id (auto-generated 4-char opaque id when omitted).
         #[arg(long)]
         id: Option<String>,
         /// Initial assignee.
@@ -113,10 +113,13 @@ pub enum TaskBoardCommand {
         json: bool,
     },
     /// Create a board and switch to it.
+    ///
+    /// Everyday restart/list reuses an existing board; use this only when you
+    /// want a new board. `--id` is required so boards are named on purpose.
     New {
-        /// Board id (auto-generated when omitted).
+        /// Board id (required).
         #[arg(long)]
-        id: Option<String>,
+        id: String,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -247,11 +250,9 @@ fn run_board_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_board_new(id: Option<String>, title: Option<String>, json: bool) -> Result<()> {
+fn run_board_new(id: String, title: Option<String>, json: bool) -> Result<()> {
     let cwd = workspace_cwd()?;
     let workspace = workspace_for_cwd(&cwd)?;
-    let id =
-        id.unwrap_or_else(|| format!("board-{}-{}", crate::util::now_millis(), std::process::id()));
     let meta = create_board(&workspace, &id, title)?;
     set_active_board(&workspace, &meta.id)?;
 
@@ -280,10 +281,30 @@ fn run_list(json: bool, status: Option<TaskStatusArg>, assignee: Option<String>)
     };
     let tasks = list_tasks(&ctx.tasks_dir, &filter)?;
 
+    let (board_title, boards) = if ctx.workspace_id.is_empty() {
+        (None, Vec::new())
+    } else {
+        let cwd = workspace_cwd()?;
+        let workspace = workspace_for_cwd(&cwd)?;
+        let boards = list_boards(&workspace)?;
+        let board_title = boards
+            .iter()
+            .find(|board| board.id == ctx.board_id)
+            .and_then(|board| board.title.clone());
+        (board_title, boards)
+    };
+
     if json {
         let payload = serde_json::json!({
             "workspace_id": ctx.workspace_id,
             "board": ctx.board_id,
+            "board_title": board_title,
+            "boards": boards.iter().map(|board| {
+                serde_json::json!({
+                    "id": board.id,
+                    "title": board.title,
+                })
+            }).collect::<Vec<_>>(),
             "tasks": tasks,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -511,13 +532,18 @@ mod tests {
             Some(Command::Task {
                 command: TaskCommand::Board {
                     command: TaskBoardCommand::New {
-                        id: Some(id),
+                        id,
                         title: Some(title),
                         json: false,
                     },
                 },
             }) if id == "phase2" && title == "Phase 2"
         ));
+
+        assert!(
+            Cli::try_parse_from(["via", "task", "board", "new", "--title", "Phase 2"]).is_err(),
+            "board new requires --id"
+        );
 
         let cli = Cli::try_parse_from(["via", "task", "board", "use", "phase2"]).unwrap();
         assert!(matches!(

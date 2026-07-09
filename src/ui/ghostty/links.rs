@@ -908,13 +908,13 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(
-            symbols,
-            vec![(4, 12, "Foo::bar"), (19, 27, "Baz::qux")]
-        );
+        assert_eq!(symbols, vec![(4, 12, "Foo::bar"), (19, 27, "Baz::qux")]);
         let chars: Vec<char> = row.chars().collect();
         assert_eq!(&chars[4..12], &['F', 'o', 'o', ':', ':', 'b', 'a', 'r'][..]);
-        assert_eq!(&chars[19..27], &['B', 'a', 'z', ':', ':', 'q', 'u', 'x'][..]);
+        assert_eq!(
+            &chars[19..27],
+            &['B', 'a', 'z', ':', ':', 'q', 'u', 'x'][..]
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
-//! Durable workspace storage keyed by a stable hash of the working directory.
+//! Durable workspace storage keyed by a sanitized absolute working directory.
 //!
 //! Terminology:
 //! - **Instance** — ephemeral live via process (pid, sockets, agent bus). See [`crate::session`].
-//! - **Workspace** — durable project scope (hash of canonical `cwd`).
+//! - **Workspace** — durable project scope (sanitized canonical `cwd` path).
 //! - **Board** — a task board within a workspace; switch when changing work context.
 //!
 //! Layout under [`crate::config::via_data_dir`]:
@@ -17,6 +17,10 @@
 //!     meta.json
 //!     tasks/*.json
 //! ```
+//!
+//! Workspace ids are browsable path-derived names (e.g. `home_username_code_via`),
+//! not opaque hashes. Distinct absolute paths that sanitize to the same string would collide;
+//! that is accepted for now.
 
 use std::path::{Path, PathBuf};
 
@@ -61,6 +65,10 @@ pub struct BoardMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub created_at: u64,
+    /// Updated whenever the board becomes active (`via task board use` / `new`).
+    /// Used to restore the most recently used board when `active_board` is missing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_at: Option<u64>,
 }
 
 /// Resolved task-board location for CLI commands.
@@ -71,15 +79,19 @@ pub struct TasksContext {
     pub tasks_dir: PathBuf,
 }
 
-/// Stable 16-hex-char id from a canonical working directory (FNV-1a 64-bit).
+/// Stable workspace id from a canonical working directory (sanitized absolute path).
+/// `/home/username/code/via` → `home_username_code_via`.
 pub fn workspace_id(cwd: &Path) -> Result<String> {
     let canonical = cwd
         .canonicalize()
         .with_context(|| format!("resolve workspace cwd {}", cwd.display()))?;
-    Ok(format!(
-        "{:016x}",
-        fnv1a64(canonical.to_string_lossy().as_bytes())
-    ))
+    let raw = canonical.to_string_lossy();
+    let trimmed = raw.trim_start_matches(['/', '\\']);
+    let id = sanitize_path_segment(trimmed);
+    if id.is_empty() {
+        bail!("workspace id must not be empty");
+    }
+    Ok(id)
 }
 
 pub fn workspace_for_cwd(cwd: &Path) -> Result<Workspace> {
@@ -162,6 +174,7 @@ pub fn list_boards(workspace: &Workspace) -> Result<Vec<BoardMeta>> {
                 id: id.to_string(),
                 title: None,
                 created_at: 0,
+                last_used_at: None,
             },
             Err(err) => {
                 return Err(err)
@@ -207,10 +220,12 @@ pub fn create_board(workspace: &Workspace, id: &str, title: Option<String>) -> R
     std::fs::create_dir_all(&tasks_dir)
         .with_context(|| format!("create tasks directory {}", tasks_dir.display()))?;
 
+    let now = now_millis();
     let meta = BoardMeta {
         id: id.clone(),
         title,
-        created_at: now_millis(),
+        created_at: now,
+        last_used_at: Some(now),
     };
     let meta_path = board_root.join(BOARD_META_FILE);
     write_atomic_json(&meta_path, &meta)?;
@@ -223,28 +238,77 @@ pub fn set_active_board(workspace: &Workspace, id: &str) -> Result<()> {
         bail!("board id must not be empty");
     }
     let id = sanitize_path_segment(trimmed);
-    let board_root = board_root(workspace, &id);
-    if !board_root.is_dir() {
+    let root = board_root(workspace, &id);
+    if !root.is_dir() {
         bail!("board not found: {id}");
     }
     let path = workspace.root.join(ACTIVE_BOARD_FILE);
-    write_atomic(&path, format!("{id}\n").as_bytes())
+    write_atomic(&path, format!("{id}\n").as_bytes())?;
+    touch_board_last_used(workspace, &id)?;
+    Ok(())
 }
 
-/// Ensure a board is active, creating `default` when needed.
+/// Ensure a board is active.
+///
+/// Reuses the current active board when its directory exists. If the pointer is
+/// missing or stale, reuses the most recently used existing board (by
+/// `last_used_at`, falling back to `created_at`). Creates and activates
+/// `default` only when the workspace has no boards yet — creating a board is
+/// otherwise an explicit `via task board new`.
 pub fn ensure_active_board(workspace: &Workspace) -> Result<String> {
     if let Some(id) = active_board_id(workspace)? {
         let board_root = board_root(workspace, &id);
         if board_root.is_dir() {
             return Ok(id);
         }
+        tracing::warn!(
+            board = %id,
+            workspace = %workspace.id,
+            "active board missing on disk; reusing the latest existing board"
+        );
     }
 
-    if !board_root(workspace, DEFAULT_BOARD_ID).is_dir() {
-        create_board(workspace, DEFAULT_BOARD_ID, None)?;
+    let boards = list_boards(workspace)?;
+    if let Some(board) = pick_latest_board(&boards) {
+        set_active_board(workspace, &board.id)?;
+        return Ok(board.id.clone());
     }
+
+    create_board(workspace, DEFAULT_BOARD_ID, None)?;
     set_active_board(workspace, DEFAULT_BOARD_ID)?;
     Ok(DEFAULT_BOARD_ID.to_string())
+}
+
+/// Prefer the board with the newest `last_used_at` (else `created_at`).
+fn pick_latest_board(boards: &[BoardMeta]) -> Option<&BoardMeta> {
+    boards.iter().max_by(|left, right| {
+        board_recency(left)
+            .cmp(&board_recency(right))
+            .then_with(|| left.id.cmp(&right.id))
+    })
+}
+
+fn board_recency(board: &BoardMeta) -> u64 {
+    board.last_used_at.unwrap_or(board.created_at)
+}
+
+fn touch_board_last_used(workspace: &Workspace, id: &str) -> Result<()> {
+    let meta_path = board_root(workspace, id).join(BOARD_META_FILE);
+    let mut meta = match std::fs::read_to_string(&meta_path) {
+        Ok(contents) => serde_json::from_str(&contents)
+            .with_context(|| format!("parse board meta {}", meta_path.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => BoardMeta {
+            id: id.to_string(),
+            title: None,
+            created_at: now_millis(),
+            last_used_at: None,
+        },
+        Err(err) => {
+            return Err(err).with_context(|| format!("read board meta {}", meta_path.display()));
+        }
+    };
+    meta.last_used_at = Some(now_millis());
+    write_atomic_json(&meta_path, &meta)
 }
 
 fn ensure_workspace_meta(workspace: &Workspace) -> Result<()> {
@@ -258,17 +322,6 @@ fn ensure_workspace_meta(workspace: &Workspace) -> Result<()> {
         created_at: now_millis(),
     };
     write_atomic_json(&path, &meta)
-}
-
-fn fnv1a64(bytes: &[u8]) -> u64 {
-    const OFFSET: u64 = 14695981039346656037;
-    const PRIME: u64 = 1099511628211;
-    let mut hash = OFFSET;
-    for &byte in bytes {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash
 }
 
 fn sanitize_path_segment(value: &str) -> String {
@@ -348,72 +401,120 @@ mod tests {
         dir
     }
 
+    fn with_data_dir(label: &str, body: impl FnOnce(&Path, &Workspace)) {
+        let _lock = DATA_DIR_LOCK.lock().unwrap();
+        let repo = temp_repo(label);
+        let data_base = std::env::temp_dir().join(format!(
+            "via-data-{}-{}-{}",
+            label,
+            std::process::id(),
+            crate::util::now_millis()
+        ));
+        let _guard = DataDirGuard::set(&data_base);
+        let workspace = workspace_for_cwd(&repo).unwrap();
+        body(&repo, &workspace);
+        std::fs::remove_dir_all(&data_base).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     #[test]
-    fn workspace_id_is_stable_for_same_path() {
+    fn workspace_id_is_stable_sanitized_path() {
         let dir = temp_repo("id");
         let first = workspace_id(&dir).unwrap();
         let second = workspace_id(&dir).unwrap();
         assert_eq!(first, second);
-        assert_eq!(first.len(), 16);
+        let canonical = dir.canonicalize().unwrap();
+        let expected =
+            sanitize_path_segment(canonical.to_string_lossy().trim_start_matches(['/', '\\']));
+        assert_eq!(first, expected);
+        assert!(!first.is_empty());
+        assert!(!first.contains('/'));
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn create_list_and_switch_boards() {
-        let _lock = DATA_DIR_LOCK.lock().unwrap();
-        let repo = temp_repo("boards");
-        let data_base = std::env::temp_dir().join(format!(
-            "via-data-{}-{}",
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        let _guard = DataDirGuard::set(&data_base);
+        with_data_dir("boards", |_repo, workspace| {
+            create_board(workspace, "sprint-a", Some("Sprint A".to_string())).unwrap();
+            create_board(workspace, "sprint-b", None).unwrap();
 
-        let workspace = workspace_for_cwd(&repo).unwrap();
-        create_board(&workspace, "sprint-a", Some("Sprint A".to_string())).unwrap();
-        create_board(&workspace, "sprint-b", None).unwrap();
+            let listed = list_boards(workspace).unwrap();
+            assert_eq!(listed.len(), 2);
+            assert!(listed.iter().any(|b| b.id == "sprint-a"));
 
-        let listed = list_boards(&workspace).unwrap();
-        assert_eq!(listed.len(), 2);
-        assert!(listed.iter().any(|b| b.id == "sprint-a"));
+            set_active_board(workspace, "sprint-b").unwrap();
+            assert_eq!(
+                active_board_id(workspace).unwrap().as_deref(),
+                Some("sprint-b")
+            );
 
-        set_active_board(&workspace, "sprint-b").unwrap();
-        assert_eq!(
-            active_board_id(&workspace).unwrap().as_deref(),
-            Some("sprint-b")
-        );
-
-        let tasks_dir = board_tasks_dir(&workspace, "sprint-b");
-        assert_eq!(
-            tasks_dir,
-            workspace.root.join("boards").join("sprint-b").join("tasks")
-        );
-        assert_eq!(workspace.root, workspace_root_for_id(&workspace.id));
-        assert!(workspace.root.join(WORKSPACE_META_FILE).is_file());
-
-        std::fs::remove_dir_all(&data_base).ok();
-        std::fs::remove_dir_all(&repo).ok();
+            let tasks_dir = board_tasks_dir(workspace, "sprint-b");
+            assert_eq!(
+                tasks_dir,
+                workspace.root.join("boards").join("sprint-b").join("tasks")
+            );
+            assert_eq!(workspace.root, workspace_root_for_id(&workspace.id));
+            assert!(workspace.root.join(WORKSPACE_META_FILE).is_file());
+        });
     }
 
     #[test]
-    fn ensure_active_creates_default_board() {
-        let _lock = DATA_DIR_LOCK.lock().unwrap();
-        let repo = temp_repo("default");
-        let data_base = std::env::temp_dir().join(format!(
-            "via-data-{}-{}",
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        let _guard = DataDirGuard::set(&data_base);
+    fn ensure_active_creates_default_board_when_empty() {
+        with_data_dir("default", |_repo, workspace| {
+            let id = ensure_active_board(workspace).unwrap();
+            assert_eq!(id, DEFAULT_BOARD_ID);
+            assert!(board_tasks_dir(workspace, DEFAULT_BOARD_ID).is_dir());
+            assert!(workspace.root.join(ACTIVE_BOARD_FILE).is_file());
+            assert_eq!(list_boards(workspace).unwrap().len(), 1);
+        });
+    }
 
-        let workspace = workspace_for_cwd(&repo).unwrap();
-        let id = ensure_active_board(&workspace).unwrap();
-        assert_eq!(id, DEFAULT_BOARD_ID);
-        assert!(board_tasks_dir(&workspace, DEFAULT_BOARD_ID).is_dir());
-        assert!(workspace.root.join(ACTIVE_BOARD_FILE).is_file());
+    #[test]
+    fn ensure_active_reuses_existing_board_when_pointer_stale() {
+        with_data_dir("reuse", |_repo, workspace| {
+            create_board(workspace, "sprint-a", None).unwrap();
+            set_active_board(workspace, "sprint-a").unwrap();
 
-        std::fs::remove_dir_all(&data_base).ok();
-        std::fs::remove_dir_all(&repo).ok();
+            // Corrupt the active pointer to a missing board.
+            write_atomic(&workspace.root.join(ACTIVE_BOARD_FILE), b"missing-board\n").unwrap();
+
+            let id = ensure_active_board(workspace).unwrap();
+            assert_eq!(id, "sprint-a");
+            assert_eq!(
+                active_board_id(workspace).unwrap().as_deref(),
+                Some("sprint-a")
+            );
+            assert_eq!(list_boards(workspace).unwrap().len(), 1);
+            assert!(!board_root(workspace, DEFAULT_BOARD_ID).exists());
+        });
+    }
+
+    #[test]
+    fn ensure_active_prefers_most_recently_used_when_reusing() {
+        with_data_dir("prefer-latest", |_repo, workspace| {
+            create_board(workspace, "alpha", None).unwrap();
+            create_board(workspace, DEFAULT_BOARD_ID, None).unwrap();
+            create_board(workspace, "zeta", None).unwrap();
+            // Mark zeta as the latest used board.
+            set_active_board(workspace, "zeta").unwrap();
+            write_atomic(&workspace.root.join(ACTIVE_BOARD_FILE), b"gone\n").unwrap();
+
+            let id = ensure_active_board(workspace).unwrap();
+            assert_eq!(id, "zeta");
+            assert_eq!(list_boards(workspace).unwrap().len(), 3);
+        });
+    }
+
+    #[test]
+    fn ensure_active_keeps_valid_pointer() {
+        with_data_dir("keep", |_repo, workspace| {
+            create_board(workspace, "sprint-a", None).unwrap();
+            create_board(workspace, DEFAULT_BOARD_ID, None).unwrap();
+            set_active_board(workspace, "sprint-a").unwrap();
+
+            let id = ensure_active_board(workspace).unwrap();
+            assert_eq!(id, "sprint-a");
+        });
     }
 
     #[test]
@@ -428,22 +529,11 @@ mod tests {
 
     #[test]
     fn create_board_rejects_empty_id() {
-        let _lock = DATA_DIR_LOCK.lock().unwrap();
-        let repo = temp_repo("empty-board");
-        let data_base = std::env::temp_dir().join(format!(
-            "via-data-{}-{}",
-            std::process::id(),
-            crate::util::now_millis()
-        ));
-        let _guard = DataDirGuard::set(&data_base);
-
-        let workspace = workspace_for_cwd(&repo).unwrap();
-        let err = create_board(&workspace, "", None).unwrap_err();
-        assert!(err.to_string().contains("board id must not be empty"));
-        let err = create_board(&workspace, "   ", None).unwrap_err();
-        assert!(err.to_string().contains("board id must not be empty"));
-
-        std::fs::remove_dir_all(&data_base).ok();
-        std::fs::remove_dir_all(&repo).ok();
+        with_data_dir("empty-board", |_repo, workspace| {
+            let err = create_board(workspace, "", None).unwrap_err();
+            assert!(err.to_string().contains("board id must not be empty"));
+            let err = create_board(workspace, "   ", None).unwrap_err();
+            assert!(err.to_string().contains("board id must not be empty"));
+        });
     }
 }

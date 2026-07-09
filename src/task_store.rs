@@ -90,7 +90,7 @@ pub fn create_task(tasks_dir: &Path, input: CreateTask) -> Result<Task> {
             }
             trimmed.to_string()
         }
-        None => unique_task_id(),
+        None => unique_task_id(tasks_dir)?,
     };
 
     let now = now_millis();
@@ -232,8 +232,41 @@ fn matches_filter(task: &Task, filter: &TaskFilter) -> bool {
     true
 }
 
-fn unique_task_id() -> String {
-    format!("task-{}-{}", now_millis(), std::process::id())
+/// Length of auto-generated task ids (base36). Kept short so the Neovim
+/// `:ViaTasks` id column (`via:` + id, width 20) never truncates them.
+const AUTO_TASK_ID_LEN: usize = 4;
+const AUTO_TASK_ID_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+const AUTO_TASK_ID_ATTEMPTS: u32 = 64;
+
+/// Allocate a short opaque id that is not already used on this board.
+///
+/// Ids are 4 base36 characters (~1.6M space). Collisions are resolved by
+/// retrying with a different mix of time/pid/attempt; explicit `--id` values
+/// are unchanged and may still be long human-readable names.
+fn unique_task_id(tasks_dir: &Path) -> Result<String> {
+    let mut seed = now_millis()
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(u64::from(std::process::id()));
+    for attempt in 0..AUTO_TASK_ID_ATTEMPTS {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(u64::from(attempt) + 1);
+        let id = encode_short_id(seed);
+        if !task_path(tasks_dir, &id).exists() {
+            return Ok(id);
+        }
+    }
+    bail!("could not allocate a unique short task id");
+}
+
+fn encode_short_id(mut n: u64) -> String {
+    let mut out = vec![b'0'; AUTO_TASK_ID_LEN];
+    for i in (0..AUTO_TASK_ID_LEN).rev() {
+        out[i] = AUTO_TASK_ID_ALPHABET[(n % 36) as usize];
+        n /= 36;
+    }
+    // Alphabet is ASCII; this cannot fail.
+    String::from_utf8(out).expect("short task id is ascii")
 }
 
 fn sanitize_id(id: &str) -> String {
@@ -308,6 +341,52 @@ mod tests {
         let loaded = get_task(&dir, "phase2-store").unwrap().unwrap();
         assert_eq!(loaded, task);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn auto_generated_id_is_short_and_unique() {
+        let dir = temp_dir("auto-id");
+        let a = create_task(
+            &dir,
+            CreateTask {
+                title: "First".to_string(),
+                id: None,
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+        let b = create_task(
+            &dir,
+            CreateTask {
+                title: "Second".to_string(),
+                id: None,
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(a.id.len(), AUTO_TASK_ID_LEN);
+        assert_eq!(b.id.len(), AUTO_TASK_ID_LEN);
+        assert!(a.id.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(b.id.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(a.id, b.id);
+        // Fits the Neovim board column: "via:" (4) + id must be <= COL.ID (20).
+        assert!(format!("via:{}", a.id).len() <= 20);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn encode_short_id_is_fixed_width_base36() {
+        assert_eq!(encode_short_id(0), "0000");
+        assert_eq!(encode_short_id(35), "000z");
+        assert_eq!(encode_short_id(36), "0010");
+        assert_eq!(encode_short_id(36u64.pow(4) - 1), "zzzz");
     }
 
     #[test]

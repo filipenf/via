@@ -28,7 +28,7 @@ pub struct SessionManifest {
     /// When false, spawn/coordinated handoff is unavailable (primary agent is PTY-only).
     #[serde(default)]
     pub orchestration_enabled: bool,
-    /// Stable workspace id (hash of `cwd`) for durable task storage.
+    /// Stable workspace id (sanitized absolute `cwd`) for durable task storage.
     #[serde(default)]
     pub workspace_id: Option<String>,
     /// Active task board id within the workspace.

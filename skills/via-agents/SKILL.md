@@ -110,19 +110,53 @@ empty result.
 
 ## Task boards (workspace-scoped)
 
-Tasks survive via restarts; they live on a **board** within a **workspace** (hash
-of project `cwd`), not in the ephemeral instance directory.
+Tasks survive via restarts; they live on a **board** within a **workspace**
+(sanitized absolute project `cwd`), not in the ephemeral instance directory.
+Restart / `via task list` reuses the existing active board; only create a board
+when none exist yet, or explicitly with `via task board new --id …`.
 
 ```bash
 via task board list
-via task board new --id phase2 --title "Phase 2 work"
+via task board new --id phase2 --title "Phase 2 work"   # explicit; activates
 via task board use default
 
 via task list
-via task create "Implement delivery hook" --id task-1
+via task create "<short title>" -m "<context/summary>"   # auto id like "a3kx"
+via task create "Named milestone" --id task-1
 via task claim task-1
 via task update task-1 --status review
 via task done task-1
+```
+
+### Always add context when you create a task
+
+A task on the board may be picked up by another agent or a human later — write
+it so it can be worked without you being present. Pass a `-m/--body` summary on
+**every** `via task create`. Keep the **title** short (one line); put the detail
+in the **body**. A good body contains:
+
+- **Goal** — what done looks like, in one or two sentences.
+- **Scope** — files/modules/areas to touch (and what to leave alone).
+- **Repro / acceptance** — how to verify (commands, expected output, test names
+  that must pass).
+- **Dependencies** — link upstream tasks with `--blocked-by <ids>`
+  (comma-separated) AND a prose `Depends on: via:<id>` line in the body, so the
+  link is both machine-readable and visible to a human/agent skimming `show`.
+- **Pointers** — `file_path:line` references for the code that motivates the
+  task, and any prior-session notes (`@skills/...`, Obsidian notes, etc.).
+
+Linking in the body: use the `via:<id>` form (the same prefix the board rows
+use) so dependencies are greppable in `via task list` / `via task show`.
+
+```bash
+# Minimal example: short title, rich body, dependency wiring.
+via task create "Surface review state in board header" \
+  -m "Add a review-count line to the board header in nvim/tasks.lua when any " \
+     "task has status=review.\n\nGoal: a glance at :ViaTasks tells the human " \
+     "there are items awaiting review.\nScope: nvim/tasks.lua board_header() " \
+     "only; no Rust changes.\nAcceptance: scripts/test-nvim.sh green; new test "\
+     "for header with review items.\nDepends on: via:90ib" \
+  --blocked-by 90ib
 ```
 
 `via task` works from a via agent pane (uses instance `cwd`) or from the project
@@ -132,8 +166,8 @@ When a live via instance is running, task transitions also deliver to agents:
 
 - **Assignee** — notified on create, assignee change, or status change (ACP
   agents get a live prompt; PTY agents read `via agent inbox`)
-- **Review gate** — moving a task to `review` notifies the primary `agent`
-  pane for human sign-off **and** opens the configured review surface
+- **Review gate** — moving a task to `review` notifies the primary `agent` pane
+  for human sign-off **and** opens the configured review surface
   (`review_backend = "nvim"` opens a Neovim diff of working-tree changes;
   `review_backend = "hunk"` opens the inline hunk pane). This is the task-level
   human gate — distinct from ACP `session/request_permission` tool modals.
