@@ -435,7 +435,10 @@ mod tests {
             Path::new("/repo"),
         );
         assert!(command.starts_with("lua local path = \"src/main.rs\"; local line = 42;"));
-        assert!(command.contains("vim.cmd('drop +' .. line .. ' ' .. escaped)"));
+        assert!(command.contains("vim.cmd(\"drop +\" .. line .. \" \" .. escaped)"));
+        assert!(command.contains("open_buffer_matches"));
+        assert!(command.contains("telescope.builtin"));
+        assert!(command.contains("vim.ui.select"));
     }
 
     #[test]
