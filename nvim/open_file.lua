@@ -1,4 +1,4 @@
-local path = __PATH__; local line = __LINE__;
+local path = __PATH__; local line = __LINE__; local index_candidates = __CANDIDATES__;
 
 local function basename(p)
   return vim.fn.fnamemodify(p, ":t")
@@ -55,6 +55,23 @@ local function path_set(paths)
     set[vim.fn.fnamemodify(p, ":.")] = true
   end
   return set
+end
+
+-- VCS commands run with cwd=root and return root-relative paths. Resolve them
+-- against `root` (not nvim cwd) so path_set/filter_by_set match absolute candidates
+-- when Neovim was started in a subdirectory.
+local function resolve_vcs_paths(root, paths)
+  local out = {}
+  for _, p in ipairs(paths) do
+    if p ~= "" then
+      if p:sub(1, 1) == "/" or p:match("^%a:[/\\]") then
+        table.insert(out, abspath(p))
+      else
+        table.insert(out, abspath(root .. "/" .. p))
+      end
+    end
+  end
+  return out
 end
 
 local function filter_by_set(candidates, set)
@@ -153,6 +170,21 @@ local function filesystem_matches(fname)
   return matches
 end
 
+-- Fixed-list picker for trusted index candidates (never widen to full-repo search).
+local function select_candidate(fname, candidates)
+  vim.ui.select(candidates, {
+    prompt = "Open file matching " .. fname,
+    format_item = function(item)
+      return vim.fn.fnamemodify(item, ":.")
+    end,
+  }, function(choice)
+    if choice then
+      drop(choice)
+    end
+  end)
+end
+
+-- Cold-index fallback: Telescope find_files when available, else vim.ui.select.
 local function pick_candidate(fname, candidates)
   local ok, builtin = pcall(require, "telescope.builtin")
   if ok and builtin.find_files then
@@ -175,16 +207,7 @@ local function pick_candidate(fname, candidates)
     })
     return
   end
-  vim.ui.select(candidates, {
-    prompt = "Open file matching " .. fname,
-    format_item = function(item)
-      return vim.fn.fnamemodify(item, ":.")
-    end,
-  }, function(choice)
-    if choice then
-      drop(choice)
-    end
-  end)
+  select_candidate(fname, candidates)
 end
 
 local function resolve_and_open()
@@ -194,6 +217,17 @@ local function resolve_and_open()
   end
 
   local fname = basename(path)
+
+  -- Trusted index candidates from Rust: skip independent glob/VCS rediscovery.
+  if type(index_candidates) == "table" and #index_candidates > 0 then
+    if #index_candidates == 1 then
+      drop(index_candidates[1])
+      return
+    end
+    select_candidate(fname, index_candidates)
+    return
+  end
+
   local buf_matches = open_buffer_matches(fname)
   if #buf_matches == 1 then
     drop(buf_matches[1])
@@ -212,7 +246,10 @@ local function resolve_and_open()
 
   local kind, root = vcs_root()
   if kind then
-    local wt = filter_by_set(candidates, path_set(working_tree_paths(kind, root)))
+    local wt = filter_by_set(
+      candidates,
+      path_set(resolve_vcs_paths(root, working_tree_paths(kind, root)))
+    )
     if #wt == 1 then
       drop(wt[1])
       return
@@ -220,7 +257,10 @@ local function resolve_and_open()
     if #wt > 1 then
       candidates = wt
     else
-      local branch = filter_by_set(candidates, path_set(branch_changed_paths(kind, root)))
+      local branch = filter_by_set(
+        candidates,
+        path_set(resolve_vcs_paths(root, branch_changed_paths(kind, root)))
+      )
       if #branch == 1 then
         drop(branch[1])
         return

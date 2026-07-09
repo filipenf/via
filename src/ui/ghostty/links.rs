@@ -69,7 +69,7 @@ struct FileReferenceSpan {
 struct SymbolReferenceSpan {
     start: usize,
     end: usize,
-    symbol: String,
+    target: ReferenceTarget,
 }
 
 #[derive(Debug)]
@@ -396,13 +396,24 @@ pub fn reference_spans_from_row_ctx(row: &str, ctx: ReferenceContext<'_>) -> Vec
             }),
     );
 
+    let file_ranges: Vec<(usize, usize)> = spans
+        .iter()
+        .filter(|span| matches!(span.target, ReferenceTarget::File(_)))
+        .map(|span| (span.start, span.end))
+        .collect();
+
     spans.extend(
-        symbol_reference_spans(row)
+        symbol_reference_spans(row, ctx)
             .into_iter()
+            .filter(|span| {
+                !file_ranges
+                    .iter()
+                    .any(|&(start, end)| start == span.start && end == span.end)
+            })
             .map(|span| ReferenceSpan {
                 start: span.start,
                 end: span.end,
-                target: ReferenceTarget::Symbol(span.symbol),
+                target: span.target,
             }),
     );
 
@@ -479,7 +490,7 @@ fn file_reference_spans(row: &str, ctx: ReferenceContext<'_>) -> Vec<FileReferen
     spans
 }
 
-fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
+fn symbol_reference_spans(row: &str, ctx: ReferenceContext<'_>) -> Vec<SymbolReferenceSpan> {
     let chars: Vec<char> = row.chars().collect();
     let mut spans = Vec::new();
     let mut index = 0;
@@ -506,14 +517,30 @@ fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
         }
         let token: String = raw[rel_start..rel_end].iter().collect();
 
-        if !looks_like_scanned_symbol(&token) {
+        if !looks_like_symbol(&token) {
             continue;
         }
+
+        let should_cue = match ctx.file_index {
+            Some(idx) => idx.should_cue_symbol_token(&token),
+            None => looks_like_scanned_symbol(&token),
+        };
+        if !should_cue {
+            continue;
+        }
+
+        let target = match ctx
+            .file_index
+            .and_then(|idx| idx.file_target_for_symbol(&token))
+        {
+            Some(file) => ReferenceTarget::File(file),
+            None => ReferenceTarget::Symbol(token),
+        };
 
         spans.push(SymbolReferenceSpan {
             start: start + rel_start,
             end: start + rel_end,
-            symbol: token,
+            target,
         });
     }
 
@@ -1083,5 +1110,85 @@ mod tests {
             &span.target,
             ReferenceTarget::File(t) if t.path.file_name().and_then(|n| n.to_str()) == Some("Makefile")
         )));
+    }
+
+    #[test]
+    fn index_cues_bare_symbol_when_known() {
+        use crate::reference_index::{IndexedSymbol, ReferenceIndex};
+
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([IndexedSymbol {
+            name: "parse_event".to_string(),
+            kind: 12,
+            path: PathBuf::from("/repo/src/editor.rs"),
+            line: 44,
+        }]);
+
+        let target = reference_target_from_row_ctx(
+            "call parse_event next",
+            6,
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/editor.rs"),
+                line: Some(44),
+            })
+        );
+    }
+
+    #[test]
+    fn index_ignores_plain_words_not_in_symbol_index() {
+        use crate::reference_index::ReferenceIndex;
+
+        let idx = ReferenceIndex::default();
+        assert!(
+            reference_target_from_row_ctx(
+                "these are plain words",
+                1,
+                ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ambiguous_symbol_falls_back_to_symbol_target() {
+        use crate::reference_index::{IndexedSymbol, ReferenceIndex};
+
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([
+            IndexedSymbol {
+                name: "parse".to_string(),
+                kind: 12,
+                path: PathBuf::from("/repo/src/a.rs"),
+                line: 1,
+            },
+            IndexedSymbol {
+                name: "parse".to_string(),
+                kind: 12,
+                path: PathBuf::from("/repo/src/b.rs"),
+                line: 2,
+            },
+        ]);
+
+        let target = reference_target_from_row_ctx(
+            "call parse next",
+            6,
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        )
+        .unwrap();
+
+        assert_eq!(target, ReferenceTarget::Symbol("parse".to_string()));
+    }
+
+    #[test]
+    fn qualified_symbol_still_cues_with_cold_index() {
+        let target =
+            reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
+        assert_eq!(target, ReferenceTarget::Symbol("Foo::bar_baz".to_string()));
     }
 }

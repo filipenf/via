@@ -123,6 +123,10 @@ pub enum UiCommand {
         vcs_working_tree: Vec<std::path::PathBuf>,
         vcs_branch: Vec<std::path::PathBuf>,
     },
+    /// Updated open-buffer document-symbol index for Ctrl-held cue scoring.
+    SymbolIndexChanged {
+        symbols: Vec<crate::reference_index::IndexedSymbol>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +188,10 @@ pub enum EditorEvent {
         buffers: Vec<PathBuf>,
         vcs_working_tree: Vec<PathBuf>,
         vcs_branch: Vec<PathBuf>,
+    },
+    /// Snapshot of open-buffer document symbols for Ctrl+click cue scoring.
+    SymbolIndexChanged {
+        symbols: Vec<crate::reference_index::IndexedSymbol>,
     },
 }
 

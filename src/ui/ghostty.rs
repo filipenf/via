@@ -1824,8 +1824,14 @@ impl WinitGhosttyApp {
                     vcs_working_tree,
                     vcs_branch,
                 } => {
-                    self.file_index =
-                        ReferenceIndex::from_parts(buffers, vcs_working_tree, vcs_branch);
+                    self.file_index
+                        .set_files(buffers, vcs_working_tree, vcs_branch);
+                    if self.modifiers.ctrl {
+                        self.handle_modifiers_changed();
+                    }
+                }
+                UiCommand::SymbolIndexChanged { symbols } => {
+                    self.file_index.set_symbols(symbols);
                     if self.modifiers.ctrl {
                         self.handle_modifiers_changed();
                     }
