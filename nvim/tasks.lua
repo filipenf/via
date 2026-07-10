@@ -2,8 +2,8 @@
 -- Project Management UI for via task boards.
 -- Load with: require('via.tasks')
 --
--- :ViaTasks opens a structured buffer listing tasks on the active board.
--- One task per line: ID  STATUS  ASSIGNEE  TITLE. Plain text, greppable.
+-- :ViaTasks (or <leader>at) toggles a structured buffer listing tasks on the active board.
+-- One task per line: via:<id>  STATUS  ASSIGNEE  TITLE. Plain text, greppable.
 -- "Your queue" section filters on assignee=human AND status=review|in_progress.
 -- :w diffs against the loaded snapshot and calls `via task update` for changed
 -- rows only (field-scoped, not whole-row). Action keys: ga/gr/gd/gR/o.
@@ -24,8 +24,10 @@ function M.run(cmd)
 end
 
 -- Column widths for the task table.
+local TASK_ID_PREFIX = "via:"
+local TASK_ID_MATCH = [[\vvia:[\w._-]+]]
 local COL = {
-  ID = 16,
+  ID = 20,
   STATUS = 12,
   ASSIGNEE = 12,
 }
@@ -60,11 +62,44 @@ local function pad(s, width)
   return s .. string.rep(" ", width - #s)
 end
 
+local function format_task_id(raw_id)
+  return pad(TASK_ID_PREFIX .. (raw_id or "?"), COL.ID)
+end
+
+--- Strip the display `via:` prefix; bare ids are accepted for hand-edited rows.
+local function parse_task_id(token)
+  if token:sub(1, #TASK_ID_PREFIX) == TASK_ID_PREFIX then
+    return token:sub(#TASK_ID_PREFIX + 1)
+  end
+  return token
+end
+
+--- Task id under the cursor on a board row, or nil when `col` is outside the id.
+local function task_id_on_line(line, col)
+  local indent, rest = line:match("^(%s*)(.*)$")
+  indent = indent or ""
+  local display = rest:match("^(via:[%w._-]+)")
+  if not display then
+    display = rest:match("^([%w._-]+)")
+    if not display then
+      return nil
+    end
+  end
+  if col ~= nil then
+    local id_start = #indent
+    local id_end = id_start + #display - 1
+    if col < id_start or col > id_end then
+      return nil
+    end
+  end
+  return parse_task_id(display)
+end
+
 --- Format a single task as a table row.
 --- `indent` is prepended for "Your queue" section rows.
 local function format_row(task, indent)
   indent = indent or ""
-  local id = pad(task.id or "?", COL.ID)
+  local id = format_task_id(task.id)
   local status = pad(task.status or "-", COL.STATUS)
   local assignee = pad(task.assignee or "-", COL.ASSIGNEE)
   local title = task.title or ""
@@ -72,7 +107,7 @@ local function format_row(task, indent)
 end
 
 -- Error message shown for a task row that is missing columns / a title.
-local ROW_FORMAT_HINT = "task rows must be: ID  STATUS  ASSIGNEE  TITLE"
+local ROW_FORMAT_HINT = "task rows must be: via:<id>  STATUS  ASSIGNEE  TITLE"
 
 --- Parse a table row back into { id, status, assignee, title }.
 --- Returns `(parsed, nil)` for a valid task row, `(nil, nil)` for a comment or
@@ -98,7 +133,7 @@ local function parse_row(line)
     return nil, "missing task title (" .. ROW_FORMAT_HINT .. ")"
   end
   -- ID, STATUS, ASSIGNEE are the first three; TITLE is the rest joined.
-  local id = parts[1]
+  local id = parse_task_id(parts[1])
   local status = parts[2]
   local assignee = parts[3]
   -- A literal "-" in the assignee column means "no assignee". (Do NOT use the
@@ -170,6 +205,52 @@ local function split_height()
   return math.max(3, math.min(10, math.floor(vim.o.lines * 0.30)))
 end
 
+local TASKS_BUF = "via://tasks"
+
+local function show_tasks_split()
+  vim.cmd("botright " .. split_height() .. "split " .. vim.fn.fnameescape(TASKS_BUF))
+end
+
+vim.api.nvim_set_hl(0, "ViaTaskId", { link = "Special", default = true })
+
+local function apply_task_id_highlight(winid)
+  if type(winid) ~= "number" or winid <= 0 or not vim.api.nvim_win_is_valid(winid) then
+    return
+  end
+  if vim.bo[vim.api.nvim_win_get_buf(winid)].filetype ~= "via-tasks" then
+    return
+  end
+  if vim.w[winid].via_tasks_id_match then
+    pcall(vim.fn.matchdelete, vim.w[winid].via_tasks_id_match)
+  end
+  vim.w[winid].via_tasks_id_match = vim.fn.matchadd("ViaTaskId", TASK_ID_MATCH, 10)
+end
+
+vim.api.nvim_create_autocmd("BufWinEnter", {
+  group = augroup,
+  callback = function(ev)
+    if vim.bo[ev.buf].filetype ~= "via-tasks" then
+      return
+    end
+    local winid = vim.fn.bufwinid(ev.buf)
+    if winid < 0 then
+      return
+    end
+    apply_task_id_highlight(winid)
+  end,
+})
+
+local function setup_tasks_buffer(bufnr)
+  local opts = { buffer = bufnr, silent = true, noremap = true }
+  vim.keymap.set("n", "gR", M.refresh, opts)
+  vim.keymap.set("n", "<CR>", function()
+    M.open_task_body()
+  end, opts)
+  vim.keymap.set("n", "<C-LeftMouse>", function()
+    M.open_task_at_mouse()
+  end, vim.tbl_extend("force", opts, { desc = "Open task id under cursor" }))
+end
+
 --- Open the :ViaTasks buffer in a horizontal split.
 function M.open()
   local data = M.load_tasks()
@@ -178,10 +259,10 @@ function M.open()
   end
 
   -- Create or reuse the via-tasks buffer.
-  local bufnr = vim.fn.bufnr("via://tasks", false)
+  local bufnr = vim.fn.bufnr(TASKS_BUF, false)
   if bufnr <= 0 then
     bufnr = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_name(bufnr, "via://tasks")
+    vim.api.nvim_buf_set_name(bufnr, TASKS_BUF)
   end
 
   vim.bo[bufnr].filetype = "via-tasks"
@@ -199,16 +280,10 @@ function M.open()
   vim.bo[bufnr].modifiable = false
 
   -- Open in a bounded horizontal split.
-  vim.cmd("botright " .. split_height() .. "split " .. vim.fn.fnameescape("via://tasks"))
+  show_tasks_split()
   vim.bo[bufnr].modifiable = true
 
-  -- Set up buffer-local keymaps (action keys are wired in p4-pm-actions;
-  -- for now just refresh and save).
-  local opts = { buffer = bufnr, silent = true, noremap = true }
-  vim.keymap.set("n", "gR", M.refresh, opts)
-  vim.keymap.set("n", "<CR>", function()
-    M.open_task_body()
-  end, opts)
+  setup_tasks_buffer(bufnr)
 
   -- BufWriteCmd: parse, diff, update.
   vim.api.nvim_clear_autocmds({ group = augroup, buffer = bufnr, event = "BufWriteCmd" })
@@ -219,6 +294,27 @@ function M.open()
       M.save()
     end,
   })
+end
+
+--- Toggle the :ViaTasks panel (open, focus, or close).
+function M.toggle()
+  local bufnr = vim.fn.bufnr(TASKS_BUF, false)
+  if bufnr > 0 then
+    local closed = false
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+      if vim.api.nvim_win_get_buf(win) == bufnr then
+        vim.api.nvim_win_close(win, true)
+        closed = true
+      end
+    end
+    if closed then
+      return
+    end
+    -- Buffer exists but is hidden: show without reloading (preserve edits).
+    show_tasks_split()
+    return
+  end
+  M.open()
 end
 
 --- Refresh the buffer from `via task list --json` (gR).
@@ -236,6 +332,7 @@ function M.refresh()
   vim.bo[bufnr].modified = false
   -- Rebuilt from the store (always valid rows); clear any stale diagnostics.
   vim.diagnostic.reset(diagnostics_ns, bufnr)
+  apply_task_id_highlight(vim.fn.win_getid())
   vim.notify("via: tasks refreshed (" .. #(data.tasks or {}) .. " tasks)", vim.log.levels.INFO)
 end
 
@@ -363,19 +460,42 @@ function M.save()
   end
 end
 
---- Open the task body in a split scratch buffer (<CR> / o).
+--- Open the task body in a split scratch buffer (<CR> / Ctrl+click on via:<id>).
 --- The body is loaded via `via task show <id> --json`; :w in the scratch
 --- buffer calls `via task update <id> --body "..."`.
-function M.open_task_body()
-  local line = vim.api.nvim_get_current_line()
-  local parsed = parse_row(line)
-  if not parsed then
+function M.open_task_at_mouse()
+  local pos = vim.fn.getmousepos()
+  if not pos or pos.winid == 0 then
     return
   end
+  local bufnr = vim.api.nvim_win_get_buf(pos.winid)
+  local line = vim.api.nvim_buf_get_lines(bufnr, pos.line - 1, pos.line, false)[1]
+  if not line then
+    return
+  end
+  local id = task_id_on_line(line, math.max(0, pos.column - 1))
+  if id then
+    M.open_task_body(id)
+  end
+end
 
-  local output, code = M.run({ "via", "task", "show", parsed.id, "--json" })
+function M.open_task_body(task_id)
+  local id = task_id
+  if not id then
+    local line = vim.api.nvim_get_current_line()
+    id = task_id_on_line(line, vim.api.nvim_win_get_cursor(0)[2])
+    if not id then
+      local parsed = parse_row(line)
+      if not parsed then
+        return
+      end
+      id = parsed.id
+    end
+  end
+
+  local output, code = M.run({ "via", "task", "show", id, "--json" })
   if code ~= 0 then
-    vim.notify("via: failed to show task " .. parsed.id, vim.log.levels.ERROR)
+    vim.notify("via: failed to show task " .. id, vim.log.levels.ERROR)
     return
   end
   local ok, task = pcall(vim.json.decode, output)
@@ -383,7 +503,7 @@ function M.open_task_body()
     return
   end
 
-  local buf_name = "via://task/" .. parsed.id
+  local buf_name = "via://task/" .. id
   local bufnr = vim.fn.bufnr(buf_name, false)
   if bufnr <= 0 then
     bufnr = vim.api.nvim_create_buf(false, true)
@@ -391,7 +511,7 @@ function M.open_task_body()
     vim.bo[bufnr].filetype = "via-task-body"
     vim.bo[bufnr].buftype = "acwrite"
     vim.bo[bufnr].swapfile = false
-    vim.b[bufnr].via_task_id = parsed.id
+    vim.b[bufnr].via_task_id = id
 
     vim.api.nvim_create_autocmd("BufWriteCmd", {
       buffer = bufnr,
@@ -420,23 +540,29 @@ function M.open_task_body()
   vim.cmd("split " .. vim.fn.fnameescape(buf_name))
 end
 
--- Register the :ViaTasks user command.
+-- Register the :ViaTasks user command and toggle mapping.
 vim.api.nvim_create_user_command("ViaTasks", function()
-  M.open()
+  M.toggle()
 end, {
-  desc = "Open the via task board (Project Management UI)",
+  desc = "Toggle the via task board (Project Management UI)",
 })
+
+vim.keymap.set("n", "<leader>at", M.toggle, { desc = "Toggle via task board" })
 
 -- Internal helpers exposed for the test suite (see nvim/tests/). Not part of the
 -- public API — do not use these from user config.
 M._internal = {
   pad = pad,
+  format_task_id = format_task_id,
+  parse_task_id = parse_task_id,
+  task_id_on_line = task_id_on_line,
   format_row = format_row,
   parse_row = parse_row,
   build_content = build_content,
   validate_rows = validate_rows,
   split_height = split_height,
   diagnostics_ns = diagnostics_ns,
+  TASK_ID_PREFIX = TASK_ID_PREFIX,
 }
 
 return M

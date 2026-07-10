@@ -838,6 +838,43 @@ mod tests {
     }
 
     #[test]
+    fn agent_role_opens_http_url_from_row_text_on_ctrl_click() {
+        let mut pane = TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: "agent".to_string(),
+                label: "agent".to_string(),
+                command: None,
+            },
+            TerminalPane::new("agent", 400, 100, test_metrics(), &TerminalTheme::default())
+                .unwrap(),
+            1.0,
+        );
+        pane.process_for_test(b"see https://example.com/path for info", true);
+
+        let col = "see https://example.com/path for info"
+            .find("example")
+            .unwrap()
+            * test_metrics().cell_width;
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                col,
+                0,
+                ctrl_modifiers(),
+                Path::new("/repo"),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome.command,
+            Some(PaneCommand::UrlOpenRequested { ref url })
+                if url == "https://example.com/path"
+        ));
+    }
+
+    #[test]
     fn agent_role_opens_http_osc8_links_on_ctrl_click() {
         let mut pane = TerminalPaneController::new(
             PaneRole::AgentTerminal {

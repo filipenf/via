@@ -1073,6 +1073,22 @@ mod tests {
     }
 
     #[test]
+    fn reference_lookup_returns_http_url_from_row_text() {
+        let mut view = test_view_with_size(80, 3);
+
+        view.process(b"see https://example.com/path for info", true);
+
+        let col = "see https://example.com/path for info"
+            .find("example")
+            .unwrap();
+
+        assert_eq!(
+            view.reference_at(0, col, Path::new("/repo")),
+            Some(ReferenceTarget::Url("https://example.com/path".to_string()))
+        );
+    }
+
+    #[test]
     fn reference_lookup_returns_http_osc8_url() {
         let mut view = test_view_with_size(40, 3);
 
