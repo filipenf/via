@@ -58,6 +58,8 @@ pub enum TaskCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print the Markdown file path for one task.
+    Path { id: String },
     /// Assign a task to yourself (or `--assignee`) and set status to `in_progress`.
     Claim {
         id: String,
@@ -169,6 +171,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             json,
         } => run_create(title, id, assignee, blocked_by, body, json),
         TaskCommand::Show { id, json } => run_show(id, json),
+        TaskCommand::Path { id } => run_path(id),
         TaskCommand::Claim { id, assignee, json } => run_claim(id, assignee, json),
         TaskCommand::Update {
             id,
@@ -353,6 +356,18 @@ fn run_show(id: String, json: bool) -> Result<()> {
         bail!("task not found: {id}");
     };
     print_task_result(&task, json, "show")
+}
+
+fn run_path(id: String) -> Result<()> {
+    let ctx = tasks_context()?;
+    if get_task(&ctx.tasks_dir, &id)?.is_none() {
+        bail!("task not found: {id}");
+    }
+    println!(
+        "{}",
+        crate::task_store::task_file_path(&ctx.tasks_dir, &id).display()
+    );
+    Ok(())
 }
 
 fn run_claim(id: String, assignee: Option<String>, json: bool) -> Result<()> {
@@ -643,6 +658,14 @@ mod tests {
             cli.command,
             Some(Command::Task {
                 command: TaskCommand::Done { id, json: false },
+            }) if id == "phase2-store"
+        ));
+
+        let cli = Cli::try_parse_from(["via", "task", "path", "phase2-store"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Task {
+                command: TaskCommand::Path { id },
             }) if id == "phase2-store"
         ));
     }

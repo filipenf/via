@@ -15,7 +15,7 @@
 //!   active_board
 //!   boards/<board-id>/
 //!     meta.json
-//!     tasks/*.json
+//!     tasks/*.md
 //! ```
 //!
 //! Workspace ids are browsable path-derived names (e.g. `home_username_code_via`),

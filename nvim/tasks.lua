@@ -7,7 +7,7 @@
 -- "Your queue" section filters on assignee=human AND status=review|in_progress.
 -- :w diffs against the loaded snapshot and calls `via task update` for changed
 -- rows only (field-scoped, not whole-row). Buffer-local keys: gR refresh,
--- <CR> open body, gn new board, gb switch board.
+-- <CR> open task, gn new board, gb switch board.
 -- A background autorefresh poll watches `via task list --json` and silently
 -- redraws the board when the store changes and the buffer has no unsaved
 -- edits. Set `vim.g.via_tasks_autorefresh_ms` (default 2000; 0 disables).
@@ -56,7 +56,7 @@ function M.run_async(cmd, on_done)
       -- stdout entries may carry trailing empty strings from the buffered
       -- job; join with "" (not "\n") because the original CLI output had no
       -- separator between chunks.
-      local out = table.concat(stdout, "")
+      local out = table.concat(stdout, "\n")
       vim.schedule(function()
         on_done(out, code)
       end)
@@ -806,9 +806,8 @@ function M.save()
   end
 end
 
---- Open the task body in a split scratch buffer (<CR> / Ctrl+click on via:<id>).
---- The body is loaded via `via task show <id> --json`; :w in the scratch
---- buffer calls `via task update <id> --body "..."`.
+--- Open the task Markdown file in a regular editor buffer (<CR> / Ctrl+click
+--- on via:<id>).
 function M.open_task_at_mouse()
   local pos = vim.fn.getmousepos()
   if not pos or pos.winid == 0 then
@@ -825,10 +824,8 @@ function M.open_task_at_mouse()
   end
 end
 
---- Open the task body in a transient split buffer (`<CR>` / Ctrl+click on
---- `via:<id>`). The buffer is unlisted and `bufhidden=wipe`, so closing the
---- window wipes it (no `:ls!` leak); `buftype=acwrite` keeps it writeable via
---- the buffer-local `BufWriteCmd`, which calls `via task update <id> --body`.
+--- Open the task Markdown file in a regular split buffer (`<CR>` / Ctrl+click
+--- on `via:<id>`).
 function M.open_task_body(task_id)
   local id = task_id
   if not id then
@@ -843,53 +840,19 @@ function M.open_task_body(task_id)
     end
   end
 
-  local output, code = M.run({ "via", "task", "show", id, "--json" })
+  local output, code = M.run({ "via", "task", "path", id })
   if code ~= 0 then
-    vim.notify("via: failed to show task " .. id, vim.log.levels.ERROR)
+    vim.notify("via: failed to find task file " .. id, vim.log.levels.ERROR)
     return
   end
-  local ok, task = pcall(vim.json.decode, output)
-  if not ok or not task then
+  local path = output:match("^%s*(.-)%s*$")
+  if not path or path == "" then
+    vim.notify("via: task path was empty for " .. id, vim.log.levels.ERROR)
     return
   end
 
-  local buf_name = "via://task/" .. id
-  local bufnr = vim.fn.bufnr(buf_name, false)
-  if bufnr <= 0 then
-    bufnr = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_name(bufnr, buf_name)
-    vim.bo[bufnr].filetype = "via-task-body"
-    vim.bo[bufnr].buftype = "acwrite"
-    vim.bo[bufnr].bufhidden = "wipe"
-    vim.bo[bufnr].swapfile = false
-    vim.b[bufnr].via_task_id = id
-
-    vim.api.nvim_create_autocmd("BufWriteCmd", {
-      buffer = bufnr,
-      callback = function()
-        local id = vim.b[bufnr].via_task_id
-        local body_text = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-        local result, code = M.run({ "via", "task", "update", id, "--body", body_text })
-        if code ~= 0 then
-          vim.notify("via: failed to save body: " .. result, vim.log.levels.WARN)
-        else
-          vim.bo[bufnr].modified = false
-          vim.notify("via: saved body for " .. id, vim.log.levels.INFO)
-        end
-      end,
-    })
-  end
-
-  -- Split on newlines without the trailing-empty-line artifact that
-  -- `gmatch("[^\n]*")` produces (which would make an untouched body round-trip
-  -- to a body with an extra trailing newline on save).
-  local body_lines = vim.split(task.body or "", "\n", { plain = true })
-  vim.bo[bufnr].modifiable = true
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, body_lines)
-  vim.bo[bufnr].modified = false
-
-  vim.cmd("split")
-  vim.api.nvim_win_set_buf(0, bufnr)
+  vim.cmd("split " .. vim.fn.fnameescape(path))
+  vim.bo.filetype = "markdown"
 end
 
 --- Autorefresh poll interval in milliseconds.

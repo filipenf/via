@@ -1,7 +1,9 @@
 //! File-backed task board for structured work items.
 //!
-//! One JSON file per task lives directly under a work-session tasks directory
-//! (see [`crate::workspace`]), using the same atomic-write pattern as [`crate::agent_bus`].
+//! One file per task lives directly under a work-session tasks directory
+//! (see [`crate::workspace`]). New tasks are written as Markdown with YAML
+//! frontmatter (`<id>.md`), using the same atomic-write pattern as
+//! [`crate::agent_bus`].
 
 use std::path::{Path, PathBuf};
 
@@ -68,8 +70,30 @@ pub struct TaskFilter {
     pub assignee: Option<String>,
 }
 
+/// YAML frontmatter for a task file. The `id` is NOT stored here — it is
+/// derived from the filename stem. The `body` lives after the closing `---`
+/// fence, not in the frontmatter. Skip rules mirror [`Task`] so files stay minimal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TaskFrontmatter {
+    title: String,
+    status: TaskStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    assignee: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    blocked_by: Vec<String>,
+    created_at: u64,
+    updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    created_by: Option<String>,
+}
+
 fn task_path(tasks_dir: &Path, id: &str) -> PathBuf {
-    tasks_dir.join(format!("{}.json", sanitize_id(id)))
+    tasks_dir.join(format!("{}.md", sanitize_id(id)))
+}
+
+/// Return the on-disk Markdown path for a task id.
+pub fn task_file_path(tasks_dir: &Path, id: &str) -> PathBuf {
+    task_path(tasks_dir, id)
 }
 
 /// Create a new task with status `queued`.
@@ -110,20 +134,23 @@ pub fn create_task(tasks_dir: &Path, input: CreateTask) -> Result<Task> {
     Ok(task)
 }
 
-/// Load a single task by id.
+/// Load a single task by id. Returns `None` if the Markdown file does not
+/// exist. Read paths are side-effect-free.
 pub fn get_task(tasks_dir: &Path, id: &str) -> Result<Option<Task>> {
     let path = task_path(tasks_dir, id);
     match std::fs::read_to_string(&path) {
-        Ok(contents) => Ok(Some(
-            serde_json::from_str(&contents)
-                .with_context(|| format!("parse task {}", path.display()))?,
-        )),
+        Ok(contents) => {
+            let task = parse_md_task(id, &contents)
+                .with_context(|| format!("parse task {}", path.display()))?;
+            Ok(Some(task))
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("read task {}", path.display())),
     }
 }
 
 /// List tasks, optionally filtered, ordered oldest-first by `created_at`.
+/// Files with extensions other than `.md` are ignored.
 pub fn list_tasks(tasks_dir: &Path, filter: &TaskFilter) -> Result<Vec<Task>> {
     let entries = match std::fs::read_dir(tasks_dir) {
         Ok(entries) => entries,
@@ -136,17 +163,28 @@ pub fn list_tasks(tasks_dir: &Path, filter: &TaskFilter) -> Result<Vec<Task>> {
     let mut tasks = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().is_none_or(|ext| ext != "json") {
+        if path.extension().is_none_or(|ext| ext != "md") {
             continue;
         }
-        let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("read task {}", path.display()))?;
-        match serde_json::from_str::<Task>(&contents) {
-            Ok(task) => tasks.push(task),
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default();
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read task {}", path.display()));
+            }
+        };
+        let parsed = match parse_md_task(stem, &contents) {
+            Ok(t) => t,
             Err(err) => {
                 tracing::warn!(path = %path.display(), %err, "skipping unparseable task file");
+                continue;
             }
-        }
+        };
+        tasks.push(parsed);
     }
 
     tasks.retain(|task| matches_filter(task, filter));
@@ -214,8 +252,88 @@ pub fn done_task(tasks_dir: &Path, id: &str) -> Result<Task> {
 
 fn write_task(tasks_dir: &Path, task: &Task) -> Result<()> {
     let path = task_path(tasks_dir, &task.id);
-    let serialized = serde_json::to_vec_pretty(task).context("serialize task")?;
-    write_atomic(&path, &serialized)
+    let serialized = task_to_md(task)?;
+    write_atomic(&path, serialized.as_bytes())?;
+    Ok(())
+}
+
+/// Serialize a [`Task`] to the on-disk Markdown-with-YAML-frontmatter format.
+///
+/// Layout: `---\n<yaml>\n---\n[\n<body>]`. When `body` is `None` the file ends
+/// at the closing fence (no blank line); when `body` is `Some(s)` a blank
+/// line separator is emitted followed by `s`. This distinguishes `None`
+/// (absent body) from `Some("")` (present-but-empty body) on round-trip.
+fn task_to_md(task: &Task) -> Result<String> {
+    let fm = TaskFrontmatter {
+        title: task.title.clone(),
+        status: task.status,
+        assignee: task.assignee.clone(),
+        blocked_by: task.blocked_by.clone(),
+        created_at: task.created_at,
+        updated_at: task.updated_at,
+        created_by: task.created_by.clone(),
+    };
+    let yaml = serde_yaml::to_string(&fm).context("serialize task frontmatter")?;
+    let mut out = String::with_capacity(yaml.len() + 16);
+    out.push_str("---\n");
+    out.push_str(&yaml);
+    out.push_str("---\n");
+    if let Some(body) = &task.body {
+        out.push('\n');
+        out.push_str(body);
+    }
+    Ok(out)
+}
+
+/// Parse a Markdown-with-YAML-frontmatter task file into a [`Task`].
+///
+/// The file layout is `---\n<yaml>\n---\n[\n<body>]`. The splitter cuts on the
+/// FIRST closing `---` line only: the body is free-form markdown and may
+/// itself contain a `---` line (a markdown horizontal rule). A greedy match
+/// on the closing fence would truncate the body at the first in-body rule and
+/// corrupt the task, so [`str::splitn`] with `n = 2` is used to stop after the
+/// first hit.
+///
+/// Body semantics: if nothing follows the closing fence, `body` is `None`
+/// (absent). If a blank line follows and then nothing, `body` is `Some("")`
+/// (present but empty). Otherwise `body` is the text after the blank-line
+/// separator. The `id` is taken from the filename stem, not the frontmatter.
+fn parse_md_task(id: &str, contents: &str) -> Result<Task> {
+    let after_open = contents
+        .strip_prefix("---\n")
+        .with_context(|| format!("task {id} missing opening frontmatter fence"))?;
+
+    let mut parts = after_open.splitn(2, "\n---\n");
+    let yaml = parts.next().unwrap_or("");
+    let body_rest = parts
+        .next()
+        .with_context(|| format!("task {id} missing closing frontmatter fence"))?;
+
+    let fm: TaskFrontmatter =
+        serde_yaml::from_str(yaml).with_context(|| format!("task {id} parse frontmatter"))?;
+
+    let body = if body_rest.is_empty() {
+        None
+    } else {
+        Some(
+            body_rest
+                .strip_prefix('\n')
+                .unwrap_or(body_rest)
+                .to_string(),
+        )
+    };
+
+    Ok(Task {
+        id: id.to_string(),
+        title: fm.title,
+        status: fm.status,
+        assignee: fm.assignee,
+        blocked_by: fm.blocked_by,
+        created_at: fm.created_at,
+        updated_at: fm.updated_at,
+        created_by: fm.created_by,
+        body,
+    })
 }
 
 fn matches_filter(task: &Task, filter: &TaskFilter) -> bool {
@@ -340,6 +458,9 @@ mod tests {
 
         let loaded = get_task(&dir, "phase2-store").unwrap().unwrap();
         assert_eq!(loaded, task);
+
+        assert_eq!(task_path(&dir, "phase2-store").extension().unwrap(), "md");
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -546,7 +667,162 @@ mod tests {
         assert_eq!(sanitize_id("../etc/passwd"), "_.._etc_passwd");
         assert_eq!(
             task_path(Path::new("/tmp/tasks"), "../x").to_str().unwrap(),
-            "/tmp/tasks/_.._x.json"
+            "/tmp/tasks/_.._x.md"
         );
+    }
+
+    #[test]
+    fn writes_markdown_with_frontmatter_and_body() {
+        let dir = temp_dir("md-write");
+        let task = create_task(
+            &dir,
+            CreateTask {
+                title: "Implement task store".to_string(),
+                id: Some("md1".to_string()),
+                assignee: Some("agent".to_string()),
+                blocked_by: vec!["other-id".to_string()],
+                created_by: Some("orchestrator".to_string()),
+                body: Some("First milestone".to_string()),
+            },
+        )
+        .unwrap();
+
+        let path = task_path(&dir, "md1");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            contents.starts_with("---\n"),
+            "missing opening fence: {contents:?}"
+        );
+        assert!(
+            contents.lines().any(|l| l.starts_with("title:")),
+            "missing title field: {contents:?}"
+        );
+        assert!(
+            contents.lines().any(|l| l == "status: queued"),
+            "missing status: queued: {contents:?}"
+        );
+        let close_count = contents.lines().filter(|l| *l == "---").count();
+        assert_eq!(
+            close_count, 2,
+            "expected exactly two fence lines: {contents:?}"
+        );
+        let after_close = contents.split_once("\n---\n").unwrap().1;
+        assert!(
+            after_close.starts_with('\n'),
+            "expected blank line after closing fence: {after_close:?}"
+        );
+        assert!(
+            after_close.trim_end().ends_with("First milestone"),
+            "expected body at end: {after_close:?}"
+        );
+
+        let loaded = get_task(&dir, "md1").unwrap().unwrap();
+        assert_eq!(loaded, task);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_md_task_rejects_missing_closing_fence() {
+        let dir = temp_dir("no-close-fence");
+        let malformed = "---\ntitle: Broken\nstatus: queued\ncreated_at: 1\nupdated_at: 1\n";
+        let path = task_path(&dir, "broken1");
+        write_atomic(&path, malformed.as_bytes()).unwrap();
+
+        assert!(get_task(&dir, "broken1").is_err());
+        assert!(list_tasks(&dir, &TaskFilter::default()).unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn body_with_separator_and_special_chars_round_trips() {
+        let dir = temp_dir("body-sep");
+        let body = "intro line\n---\n- list item\nkey: value\n\nfinal line".to_string();
+        let task = create_task(
+            &dir,
+            CreateTask {
+                title: "Tricky: body with rules".to_string(),
+                id: Some("tricky".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: Some(body.clone()),
+            },
+        )
+        .unwrap();
+
+        let loaded = get_task(&dir, "tricky").unwrap().unwrap();
+        assert_eq!(loaded.body.as_deref(), Some(body.as_str()));
+        assert_eq!(loaded, task);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn title_with_colon_round_trips() {
+        let dir = temp_dir("title-colon");
+        let task = create_task(
+            &dir,
+            CreateTask {
+                title: "Fix: the bug".to_string(),
+                id: Some("colon1".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+        let loaded = get_task(&dir, "colon1").unwrap().unwrap();
+        assert_eq!(loaded.title, "Fix: the bug");
+        assert_eq!(loaded, task);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn empty_body_semantics_none_vs_some_empty() {
+        let dir = temp_dir("body-empty");
+
+        create_task(
+            &dir,
+            CreateTask {
+                title: "No body".to_string(),
+                id: Some("n1".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+        let none_path = task_path(&dir, "n1");
+        let none_contents = std::fs::read_to_string(&none_path).unwrap();
+        assert!(
+            none_contents.ends_with("---\n"),
+            "None body should end at closing fence: {none_contents:?}"
+        );
+        let none_loaded = get_task(&dir, "n1").unwrap().unwrap();
+        assert_eq!(none_loaded.body, None);
+
+        create_task(
+            &dir,
+            CreateTask {
+                title: "Empty body".to_string(),
+                id: Some("e1".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: Some(String::new()),
+            },
+        )
+        .unwrap();
+        let empty_path = task_path(&dir, "e1");
+        let empty_contents = std::fs::read_to_string(&empty_path).unwrap();
+        assert!(
+            empty_contents.ends_with("---\n\n"),
+            "Some(\"\") body should end with closing fence + blank line: {empty_contents:?}"
+        );
+        let empty_loaded = get_task(&dir, "e1").unwrap().unwrap();
+        assert_eq!(empty_loaded.body, Some(String::new()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

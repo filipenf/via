@@ -84,8 +84,8 @@ The primary PTY `agent` pane cannot be terminated.
 
 Messages always go to the recipient's **mailbox**. Live delivery:
 
-- **ACP agents** — full body delivered as a prompt (automatic turn).
-- **PTY agents** — mailbox only; read with `via agent inbox`.
+- **ACP agents**: full body delivered as a prompt (automatic turn).
+- **PTY agents**: mailbox only; read with `via agent inbox`.
 
 ```bash
 via agent send --to orchestrator -m "Plan the refactor."
@@ -128,21 +128,19 @@ via task update task-1 --status review
 via task done task-1
 ```
 
-### Always add context when you create a task
+### Add context when you create a task
 
-A task on the board may be picked up by another agent or a human later — write
+A task on the board may be picked up by another agent or a human later - write
 it so it can be worked without you being present. Pass a `-m/--body` summary on
 **every** `via task create`. Keep the **title** short (one line); put the detail
 in the **body**. A good body contains:
 
-- **Goal** — what done looks like, in one or two sentences.
-- **Scope** — files/modules/areas to touch (and what to leave alone).
-- **Repro / acceptance** — how to verify (commands, expected output, test names
+- **Goal**: what done looks like, in one or two sentences.
+- **Scope**: files/modules/areas to touch (and what to leave alone).
+- **Repro / acceptance**: how to verify (commands, expected output, test names
   that must pass).
-- **Dependencies** — link upstream tasks with `--blocked-by <ids>`
-  (comma-separated) AND a prose `Depends on: via:<id>` line in the body, so the
-  link is both machine-readable and visible to a human/agent skimming `show`.
-- **Pointers** — `file_path:line` references for the code that motivates the
+- **Dependencies**: link upstream tasks with `--blocked-by <ids>` (if any)
+- **Pointers**: `file_path:line` references for the code that motivates the
   task, and any prior-session notes (`@skills/...`, Obsidian notes, etc.).
 
 Linking in the body: use the `via:<id>` form (the same prefix the board rows
@@ -164,15 +162,18 @@ directory without a live instance.
 
 When a live via instance is running, task transitions also deliver to agents:
 
-- **Assignee** — notified on create, assignee change, or status change (ACP
+- **Assignee**: notified on create, assignee change, or status change (ACP
   agents get a live prompt; PTY agents read `via agent inbox`)
-- **Review gate** — moving a task to `review` notifies the primary `agent` pane
+- **Review gate**: moving a task to `review` notifies the primary `agent` pane
   for human sign-off **and** opens the configured review surface
   (`review_backend = "nvim"` opens a Neovim diff of working-tree changes;
   `review_backend = "hunk"` opens the inline hunk pane). This is the task-level
-  human gate — distinct from ACP `session/request_permission` tool modals.
+  human gate - distinct from ACP `session/request_permission` tool modals.
 
 Use `via agent send` for ad-hoc messages; tasks are for structured workflow.
+
+Tasks can optionally have a status update/report section for capturing the
+decisions, risks, caveats and trade-offs found during implementation
 
 ## Command reference
 
@@ -185,7 +186,7 @@ Use `via agent send` for ad-hoc messages; tasks are for structured workflow.
 | `via agent send [--to ID] -m TEXT [--no-focus] [--no-notify]` | Deliver to a registered agent (errors if missing) |
 | `via agent inbox [--json] [--peek] [--wait SECONDS]`          | Read your mailbox (optionally block for new mail) |
 | `via task board list\|new\|use`                               | Manage task boards in the workspace               |
-| `via task list\|create\|show\|claim\|update\|done`            | Tasks on the active board                         |
+| `via task list\|create\|show\|path\|claim\|update\|done`     | Tasks on the active board                         |
 
 ## Sandbox notes
 

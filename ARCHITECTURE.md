@@ -203,7 +203,7 @@ workspaces/<workspace-id>/    # durable per-project state
   active_board                # pointer to selected board
   boards/<board-id>/
     meta.json
-    tasks/*.json              # one file per task (task_store)
+    tasks/*.md                # one Markdown file per task (task_store)
 ```
 
 - **Instance** — `SessionGuard` creates `instances/<pid>/` at startup and

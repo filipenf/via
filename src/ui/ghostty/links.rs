@@ -597,13 +597,7 @@ fn symbol_target_from_uri(uri: &str) -> Option<String> {
     uri.strip_prefix("symbol://")
         .or_else(|| uri.strip_prefix("symbol:"))
         .map(percent_decode)
-        .and_then(|symbol| {
-            if looks_like_symbol(&symbol) {
-                Some(symbol)
-            } else {
-                None
-            }
-        })
+        .filter(|symbol| looks_like_symbol(symbol))
 }
 
 fn percent_decode(input: &str) -> String {

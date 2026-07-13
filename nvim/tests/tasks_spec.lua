@@ -552,80 +552,61 @@ t.it("save: keeps buffer modified and does not refresh when an update fails", fu
   t.eq(0, list_calls, "refresh (list) must not run after a failed update")
 end)
 
-t.it("open_task_body: round-trips body without adding a trailing empty line", function()
+t.it("open_task_body: opens the task Markdown file in a regular editor buffer", function()
   local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({
+    "---",
+    "title: Hello",
+    "status: queued",
+    "created_at: 1",
+    "updated_at: 1",
+    "---",
+    "",
+    "line one",
+    "line two",
+  }, path)
+  local calls = {}
   mod.run = function(cmd)
-    if cmd[3] == "show" then
-      return '{"id":"t1","status":"queued","assignee":"agent","title":"Hello","body":"line one\\nline two"}', 0
-    end
-    return "", 0
+    table.insert(calls, cmd)
+    return path .. "\n", 0
   end
-  -- Set up a parent buffer with a task line so open_task_body can read it.
-  local parent = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(parent, 0, -1, false, { "# All tasks", "t1  queued  agent  Hello" })
-  vim.api.nvim_win_set_buf(0, parent)
-  vim.api.nvim_win_set_cursor(0, { 2, 0 })
-  mod.open_task_body()
-  local body_buf = vim.fn.bufnr("via://task/t1")
-  t.neq(-1, body_buf, "body buffer should exist")
-  local lines = vim.api.nvim_buf_get_lines(body_buf, 0, -1, false)
-  t.eq({ "line one", "line two" }, lines)
+  mod.open_task_body("t1")
+  local bufnr = vim.fn.bufnr(path, false)
+  t.eq({ "via", "task", "path", "t1" }, calls[1])
+  t.neq(-1, bufnr, "task file buffer should exist")
+  t.eq(path, vim.api.nvim_buf_get_name(bufnr))
+  t.eq("", vim.bo[bufnr].buftype, "task file should use a regular buffer")
+  t.eq(true, vim.bo[bufnr].buflisted, "task file should be listed like a regular buffer")
+  t.eq("markdown", vim.bo[bufnr].filetype, "task file should use Markdown filetype")
+  t.eq({
+    "---",
+    "title: Hello",
+    "status: queued",
+    "created_at: 1",
+    "updated_at: 1",
+    "---",
+    "",
+    "line one",
+    "line two",
+  }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
+  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  vim.fn.delete(path)
 end)
 
--- ---------------------------------------------------------------------------
--- open_task_body: transient buffer options
--- ---------------------------------------------------------------------------
-
---- Open a body buffer for `id` with `mod.run` stubbed to return `body`.
---- Returns the body bufnr. Clears any prior body buffer for the same id first.
-local function open_body_fixture(mod, id, body)
-  local name = "via://task/" .. id
-  local existing = vim.fn.bufnr(name, false)
-  if existing > 0 and vim.api.nvim_buf_is_valid(existing) then
-    pcall(vim.api.nvim_buf_delete, existing, { force = true })
-  end
-  mod.run = function(cmd)
-    if cmd[3] == "show" then
-      return vim.json.encode({ id = id, status = "queued", assignee = "agent", title = "T", body = body }), 0
-    end
-    return "", 0
-  end
-  mod.open_task_body(id)
-  return vim.fn.bufnr(name, false)
-end
-
---- Close every window showing `bufnr` (triggers `bufhidden=wipe` for body buffers).
-local function close_windows_showing(bufnr)
-  for _, win in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == bufnr then
-      pcall(vim.api.nvim_win_close, win, true)
-    end
-  end
-end
-
-t.it("open_task_body: body buffer is unlisted (buflisted=false, excluded from :ls)", function()
+t.it("open_task_body: regular Markdown buffers remain editable and listed", function()
   local mod = t.load_tasks_module()
-  local body_buf = open_body_fixture(mod, "body1", "hello")
-  t.truthy(body_buf > 0, "body buffer should exist")
-  t.eq(false, vim.bo[body_buf].buflisted, "body buffer must be unlisted")
-  local ls = vim.api.nvim_exec2("ls", { output = true }).output
-  t.truthy(not ls:find("via://task/body1", 1, true), "body buffer must not appear in :ls")
-  close_windows_showing(body_buf)
-end)
-
-t.it("open_task_body: body buffer has bufhidden=wipe and is wiped when its window closes", function()
-  local mod = t.load_tasks_module()
-  local body_buf = open_body_fixture(mod, "body2", "hello")
-  t.eq("wipe", vim.bo[body_buf].bufhidden, "body buffer must wipe on window close")
-  close_windows_showing(body_buf)
-  t.eq(false, vim.api.nvim_buf_is_valid(body_buf), "body buffer should be wiped after its window closes")
-end)
-
-t.it("open_task_body: body buffer keeps buftype=acwrite (writeable via BufWriteCmd)", function()
-  local mod = t.load_tasks_module()
-  local body_buf = open_body_fixture(mod, "body3", "hello")
-  t.eq("acwrite", vim.bo[body_buf].buftype, "body buffer must stay acwrite, not nofile")
-  close_windows_showing(body_buf)
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task", "hello" }, path)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("body1")
+  local bufnr = vim.fn.bufnr(path, false)
+  t.eq(true, vim.bo[bufnr].modifiable, "task file should be editable")
+  t.eq(false, vim.bo[bufnr].readonly, "task file should not be read-only")
+  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  vim.fn.delete(path)
 end)
 
 -- ---------------------------------------------------------------------------
