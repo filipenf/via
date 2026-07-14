@@ -212,7 +212,7 @@ embedded Neovim Lua bridges (`nvim/*.lua`).
     link extraction, Ratatui-backed ACP pane, review terminal toggling (hunk or
     nvim), font rendering with cosmic-text.
   - `src/acp.rs` — small ACP JSON-RPC client (initialize, new_session,
-    context/update, prompt, tool results).
+    prompt, tool results).
   - `src/nvim.rs` + `nvim/` — nvim-rs RPC client + embedded Lua templates for
     file/symbol open, diagnostics export, review.
   - `src/config.rs`, `src/session.rs`, `src/cli/` — layered config (CLI > env >

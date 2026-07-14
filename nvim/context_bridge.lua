@@ -1,7 +1,6 @@
 local socket = vim.g.via_editor_socket
 local lsp_bridge_socket = vim.g.via_lsp_bridge_socket
 local uv = vim.uv or vim.loop
-local pending_active_update = false
 local pending_selection_update = false
 local lsp_pipe = nil
 local clients = {}
@@ -96,33 +95,6 @@ local function current_file_path()
   end
 
   return path
-end
-
-local function send_active_buffer()
-  local path = current_file_path()
-  if not path then
-    return
-  end
-
-  local pos = vim.api.nvim_win_get_cursor(0)
-  notify({
-    type = "active_buffer_changed",
-    path = path,
-    line = pos[1],
-    column = pos[2] + 1,
-  })
-end
-
-local function schedule_active_buffer()
-  if pending_active_update then
-    return
-  end
-
-  pending_active_update = true
-  vim.defer_fn(function()
-    pending_active_update = false
-    send_active_buffer()
-  end, 75)
 end
 
 local function send_diagnostics()
@@ -315,9 +287,6 @@ vim.api.nvim_create_autocmd("ModeChanged", {
     end
   end,
 })
-
--- NOTE: Active buffer context is no longer pushed automatically.
--- Use :ViaBufferSend (or <leader>ab) to explicitly send the current buffer/selection to the agent.
 
 vim.api.nvim_create_autocmd("LspAttach", {
   group = group,

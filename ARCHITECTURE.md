@@ -79,10 +79,10 @@ The central async coordinator. It owns:
 Key paths:
 
 - On `BufferSendRequested` (from `:ViaBufferSend` / `<leader>ab` or explicit
-  CLI): if ACP client is connected, sends a structured `context/update`;
-  otherwise falls back to writing the content into the PTY (normal mode).
-- Incoming Neovim events (active buffer, diagnostics, visual selection, LSP
-  client list) update `editor_state` and are forwarded where relevant.
+  CLI): if ACP client is connected, sends an ACP context prompt with the file
+  (or selection); otherwise falls back to writing `@path` into the PTY.
+- Incoming Neovim events (diagnostics, visual selection, LSP client list)
+  update `editor_state` and are forwarded where relevant.
 - Reference navigation (file or symbol clicks) results in `nvim::open_file` /
   `open_symbol` RPC calls and a focus change command back to the UI.
 - ACP tool results and session updates are turned into `@tool_result ...` lines
@@ -135,12 +135,13 @@ system browser without changing Neovim focus.
   the agent. Output is fed to a libghostty `Terminal` in the agent pane. Context
   is injected by writing text into the PTY.
 - ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
-  as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, context is
-  sent as `context/update` messages. The UI for this path is the Ratatui ACP
-  pane (not a raw PTY). Tool permissions and results flow through the mediator.
+  as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, explicit
+  context is sent as prompts (e.g. `:ViaBufferSend`). The UI for this path is
+  the Ratatui ACP pane (not a raw PTY). Tool permissions and results flow
+  through the mediator.
 
-`AcpClient` is intentionally minimal (handshake, session create, context,
-prompt, tool result serialization). It is not a full agent SDK.
+`AcpClient` is intentionally minimal (handshake, session create, prompt,
+tool result serialization). It is not a full agent SDK.
 
 ### Two coordination modes
 

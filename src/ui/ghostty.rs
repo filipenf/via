@@ -1682,17 +1682,6 @@ impl WinitGhosttyApp {
         while let Ok(command) = self.ui_commands.try_recv() {
             changed = true;
             match command {
-                UiCommand::EditorContextChanged { path, line, column } => {
-                    let update =
-                        format_context_update(&path, line, column, &self.config.working_directory);
-                    let Some(agent_pane) = self.first_agent_terminal_mut() else {
-                        continue;
-                    };
-
-                    debug!(path = %path.display(), line, column, "forwarding editor context to agent");
-                    agent_pane.write_all(update.as_bytes())?;
-                    self.pending_agent_write = None;
-                }
                 UiCommand::VisualSelectionChanged {
                     path,
                     start_line,
@@ -2105,17 +2094,6 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
             vim_fnameescape(&config.nvim_context_bridge_path)
         )),
     ]
-}
-
-fn format_context_update(
-    path: &Path,
-    _line: u32,
-    _column: u32,
-    working_directory: &Path,
-) -> String {
-    let display_path = path.strip_prefix(working_directory).unwrap_or(path);
-
-    format!("@{}\n", display_path.display())
 }
 
 fn format_selection_update(
@@ -2702,14 +2680,6 @@ mod tests {
         assert_eq!(
             args[11],
             OsString::from("luafile /repo/nvim/context\\ bridge.lua")
-        );
-    }
-
-    #[test]
-    fn context_update_uses_relative_file_path() {
-        assert_eq!(
-            format_context_update(Path::new("/repo/src/main.rs"), 42, 7, Path::new("/repo")),
-            "@src/main.rs\n"
         );
     }
 

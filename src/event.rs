@@ -67,11 +67,6 @@ pub enum AcpHandshakeAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiCommand {
-    EditorContextChanged {
-        path: PathBuf,
-        line: u32,
-        column: u32,
-    },
     VisualSelectionChanged {
         path: PathBuf,
         start_line: u32,
@@ -126,11 +121,6 @@ pub enum UiCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorEvent {
-    ActiveBufferChanged {
-        path: PathBuf,
-        line: u32,
-        column: u32,
-    },
     DiagnosticsChanged {
         path: PathBuf,
         error_count: usize,
