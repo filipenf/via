@@ -37,7 +37,7 @@ pub enum TaskCommand {
     Create {
         /// Task title.
         title: String,
-        /// Optional stable id (auto-generated when omitted).
+        /// Optional stable id (auto-generated 4-char opaque id when omitted).
         #[arg(long)]
         id: Option<String>,
         /// Initial assignee.
@@ -58,6 +58,8 @@ pub enum TaskCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Print the Markdown file path for one task.
+    Path { id: String },
     /// Assign a task to yourself (or `--assignee`) and set status to `in_progress`.
     Claim {
         id: String,
@@ -113,10 +115,13 @@ pub enum TaskBoardCommand {
         json: bool,
     },
     /// Create a board and switch to it.
+    ///
+    /// Everyday restart/list reuses an existing board; use this only when you
+    /// want a new board. `--id` is required so boards are named on purpose.
     New {
-        /// Board id (auto-generated when omitted).
+        /// Board id (required).
         #[arg(long)]
-        id: Option<String>,
+        id: String,
         #[arg(long)]
         title: Option<String>,
         #[arg(long)]
@@ -166,6 +171,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             json,
         } => run_create(title, id, assignee, blocked_by, body, json),
         TaskCommand::Show { id, json } => run_show(id, json),
+        TaskCommand::Path { id } => run_path(id),
         TaskCommand::Claim { id, assignee, json } => run_claim(id, assignee, json),
         TaskCommand::Update {
             id,
@@ -247,11 +253,9 @@ fn run_board_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_board_new(id: Option<String>, title: Option<String>, json: bool) -> Result<()> {
+fn run_board_new(id: String, title: Option<String>, json: bool) -> Result<()> {
     let cwd = workspace_cwd()?;
     let workspace = workspace_for_cwd(&cwd)?;
-    let id =
-        id.unwrap_or_else(|| format!("board-{}-{}", crate::util::now_millis(), std::process::id()));
     let meta = create_board(&workspace, &id, title)?;
     set_active_board(&workspace, &meta.id)?;
 
@@ -280,10 +284,30 @@ fn run_list(json: bool, status: Option<TaskStatusArg>, assignee: Option<String>)
     };
     let tasks = list_tasks(&ctx.tasks_dir, &filter)?;
 
+    let (board_title, boards) = if ctx.workspace_id.is_empty() {
+        (None, Vec::new())
+    } else {
+        let cwd = workspace_cwd()?;
+        let workspace = workspace_for_cwd(&cwd)?;
+        let boards = list_boards(&workspace)?;
+        let board_title = boards
+            .iter()
+            .find(|board| board.id == ctx.board_id)
+            .and_then(|board| board.title.clone());
+        (board_title, boards)
+    };
+
     if json {
         let payload = serde_json::json!({
             "workspace_id": ctx.workspace_id,
             "board": ctx.board_id,
+            "board_title": board_title,
+            "boards": boards.iter().map(|board| {
+                serde_json::json!({
+                    "id": board.id,
+                    "title": board.title,
+                })
+            }).collect::<Vec<_>>(),
             "tasks": tasks,
         });
         println!("{}", serde_json::to_string_pretty(&payload)?);
@@ -332,6 +356,18 @@ fn run_show(id: String, json: bool) -> Result<()> {
         bail!("task not found: {id}");
     };
     print_task_result(&task, json, "show")
+}
+
+fn run_path(id: String) -> Result<()> {
+    let ctx = tasks_context()?;
+    if get_task(&ctx.tasks_dir, &id)?.is_none() {
+        bail!("task not found: {id}");
+    }
+    println!(
+        "{}",
+        crate::task_store::task_file_path(&ctx.tasks_dir, &id).display()
+    );
+    Ok(())
 }
 
 fn run_claim(id: String, assignee: Option<String>, json: bool) -> Result<()> {
@@ -511,13 +547,18 @@ mod tests {
             Some(Command::Task {
                 command: TaskCommand::Board {
                     command: TaskBoardCommand::New {
-                        id: Some(id),
+                        id,
                         title: Some(title),
                         json: false,
                     },
                 },
             }) if id == "phase2" && title == "Phase 2"
         ));
+
+        assert!(
+            Cli::try_parse_from(["via", "task", "board", "new", "--title", "Phase 2"]).is_err(),
+            "board new requires --id"
+        );
 
         let cli = Cli::try_parse_from(["via", "task", "board", "use", "phase2"]).unwrap();
         assert!(matches!(
@@ -617,6 +658,14 @@ mod tests {
             cli.command,
             Some(Command::Task {
                 command: TaskCommand::Done { id, json: false },
+            }) if id == "phase2-store"
+        ));
+
+        let cli = Cli::try_parse_from(["via", "task", "path", "phase2-store"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Task {
+                command: TaskCommand::Path { id },
             }) if id == "phase2-store"
         ));
     }

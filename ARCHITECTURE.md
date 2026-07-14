@@ -186,7 +186,7 @@ Naming convention used in via:
 | Term          | Meaning                                    | Lifetime  | On disk                              |
 | ------------- | ------------------------------------------ | --------- | ------------------------------------ |
 | **Instance**  | Live via process (pid, sockets, agent bus) | Ephemeral | `instances/<pid>/`                   |
-| **Workspace** | Project scope (hash of canonical `cwd`)    | Durable   | `workspaces/<id>/`                   |
+| **Workspace** | Project scope (sanitized canonical `cwd`)  | Durable   | `workspaces/<id>/`                   |
 | **Board**     | Task board within a workspace              | Durable   | `workspaces/<id>/boards/<board-id>/` |
 
 Under `$XDG_DATA_HOME/via` (default `~/.local/share/via`):
@@ -203,18 +203,23 @@ workspaces/<workspace-id>/    # durable per-project state
   active_board                # pointer to selected board
   boards/<board-id>/
     meta.json
-    tasks/*.json              # one file per task (task_store)
+    tasks/*.md                # one Markdown file per task (task_store)
 ```
 
 - **Instance** — `SessionGuard` creates `instances/<pid>/` at startup and
   removes it on clean shutdown. Detached mode sets `VIA_RUNTIME_ROOT` to the
   same path. `via session list` discovers live instances by scanning
   `instances/*/session.json`.
-- **Workspace** — id is a stable 16-hex FNV-1a hash of the canonical working
-  directory (`src/workspace.rs`). Created lazily on first task operation.
-- **Board** — switch task context with `via task board new|use|list`. Tasks on
-  the active board survive via restarts; agent mailboxes do not
-  (instance-scoped).
+- **Workspace** — id is a sanitized absolute path of the canonical working
+  directory (`src/workspace.rs`), e.g. `/home/you/proj` →
+  `home_you_proj`. Created lazily on first task operation. Browsable under
+  `~/.local/share/via/workspaces/`.
+- **Board** — startup and `via task *` **reuse** the active board (or the
+  most recently used board if the pointer is stale); `default` is created
+  only when the workspace has no boards yet. Explicit `via task board new
+  --id …` creates and activates a new board. Board `meta.json` tracks
+  `last_used_at` (updated on activate). Tasks on the active board survive
+  via restarts; agent mailboxes do not (instance-scoped).
 
 ACP **sessions** (JSON-RPC `new_session`) are a separate concept — subprocess
 conversation handles inside an instance, not file-backed storage.
