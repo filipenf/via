@@ -10,8 +10,7 @@ editors and AI coding agents. Instead of every editor scraping PTYs or inventing
 ad-hoc text protocols (`@file\n`, etc.), ACP defines a structured bidirectional
 JSON-RPC channel (over stdio or sockets) for:
 
-- Editor → Agent: context updates (`active_buffer`, workspace roots,
-  diagnostics, etc.)
+- Editor → Agent: context updates (workspace roots, diagnostics, etc.)
 - Agent → Editor: tool calls, permission requests, streaming responses, session
   management
 - Capabilities negotiation on startup
@@ -28,7 +27,7 @@ clients.
   - Spawn an agent subprocess (`opencode acp`, `cursor-agent acp`, etc.)
   - Perform the `initialize` handshake
   - Create sessions via `new_session`
-  - Push structured context via `context/update`
+  - Send prompts (including explicit buffer context via `:ViaBufferSend`)
 - Integration into `Mediator`:
   - Sub-agents connect on spawn: when a spawn command `is_acp_command`, the
     mediator establishes a session for that id and starts its reader

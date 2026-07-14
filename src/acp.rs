@@ -70,22 +70,6 @@ pub struct AgentInfo {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct ContextUpdateParams {
-    pub active_buffer: Option<BufferContext>,
-    #[serde(default)]
-    pub workspace_roots: Vec<String>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub struct BufferContext {
-    pub path: String,
-    pub line: u32,
-    pub column: u32,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionParams {
     pub cwd: String,
@@ -293,16 +277,6 @@ impl AcpClient {
         }
     }
 
-    /// Push updated editor context to the agent.
-    ///
-    /// This is the primary mechanism for keeping the agent aware of the
-    /// current buffer, cursor position, etc. It replaces any previous
-    /// context for the active session.
-    pub async fn update_context(&mut self, params: ContextUpdateParams) -> Result<()> {
-        self.send_notification("context/update", serde_json::to_value(params)?)
-            .await
-    }
-
     /// Send a prompt to an existing session.
     pub async fn prompt(
         &mut self,
@@ -362,16 +336,6 @@ impl AcpClient {
         self.read_response(id).await
     }
 
-    async fn send_notification(&mut self, method: &str, params: serde_json::Value) -> Result<()> {
-        let msg = JsonRpcMessage::Notification {
-            jsonrpc: "2.0".to_string(),
-            method: method.to_string(),
-            params,
-        };
-
-        self.write_message(&msg).await
-    }
-
     async fn send_request_detached(
         &mut self,
         method: &str,
@@ -417,21 +381,6 @@ impl AcpClient {
             "result": result,
         });
         self.write_line_json(&line).await
-    }
-
-    async fn write_message(&mut self, msg: &JsonRpcMessage) -> Result<()> {
-        let json = serde_json::to_string(msg)?;
-        debug!(json = %json, "writing ACP message to agent stdin");
-        let stdin = self
-            .child
-            .stdin
-            .as_mut()
-            .context("agent stdin unavailable")?;
-        stdin.write_all(json.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-        debug!("ACP message flushed to agent");
-        Ok(())
     }
 
     async fn read_response(&mut self, expected_id: u64) -> Result<serde_json::Value> {

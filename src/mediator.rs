@@ -6,7 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
-use crate::acp::{self, ContextUpdateParams, PromptResource};
+use crate::acp::PromptResource;
 use crate::acp_runtime::{AcpConnectCtx, AcpRuntime};
 use crate::agent_bus;
 use crate::agent_delivery::AgentDelivery;
@@ -327,44 +327,8 @@ impl Mediator {
     }
 
     async fn apply_editor_event(&mut self, event: EditorEvent) {
-        let previous_path = self
-            .editor_state
-            .active_buffer
-            .as_ref()
-            .map(|buffer| buffer.path.clone());
-
         debug!(?event, "editor context updated");
         match &event {
-            EditorEvent::ActiveBufferChanged { path, line, column } => {
-                // Editor context follows the primary ACP agent when one is connected.
-                if let Some(session) = self.acp_runtime.session_for_prompt(None).await {
-                    let path = path.clone();
-                    let line = *line;
-                    let column = *column;
-                    let client = Arc::clone(&session.client);
-                    tokio::spawn(async move {
-                        let params = ContextUpdateParams {
-                            active_buffer: Some(acp::BufferContext {
-                                path: path.to_string_lossy().to_string(),
-                                line,
-                                column,
-                            }),
-                            workspace_roots: vec![],
-                        };
-                        let mut guard = client.lock().await;
-                        if let Err(err) = guard.update_context(params).await {
-                            debug!(%err, "failed to send ACP context update");
-                        }
-                    });
-                } else if previous_path.as_ref() != Some(path) {
-                    // Legacy PTY path
-                    self.send_ui_command(UiCommand::EditorContextChanged {
-                        path: path.clone(),
-                        line: *line,
-                        column: *column,
-                    });
-                }
-            }
             EditorEvent::VisualSelectionChanged { .. } => {}
             EditorEvent::DiagnosticsChanged { .. } => {}
             EditorEvent::BufferSendRequested {
