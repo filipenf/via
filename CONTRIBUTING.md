@@ -144,6 +144,21 @@ commands against the active `VIA_SESSION`: spawns `reviewer` and `orchestrator`,
 checks ACP registry mode, verifies ACP prompt delivery, verifies PTY mailbox-only
 send behavior, checks missing-recipient failure, and terminates spawned panes.
 
+For a higher-level **skills / harness eval** (create a task board, delegate to
+helpers, implement a tiny fixture until green), see
+[`evals/task-board-loop/`](evals/task-board-loop/README.md):
+
+```sh
+# After an agent run (portable: paste PROMPT.md into any harness):
+EVAL_BOARD_ID=eval-<run-id> mise run eval-task-board-grade
+
+# Or unattended inside a live via session (ACP spawn required):
+mise run eval-task-board-via
+```
+
+Also opt-in and not CI-gated. Grading is deterministic (`grade.sh` +
+`fixture/verify.sh`); there is no LLM judge.
+
 We have Criterion micro-benchmarks for the two most user-visible
 performance-sensitive surfaces:
 
