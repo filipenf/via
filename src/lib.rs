@@ -13,6 +13,7 @@ mod mediator;
 mod nvim;
 mod plugin;
 mod pty;
+mod reference_index;
 mod session;
 mod task_delivery;
 mod task_store;
@@ -79,7 +80,13 @@ async fn async_main(cli: Cli) -> Result<()> {
     if let Some(open) = cli.open {
         nvim::log_socket_warning(&config.nvim_socket_path);
         let target = FileTarget::parse(&open, &config.working_directory);
-        nvim::open_file(&config.nvim_socket_path, &config.working_directory, target).await?;
+        nvim::open_file(
+            &config.nvim_socket_path,
+            &config.working_directory,
+            target,
+            &[],
+        )
+        .await?;
         return Ok(());
     }
 

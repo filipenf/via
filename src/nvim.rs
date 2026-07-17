@@ -58,6 +58,7 @@ pub async fn open_file(
     socket_path: &Path,
     working_directory: &Path,
     target: FileTarget,
+    candidates: &[PathBuf],
 ) -> Result<()> {
     if !socket_path.exists() {
         bail!(
@@ -67,7 +68,7 @@ pub async fn open_file(
     }
 
     let (nvim, io_handle) = connect(socket_path).await?;
-    let command = file_open_command(&target, working_directory);
+    let command = file_open_command(&target, working_directory, candidates);
 
     nvim.command(&command)
         .await
@@ -285,7 +286,11 @@ fn resolve_path(path: &str, working_directory: &Path) -> PathBuf {
     }
 }
 
-fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
+fn file_open_command(
+    target: &FileTarget,
+    working_directory: &Path,
+    candidates: &[PathBuf],
+) -> String {
     let path = target
         .path
         .strip_prefix(working_directory)
@@ -295,10 +300,29 @@ fn file_open_command(target: &FileTarget, working_directory: &Path) -> String {
         .line
         .map(|line| line.to_string())
         .unwrap_or_else(|| "nil".to_string());
-    let replacements: [(&str, &str); 2] =
-        [("__PATH__", path.as_str()), ("__LINE__", line.as_str())];
+    let candidates = lua_path_table(candidates);
+    let replacements: [(&str, &str); 3] = [
+        ("__PATH__", path.as_str()),
+        ("__LINE__", line.as_str()),
+        ("__CANDIDATES__", candidates.as_str()),
+    ];
 
     lua_command(OPEN_FILE_LUA_TEMPLATE, replacements.as_slice())
+}
+
+fn lua_path_table(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "nil".to_string();
+    }
+    let mut out = String::from("{ ");
+    for (i, path) in paths.iter().enumerate() {
+        if i > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&lua_string_literal(&path.to_string_lossy()));
+    }
+    out.push_str(" }");
+    out
 }
 
 fn symbol_open_command(symbol: &str) -> String {
@@ -433,12 +457,35 @@ mod tests {
                 line: Some(42),
             },
             Path::new("/repo"),
+            &[],
         );
-        assert!(command.starts_with("lua local path = \"src/main.rs\"; local line = 42;"));
+        assert!(command.starts_with(
+            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")"
+        ));
         assert!(command.contains("vim.cmd(\"drop +\" .. line .. \" \" .. escaped)"));
         assert!(command.contains("open_buffer_matches"));
         assert!(command.contains("telescope.builtin"));
         assert!(command.contains("vim.ui.select"));
+        assert!(command.contains("via.vcs"));
+    }
+
+    #[test]
+    fn builds_file_open_command_with_index_candidates() {
+        let command = file_open_command(
+            &FileTarget {
+                path: PathBuf::from("/repo/main.rs"),
+                line: Some(10),
+            },
+            Path::new("/repo"),
+            &[
+                PathBuf::from("/repo/src/main.rs"),
+                PathBuf::from("/repo/tests/main.rs"),
+            ],
+        );
+        assert!(command.starts_with(
+            "lua local path = \"main.rs\"; local line = 10; local index_candidates = { \"/repo/src/main.rs\", \"/repo/tests/main.rs\" };"
+        ));
+        assert!(command.contains("index_candidates"));
     }
 
     #[test]

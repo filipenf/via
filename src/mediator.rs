@@ -15,7 +15,7 @@ use crate::config::ReviewBackend;
 use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
-use crate::nvim::{self, FileTarget};
+use crate::nvim;
 
 use crate::config::ORCHESTRATOR_AGENT_ID;
 
@@ -199,11 +199,15 @@ impl Mediator {
                     break;
                 }
                 Event::Ui(UiEvent::OpenRequested { path, line }) => {
-                    let target = FileTarget { path, line };
+                    let (target, candidates) = self
+                        .editor_state
+                        .file_index
+                        .resolve_open_from_index(path, line);
                     if let Err(error) = nvim::open_file(
                         &self.config.nvim_socket_path,
                         &self.config.working_directory,
                         target,
+                        &candidates,
                     )
                     .await
                     {
@@ -504,6 +508,29 @@ impl Mediator {
             }
             EditorEvent::TaskDeleted { id } => {
                 debug!(%id, "task deleted signal received");
+            }
+            EditorEvent::FileIndexChanged {
+                buffers,
+                vcs_working_tree,
+                vcs_branch,
+            } => {
+                debug!(
+                    buffers = buffers.len(),
+                    vcs_wt = vcs_working_tree.len(),
+                    vcs_branch = vcs_branch.len(),
+                    "file index snapshot received"
+                );
+                self.send_ui_command(UiCommand::FileIndexChanged {
+                    buffers: buffers.clone(),
+                    vcs_working_tree: vcs_working_tree.clone(),
+                    vcs_branch: vcs_branch.clone(),
+                });
+            }
+            EditorEvent::SymbolIndexChanged { symbols } => {
+                debug!(symbols = symbols.len(), "symbol index snapshot received");
+                self.send_ui_command(UiCommand::SymbolIndexChanged {
+                    symbols: symbols.clone(),
+                });
             }
         }
 

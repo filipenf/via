@@ -10,11 +10,13 @@ use tracing::{debug, error, info, warn};
 
 use crate::event::{EditorEvent, Event};
 use crate::mediator::EventSender;
+use crate::reference_index::ReferenceIndex;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EditorState {
     pub visual_selection: Option<VisualSelection>,
     pub diagnostics: HashMap<PathBuf, DiagnosticSummary>,
+    pub file_index: ReferenceIndex,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +86,17 @@ impl EditorState {
             EditorEvent::TaskDeleted { .. } => {
                 // one-shot signal, forwarded to UI by mediator
             }
+            EditorEvent::FileIndexChanged {
+                buffers,
+                vcs_working_tree,
+                vcs_branch,
+            } => {
+                self.file_index
+                    .set_files(buffers, vcs_working_tree, vcs_branch);
+            }
+            EditorEvent::SymbolIndexChanged { symbols } => {
+                self.file_index.set_symbols(symbols);
+            }
         }
     }
 }
@@ -145,6 +158,27 @@ enum WireEditorEvent {
     TaskDeleted {
         id: String,
     },
+    FileIndexChanged {
+        #[serde(default)]
+        buffers: Vec<String>,
+        #[serde(default)]
+        vcs_working_tree: Vec<String>,
+        #[serde(default)]
+        vcs_branch: Vec<String>,
+    },
+    SymbolIndexChanged {
+        #[serde(default)]
+        symbols: Vec<WireIndexedSymbol>,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct WireIndexedSymbol {
+    name: String,
+    #[serde(default)]
+    kind: u32,
+    path: String,
+    line: u32,
 }
 
 fn default_true() -> bool {
@@ -281,6 +315,35 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
         WireEditorEvent::TaskCreated { id } => EditorEvent::TaskCreated { id },
         WireEditorEvent::TaskUpdated { id, fields } => EditorEvent::TaskUpdated { id, fields },
         WireEditorEvent::TaskDeleted { id } => EditorEvent::TaskDeleted { id },
+        WireEditorEvent::FileIndexChanged {
+            buffers,
+            vcs_working_tree,
+            vcs_branch,
+        } => EditorEvent::FileIndexChanged {
+            buffers: buffers
+                .into_iter()
+                .map(|p| resolve_path(&p, working_directory))
+                .collect(),
+            vcs_working_tree: vcs_working_tree
+                .into_iter()
+                .map(|p| resolve_path(&p, working_directory))
+                .collect(),
+            vcs_branch: vcs_branch
+                .into_iter()
+                .map(|p| resolve_path(&p, working_directory))
+                .collect(),
+        },
+        WireEditorEvent::SymbolIndexChanged { symbols } => EditorEvent::SymbolIndexChanged {
+            symbols: symbols
+                .into_iter()
+                .map(|s| crate::reference_index::IndexedSymbol {
+                    name: s.name,
+                    kind: s.kind,
+                    path: resolve_path(&s.path, working_directory),
+                    line: s.line,
+                })
+                .collect(),
+        },
     })
 }
 
@@ -479,5 +542,72 @@ mod tests {
                 text: "fn main() {}".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn parses_file_index_changed_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"file_index_changed","buffers":["src/main.rs"],"vcs_working_tree":["src/lib.rs"],"vcs_branch":["src/editor.rs"]}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::FileIndexChanged {
+                buffers: vec![PathBuf::from("/repo/src/main.rs")],
+                vcs_working_tree: vec![PathBuf::from("/repo/src/lib.rs")],
+                vcs_branch: vec![PathBuf::from("/repo/src/editor.rs")],
+            }
+        );
+    }
+
+    #[test]
+    fn applies_file_index_changed_to_state() {
+        let mut state = EditorState::default();
+        state.apply(EditorEvent::FileIndexChanged {
+            buffers: vec![PathBuf::from("/repo/src/main.rs")],
+            vcs_working_tree: vec![PathBuf::from("/repo/src/main.rs")],
+            vcs_branch: vec![],
+        });
+        assert!(state.file_index.contains_basename("main.rs"));
+        assert!(!state.file_index.is_empty());
+    }
+
+    #[test]
+    fn parses_symbol_index_changed_event() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"symbol_index_changed","symbols":[{"name":"parse_event","kind":12,"path":"src/editor.rs","line":44}]}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::SymbolIndexChanged {
+                symbols: vec![crate::reference_index::IndexedSymbol {
+                    name: "parse_event".to_string(),
+                    kind: 12,
+                    path: PathBuf::from("/repo/src/editor.rs"),
+                    line: 44,
+                }],
+            }
+        );
+    }
+
+    #[test]
+    fn applies_symbol_index_changed_preserving_files() {
+        let mut state = EditorState::default();
+        state.apply(EditorEvent::FileIndexChanged {
+            buffers: vec![PathBuf::from("/repo/src/main.rs")],
+            vcs_working_tree: vec![],
+            vcs_branch: vec![],
+        });
+        state.apply(EditorEvent::SymbolIndexChanged {
+            symbols: vec![crate::reference_index::IndexedSymbol {
+                name: "parse_event".to_string(),
+                kind: 12,
+                path: PathBuf::from("/repo/src/editor.rs"),
+                line: 44,
+            }],
+        });
+        assert!(state.file_index.contains_basename("main.rs"));
+        assert!(state.file_index.contains_symbol("parse_event"));
     }
 }

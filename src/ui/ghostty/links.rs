@@ -2,6 +2,30 @@ use std::path::Path;
 
 use crate::nvim::FileTarget;
 use crate::pty::TerminalSize;
+use crate::reference_index::ReferenceIndex;
+
+/// Working directory + optional file index for cue scan / click resolution.
+#[derive(Debug, Clone, Copy)]
+pub struct ReferenceContext<'a> {
+    pub working_directory: &'a Path,
+    pub file_index: Option<&'a ReferenceIndex>,
+}
+
+impl<'a> ReferenceContext<'a> {
+    pub fn new(working_directory: &'a Path, file_index: Option<&'a ReferenceIndex>) -> Self {
+        Self {
+            working_directory,
+            file_index,
+        }
+    }
+
+    pub fn cwd_only(working_directory: &'a Path) -> Self {
+        Self {
+            working_directory,
+            file_index: None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReferenceTarget {
@@ -45,7 +69,7 @@ struct FileReferenceSpan {
 struct SymbolReferenceSpan {
     start: usize,
     end: usize,
-    symbol: String,
+    target: ReferenceTarget,
 }
 
 #[derive(Debug)]
@@ -334,13 +358,25 @@ pub fn reference_target_from_row(
     column: usize,
     working_directory: &Path,
 ) -> Option<ReferenceTarget> {
-    reference_spans_from_row(row, working_directory)
+    reference_target_from_row_ctx(row, column, ReferenceContext::cwd_only(working_directory))
+}
+
+pub fn reference_target_from_row_ctx(
+    row: &str,
+    column: usize,
+    ctx: ReferenceContext<'_>,
+) -> Option<ReferenceTarget> {
+    reference_spans_from_row_ctx(row, ctx)
         .into_iter()
         .find(|span| column >= span.start && column < span.end)
         .map(|span| span.target)
 }
 
 pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<ReferenceSpan> {
+    reference_spans_from_row_ctx(row, ReferenceContext::cwd_only(working_directory))
+}
+
+pub fn reference_spans_from_row_ctx(row: &str, ctx: ReferenceContext<'_>) -> Vec<ReferenceSpan> {
     let mut spans: Vec<ReferenceSpan> = url_reference_spans(row)
         .into_iter()
         .map(|span| ReferenceSpan {
@@ -351,7 +387,7 @@ pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<Refe
         .collect();
 
     spans.extend(
-        file_reference_spans(row, working_directory)
+        file_reference_spans(row, ctx)
             .into_iter()
             .map(|span| ReferenceSpan {
                 start: span.start,
@@ -360,46 +396,61 @@ pub fn reference_spans_from_row(row: &str, working_directory: &Path) -> Vec<Refe
             }),
     );
 
+    let file_ranges: Vec<(usize, usize)> = spans
+        .iter()
+        .filter(|span| matches!(span.target, ReferenceTarget::File(_)))
+        .map(|span| (span.start, span.end))
+        .collect();
+
     spans.extend(
-        symbol_reference_spans(row)
+        symbol_reference_spans(row, ctx)
             .into_iter()
+            .filter(|span| {
+                !file_ranges
+                    .iter()
+                    .any(|&(start, end)| start == span.start && end == span.end)
+            })
             .map(|span| ReferenceSpan {
                 start: span.start,
                 end: span.end,
-                target: ReferenceTarget::Symbol(span.symbol),
+                target: span.target,
             }),
     );
 
     spans
 }
 
-fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenceSpan> {
+fn file_reference_spans(row: &str, ctx: ReferenceContext<'_>) -> Vec<FileReferenceSpan> {
     let chars: Vec<char> = row.chars().collect();
     let mut spans = Vec::new();
-    let mut index = 0;
+    let mut cursor = 0;
 
-    while index < chars.len() {
-        while index < chars.len() && !is_file_reference_char(chars[index]) {
-            index += 1;
+    while cursor < chars.len() {
+        while cursor < chars.len() && !is_file_reference_char(chars[cursor]) {
+            cursor += 1;
         }
 
-        let start = index;
+        let start = cursor;
 
-        while index < chars.len() && is_file_reference_char(chars[index]) {
-            index += 1;
+        while cursor < chars.len() && is_file_reference_char(chars[cursor]) {
+            cursor += 1;
         }
 
-        if start == index {
+        if start == cursor {
             continue;
         }
 
-        let raw_slice = &chars[start..index];
+        let raw_slice = &chars[start..cursor];
         let raw_collected: String = raw_slice.iter().collect();
 
         let (token_start, token_end, token) = if let Some((n_start, n_end, narrowed)) =
             narrow_call_wrapped_file_path(&raw_collected)
         {
-            if looks_like_file_reference(&narrowed) {
+            if looks_like_file_reference(&narrowed)
+                || ctx
+                    .file_index
+                    .is_some_and(|idx| idx.should_cue_file_token(&narrowed))
+            {
                 (n_start, n_end, narrowed)
             } else if let Some((ts, te, t)) = trim_file_reference(raw_slice) {
                 (ts, te, t)
@@ -412,7 +463,11 @@ fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenc
             continue;
         };
 
-        if !looks_like_file_reference(&token) {
+        let should_cue = match ctx.file_index {
+            Some(idx) => idx.should_cue_file_token(&token),
+            None => looks_like_file_reference(&token),
+        };
+        if !should_cue {
             continue;
         }
 
@@ -420,7 +475,10 @@ fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenc
             continue;
         }
 
-        let target = FileTarget::parse(&token, working_directory);
+        let target = match ctx.file_index {
+            Some(idx) => idx.file_target_for_token(&token, ctx.working_directory),
+            None => FileTarget::parse(&token, ctx.working_directory),
+        };
 
         spans.push(FileReferenceSpan {
             start: start + token_start,
@@ -432,7 +490,7 @@ fn file_reference_spans(row: &str, working_directory: &Path) -> Vec<FileReferenc
     spans
 }
 
-fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
+fn symbol_reference_spans(row: &str, ctx: ReferenceContext<'_>) -> Vec<SymbolReferenceSpan> {
     let chars: Vec<char> = row.chars().collect();
     let mut spans = Vec::new();
     let mut index = 0;
@@ -459,14 +517,30 @@ fn symbol_reference_spans(row: &str) -> Vec<SymbolReferenceSpan> {
         }
         let token: String = raw[rel_start..rel_end].iter().collect();
 
-        if !looks_like_scanned_symbol(&token) {
+        if !looks_like_symbol(&token) {
             continue;
         }
+
+        let should_cue = match ctx.file_index {
+            Some(idx) => idx.should_cue_symbol_token(&token),
+            None => looks_like_scanned_symbol(&token),
+        };
+        if !should_cue {
+            continue;
+        }
+
+        let target = match ctx
+            .file_index
+            .and_then(|idx| idx.file_target_for_symbol(&token))
+        {
+            Some(file) => ReferenceTarget::File(file),
+            None => ReferenceTarget::Symbol(token),
+        };
 
         spans.push(SymbolReferenceSpan {
             start: start + rel_start,
             end: start + rel_end,
-            symbol: token,
+            target,
         });
     }
 
@@ -991,5 +1065,130 @@ mod tests {
                 line: Some(10),
             })
         );
+    }
+
+    #[test]
+    fn index_resolves_unique_bare_basename() {
+        use crate::reference_index::ReferenceIndex;
+
+        let idx = ReferenceIndex::from_parts([PathBuf::from("/repo/src/main.rs")], [], []);
+        let target = reference_target_from_row_ctx(
+            "open main.rs here",
+            6,
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/main.rs"),
+                line: None,
+            })
+        );
+    }
+
+    #[test]
+    fn index_cues_extensionless_basename_when_known() {
+        use crate::reference_index::ReferenceIndex;
+
+        let idx = ReferenceIndex::from_parts([PathBuf::from("/repo/Makefile")], [], []);
+        let spans = reference_spans_from_row_ctx(
+            "see Makefile next",
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        );
+        assert!(spans.iter().any(|span| matches!(
+            &span.target,
+            ReferenceTarget::File(t) if t.path.ends_with("Makefile")
+        )));
+    }
+
+    #[test]
+    fn without_index_extensionless_basename_is_not_cued() {
+        let spans = reference_spans_from_row("see Makefile next", Path::new("/repo"));
+        assert!(spans.iter().all(|span| !matches!(
+            &span.target,
+            ReferenceTarget::File(t) if t.path.file_name().and_then(|n| n.to_str()) == Some("Makefile")
+        )));
+    }
+
+    #[test]
+    fn index_cues_bare_symbol_when_known() {
+        use crate::reference_index::{IndexedSymbol, ReferenceIndex};
+
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([IndexedSymbol {
+            name: "parse_event".to_string(),
+            kind: 12,
+            path: PathBuf::from("/repo/src/editor.rs"),
+            line: 44,
+        }]);
+
+        let target = reference_target_from_row_ctx(
+            "call parse_event next",
+            6,
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            target,
+            ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/src/editor.rs"),
+                line: Some(44),
+            })
+        );
+    }
+
+    #[test]
+    fn index_ignores_plain_words_not_in_symbol_index() {
+        use crate::reference_index::ReferenceIndex;
+
+        let idx = ReferenceIndex::default();
+        assert!(
+            reference_target_from_row_ctx(
+                "these are plain words",
+                1,
+                ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn ambiguous_symbol_falls_back_to_symbol_target() {
+        use crate::reference_index::{IndexedSymbol, ReferenceIndex};
+
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([
+            IndexedSymbol {
+                name: "parse".to_string(),
+                kind: 12,
+                path: PathBuf::from("/repo/src/a.rs"),
+                line: 1,
+            },
+            IndexedSymbol {
+                name: "parse".to_string(),
+                kind: 12,
+                path: PathBuf::from("/repo/src/b.rs"),
+                line: 2,
+            },
+        ]);
+
+        let target = reference_target_from_row_ctx(
+            "call parse next",
+            6,
+            ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+        )
+        .unwrap();
+
+        assert_eq!(target, ReferenceTarget::Symbol("parse".to_string()));
+    }
+
+    #[test]
+    fn qualified_symbol_still_cues_with_cold_index() {
+        let target =
+            reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
+        assert_eq!(target, ReferenceTarget::Symbol("Foo::bar_baz".to_string()));
     }
 }

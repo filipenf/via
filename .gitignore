@@ -28,3 +28,6 @@ via.conf
 .DS_Store
 Thumbs.db
 
+
+#jj workspaces
+workspaces/

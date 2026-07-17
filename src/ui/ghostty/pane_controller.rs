@@ -1,5 +1,4 @@
 use std::ops::{Deref, DerefMut};
-use std::path::Path;
 
 use anyhow::Result;
 use tracing::info;
@@ -9,7 +8,7 @@ use super::input::{
     Key, Modifiers, copy_requested, forward_special_keys, forward_text_input, paste_requested,
     try_clipboard_paste,
 };
-use super::links::ReferenceTarget;
+use super::links::{ReferenceContext, ReferenceTarget};
 use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,14 +228,12 @@ impl TerminalPaneController {
     pub(super) fn handle_modifiers_changed(
         &mut self,
         modifiers: Modifiers,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> PaneEventOutcome {
         if matches!(self.role, PaneRole::Editor) {
             return PaneEventOutcome::default();
         }
-        let dirty = self
-            .pane
-            .set_reference_cues_enabled(modifiers.ctrl, working_directory);
+        let dirty = self.pane.set_reference_cues_enabled(modifiers.ctrl, ctx);
         PaneEventOutcome {
             dirty,
             force_redraw: dirty,
@@ -275,20 +272,15 @@ impl TerminalPaneController {
         local_x: usize,
         local_y: usize,
         modifiers: Modifiers,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> Result<PaneEventOutcome> {
         match self.role {
             PaneRole::ReviewTerminal => {
                 self.forward_terminal_mouse_input(state, button, local_x, local_y, modifiers)
             }
-            PaneRole::Editor | PaneRole::AgentTerminal { .. } => Ok(self.handle_local_mouse_input(
-                state,
-                button,
-                local_x,
-                local_y,
-                modifiers,
-                working_directory,
-            )),
+            PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
+                Ok(self.handle_local_mouse_input(state, button, local_x, local_y, modifiers, ctx))
+            }
         }
     }
 
@@ -425,7 +417,7 @@ impl TerminalPaneController {
         local_x: usize,
         local_y: usize,
         modifiers: Modifiers,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
     ) -> PaneEventOutcome {
         if button != MouseButton::Left {
             return PaneEventOutcome::default();
@@ -448,12 +440,8 @@ impl TerminalPaneController {
                 outcome.dirty |= self.start_selection(local_x, local_y);
             }
             if is_reference_click {
-                outcome.dirty |= self.forward_reference_click(
-                    local_x,
-                    local_y,
-                    working_directory,
-                    &mut outcome.command,
-                );
+                outcome.dirty |=
+                    self.forward_reference_click(local_x, local_y, ctx, &mut outcome.command);
             }
         }
         if just_released {
@@ -473,14 +461,14 @@ impl TerminalPaneController {
         &mut self,
         local_x: usize,
         local_y: usize,
-        working_directory: &Path,
+        ctx: ReferenceContext<'_>,
         command: &mut Option<PaneCommand>,
     ) -> bool {
         let metrics = self.pane.metrics();
         let row = local_y / metrics.cell_height;
         let column = local_x / metrics.cell_width;
 
-        let Some(target) = self.pane.reference_at(row, column, working_directory) else {
+        let Some(target) = self.pane.reference_at(row, column, ctx) else {
             return false;
         };
 
@@ -724,7 +712,7 @@ mod tests {
                 5 * test_metrics().cell_width,
                 0,
                 Modifiers::default(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
         assert!(without_ctrl.command.is_none());
@@ -734,7 +722,7 @@ mod tests {
             5 * test_metrics().cell_width,
             0,
             Modifiers::default(),
-            Path::new("/repo"),
+            ReferenceContext::cwd_only(Path::new("/repo")),
         )
         .unwrap();
 
@@ -745,7 +733,7 @@ mod tests {
                 5 * test_metrics().cell_width,
                 0,
                 ctrl_modifiers(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -767,7 +755,7 @@ mod tests {
                 5 * test_metrics().cell_width,
                 0,
                 Modifiers::default(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -779,11 +767,17 @@ mod tests {
         let mut pane = test_controller(PaneRole::ReviewTerminal);
         pane.process_for_test(b"open src/main.rs:42", true);
 
-        let outcome = pane.handle_modifiers_changed(ctrl_modifiers(), Path::new("/repo"));
+        let outcome = pane.handle_modifiers_changed(
+            ctrl_modifiers(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        );
         assert!(outcome.dirty);
         assert!(outcome.force_redraw);
 
-        let outcome = pane.handle_modifiers_changed(Modifiers::default(), Path::new("/repo"));
+        let outcome = pane.handle_modifiers_changed(
+            Modifiers::default(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        );
         assert!(outcome.dirty);
         assert!(outcome.force_redraw);
     }
@@ -805,7 +799,7 @@ mod tests {
                 x,
                 0,
                 Modifiers::default(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
         assert!(without_ctrl.command.is_none());
@@ -815,7 +809,7 @@ mod tests {
             x,
             0,
             Modifiers::default(),
-            Path::new("/repo"),
+            ReferenceContext::cwd_only(Path::new("/repo")),
         )
         .unwrap();
 
@@ -826,7 +820,7 @@ mod tests {
                 x,
                 0,
                 ctrl_modifiers(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -863,7 +857,7 @@ mod tests {
                 col,
                 0,
                 ctrl_modifiers(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -898,7 +892,7 @@ mod tests {
                 test_metrics().cell_width,
                 0,
                 ctrl_modifiers(),
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -928,7 +922,7 @@ mod tests {
                     shift: true,
                     ..Modifiers::default()
                 },
-                Path::new("/repo"),
+                ReferenceContext::cwd_only(Path::new("/repo")),
             )
             .unwrap();
 
@@ -945,7 +939,7 @@ mod tests {
             0,
             0,
             Modifiers::default(),
-            Path::new("/repo"),
+            ReferenceContext::cwd_only(Path::new("/repo")),
         )
         .unwrap();
         assert_eq!(pane.held_button_for_test(), Some(PaneMouseButton::Left));
@@ -960,7 +954,7 @@ mod tests {
             10,
             10,
             Modifiers::default(),
-            Path::new("/repo"),
+            ReferenceContext::cwd_only(Path::new("/repo")),
         )
         .unwrap();
         assert_eq!(pane.held_button_for_test(), None);
@@ -976,7 +970,7 @@ mod tests {
             0,
             0,
             Modifiers::default(),
-            Path::new("/repo"),
+            ReferenceContext::cwd_only(Path::new("/repo")),
         )
         .unwrap();
         pane.handle_mouse_wheel((0.0, 40.0), 0, 0, Modifiers::default())

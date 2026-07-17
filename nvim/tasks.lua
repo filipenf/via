@@ -81,7 +81,6 @@ local COL = {
 -- Header prefix for "Your queue" section.
 local YOUR_QUEUE_HEADER = "# Your queue (assignee=human, status=review|in_progress)"
 local ALL_TASKS_HEADER = "# All tasks"
-local SEPARATOR = "#"
 
 --- Build the top-of-buffer board identity line.
 --- Example: `# Board: default  (others: phase2, sprint-a)`
