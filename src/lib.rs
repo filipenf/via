@@ -1,5 +1,6 @@
 mod acp;
 mod acp_runtime;
+pub mod acp_tui;
 mod agent_bus;
 mod agent_delivery;
 mod bootstrap;
@@ -36,6 +37,13 @@ use crate::ui::ghostty::GhosttyUi;
 /// as a crate and reach internal modules via `pub(crate)` items.
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
+
+    // ACP TUI is a TTY display surface hosted in a PTY pane. Dispatch before persist,
+    // headless subcommands, detach, and winit GUI bootstrap so `via --acp-tui` never
+    // opens a window.
+    if cli.acp_tui {
+        return acp_tui::run(cli.acp_tui_args());
+    }
 
     if cli.persist {
         let path = config::persist_resolved(cli.config_overrides())?;

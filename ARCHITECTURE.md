@@ -116,8 +116,10 @@ Major submodules:
 - `font.rs`: cosmic-text + swash based glyph rasterization with tunable
   hinting/shaping/coverage/boost. The actual terminal cells come from
   libghostty-vt; via renders the glyph bitmaps.
-- `acp_pane.rs` / `acp_modal.rs`: Ratatui-backed read/write surface for ACP
-  agents (prompt box that grows, transcript, basic tool state). Still evolving.
+- `acp_modal.rs`: in-process Ratatui overlay for ACP permission / ask-question
+  prompts (drawn via `draw_ratatui_buffer`). ACP agent transcript/input lives in
+  the PTY-hosted `via --acp-tui` child (`src/acp_tui/`), not an in-window Buffer
+  pane.
 - `input.rs`: key and clipboard normalization.
 
 Layout modes (Alt+1/2/Shift variants + Alt+Shift+3 for split direction) live in
@@ -136,9 +138,10 @@ system browser without changing Neovim focus.
   is injected by writing text into the PTY.
 - ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
   as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, explicit
-  context is sent as prompts (e.g. `:ViaBufferSend`). The UI for this path is
-  the Ratatui ACP pane (not a raw PTY). Tool permissions and results flow
-  through the mediator.
+  context is sent as prompts (e.g. `:ViaBufferSend`). The agent UI is a PTY pane
+  running `via --acp-tui` (plain ratatui), glued to the mediator over a side
+  Unix socket. Permission / ask-question modals stay in-process. Tool permissions
+  and results flow through the mediator.
 
 `AcpClient` is intentionally minimal (handshake, session create, prompt,
 tool result serialization). It is not a full agent SDK.

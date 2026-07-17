@@ -17,7 +17,10 @@ pub(super) enum PaneRole {
     AgentTerminal {
         id: String,
         label: String,
+        /// Launch / ACP command recorded in the agent registry (not the TUI binary argv).
         command: Option<String>,
+        /// PTY child is `via --acp-tui`; mediator owns the ACP session.
+        acp_tui: bool,
     },
     ReviewTerminal,
 }
@@ -30,6 +33,7 @@ pub(super) struct PaneEventOutcome {
 }
 
 #[derive(Debug)]
+#[allow(clippy::enum_variant_names)] // Open / SymbolOpen / UrlOpen share a deliberate Requested suffix
 pub(super) enum PaneCommand {
     OpenRequested {
         path: std::path::PathBuf,
@@ -40,9 +44,6 @@ pub(super) enum PaneCommand {
     },
     UrlOpenRequested {
         url: String,
-    },
-    AgentPromptSubmitted {
-        text: String,
     },
 }
 
@@ -99,6 +100,17 @@ impl TerminalPaneController {
     pub(super) fn command(&self) -> Option<&str> {
         match &self.role {
             PaneRole::AgentTerminal { command, .. } => command.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(super) fn is_acp_tui(&self) -> bool {
+        matches!(self.role, PaneRole::AgentTerminal { acp_tui: true, .. })
+    }
+
+    pub(super) fn agent_id(&self) -> Option<&str> {
+        match &self.role {
+            PaneRole::AgentTerminal { id, .. } => Some(id.as_str()),
             _ => None,
         }
     }
@@ -566,6 +578,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         let outcome = pane
             .handle_terminal_key(
@@ -586,6 +599,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         pane.process_for_test(b"\x1b[?1049h", true);
         assert!(pane.is_alt_screen());
@@ -649,6 +663,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 40.0)), 1);
         assert_eq!(pane.accumulate_wheel_steps((0.0, -40.0)), -1);
@@ -661,6 +676,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         // Four sub-threshold pixel events that together cross one step.
         assert_eq!(pane.accumulate_wheel_steps((0.0, 10.0)), 0);
@@ -675,6 +691,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         assert_eq!(pane.accumulate_wheel_steps((0.0, 30.0)), 0);
         // Reversing direction should not have to "pay back" the prior carry.
@@ -688,6 +705,7 @@ mod tests {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
                 command: None,
+                acp_tui: false,
             },
             0.5,
         );
@@ -702,6 +720,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         pane.process_for_test(b"see Foo::bar here", true);
 
@@ -788,6 +807,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         pane.process_for_test(b"open src/main.rs:42", true);
         let x = 6 * test_metrics().cell_width;
@@ -838,6 +858,7 @@ mod tests {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
                 command: None,
+                acp_tui: false,
             },
             TerminalPane::new("agent", 400, 100, test_metrics(), &TerminalTheme::default())
                 .unwrap(),
@@ -875,6 +896,7 @@ mod tests {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
                 command: None,
+                acp_tui: false,
             },
             TerminalPane::new("agent", 400, 100, test_metrics(), &TerminalTheme::default())
                 .unwrap(),
@@ -909,6 +931,7 @@ mod tests {
             id: "agent".to_string(),
             label: "agent".to_string(),
             command: None,
+            acp_tui: false,
         });
         pane.process_for_test(b"open src/main.rs:42", true);
 
@@ -987,6 +1010,7 @@ mod tests {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
                 command: None,
+                acp_tui: false,
             },
         ] {
             let mut pane = test_controller(role);
@@ -1008,6 +1032,7 @@ mod tests {
                 id: "agent".to_string(),
                 label: "agent".to_string(),
                 command: None,
+                acp_tui: false,
             },
         ] {
             let mut pane = test_controller(role);

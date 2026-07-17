@@ -51,6 +51,33 @@ pub struct Cli {
     #[arg(long = "persist")]
     pub persist: bool,
 
+    /// Run the ACP agent TUI (PTY display + input surface). Does not start the GUI.
+    ///
+    /// Hosted by via in a PTY pane; the mediator keeps ACP client ownership. Prefer
+    /// spawning `current_exe()` with this flag rather than a separate binary.
+    #[arg(long = "acp-tui")]
+    pub acp_tui: bool,
+
+    /// ACP TUI: agent id (defaults to `$VIA_AGENT_ID`, then `agent`).
+    #[arg(long = "agent-id")]
+    pub agent_id: Option<String>,
+
+    /// ACP TUI: role label for the header (defaults to `$VIA_AGENT_ROLE`, then agent id).
+    #[arg(long)]
+    pub role: Option<String>,
+
+    /// ACP TUI: seed a demo transcript (standalone smoke without a host).
+    #[arg(long)]
+    pub demo: bool,
+
+    /// ACP TUI: hide the prompt row (output / scrollback only).
+    #[arg(long = "no-input")]
+    pub no_input: bool,
+
+    /// ACP TUI: control-plane Unix socket (defaults to `$VIA_ACP_UI_SOCKET`).
+    #[arg(long = "socket")]
+    pub socket: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -66,6 +93,17 @@ impl Cli {
             scroll_sensitivity: self.scroll_sensitivity,
             plugin_dir: self.plugin_dir.clone(),
             agent_presets: Default::default(),
+        }
+    }
+
+    /// Options for [`crate::acp_tui::run`] when `--acp-tui` is set.
+    pub fn acp_tui_args(&self) -> crate::acp_tui::Args {
+        crate::acp_tui::Args {
+            agent_id: self.agent_id.clone(),
+            role: self.role.clone(),
+            demo: self.demo,
+            no_input: self.no_input,
+            socket: self.socket.clone(),
         }
     }
 }
@@ -307,6 +345,36 @@ mod tests {
     fn parses_review_backend_flag() {
         let cli = Cli::try_parse_from(["via", "--review-backend", "hunk"]).unwrap();
         assert_eq!(cli.review_backend, Some(crate::config::ReviewBackend::Hunk));
+    }
+
+    #[test]
+    fn parses_acp_tui_flags() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "--acp-tui",
+            "--demo",
+            "--agent-id",
+            "coder",
+            "--role",
+            "reviewer",
+            "--socket",
+            "/tmp/acp-ui.sock",
+            "--no-input",
+        ])
+        .unwrap();
+        assert!(cli.acp_tui);
+        assert!(cli.demo);
+        assert!(cli.no_input);
+        assert_eq!(cli.agent_id.as_deref(), Some("coder"));
+        assert_eq!(cli.role.as_deref(), Some("reviewer"));
+        assert_eq!(
+            cli.socket.as_deref(),
+            Some(std::path::Path::new("/tmp/acp-ui.sock"))
+        );
+        let args = cli.acp_tui_args();
+        assert!(args.demo);
+        assert!(args.no_input);
+        assert_eq!(args.agent_id.as_deref(), Some("coder"));
     }
 
     #[test]
