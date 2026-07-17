@@ -680,6 +680,7 @@ fn ensure_lua_assets() {
             ),
             ("via.lua", include_str!("../nvim/via.lua")),
             ("via/tasks.lua", include_str!("../nvim/tasks.lua")),
+            ("via/vcs.lua", include_str!("../nvim/vcs.lua")),
         ] {
             let path = dir.join(filename);
             if let Some(parent) = path.parent() {

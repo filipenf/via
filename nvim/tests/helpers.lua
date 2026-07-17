@@ -76,6 +76,14 @@ function M.load_tasks_module()
   return chunk()
 end
 
+--- Load a fresh copy of nvim/vcs.lua (`require("via.vcs")` source).
+function M.load_vcs_module()
+  local helpers_src = debug.getinfo(1, "S").source:sub(2)
+  local nvim_dir = vim.fn.fnamemodify(helpers_src, ":h:h")
+  local chunk = assert(loadfile(nvim_dir .. "/vcs.lua"))
+  return chunk()
+end
+
 --- Run all registered tests, printing TAP-ish output. Returns true if all passed.
 function M.run()
   for _, t in ipairs(M._tests) do

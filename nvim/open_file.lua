@@ -1,4 +1,5 @@
 local path = __PATH__; local line = __LINE__; local index_candidates = __CANDIDATES__;
+local vcs = require("via.vcs")
 
 local function basename(p)
   return vim.fn.fnamemodify(p, ":t")
@@ -24,29 +25,6 @@ local function drop(p)
   end
 end
 
-local function systemlist(cmd, cwd)
-  local result = vim.system(cmd, { cwd = cwd, text = true }):wait()
-  if result.code ~= 0 then
-    return {}
-  end
-  local cleaned = {}
-  for item in (result.stdout or ""):gmatch("[^\n]+") do
-    if item ~= "" then
-      table.insert(cleaned, item)
-    end
-  end
-  return cleaned
-end
-
-local function system_ok(cmd, cwd)
-  return vim.system(cmd, { cwd = cwd }):wait().code == 0
-end
-
-local function first_system_line(cmd)
-  local out = systemlist(cmd)
-  return out[1]
-end
-
 local function path_set(paths)
   local set = {}
   for _, p in ipairs(paths) do
@@ -55,23 +33,6 @@ local function path_set(paths)
     set[vim.fn.fnamemodify(p, ":.")] = true
   end
   return set
-end
-
--- VCS commands run with cwd=root and return root-relative paths. Resolve them
--- against `root` (not nvim cwd) so path_set/filter_by_set match absolute candidates
--- when Neovim was started in a subdirectory.
-local function resolve_vcs_paths(root, paths)
-  local out = {}
-  for _, p in ipairs(paths) do
-    if p ~= "" then
-      if p:sub(1, 1) == "/" or p:match("^%a:[/\\]") then
-        table.insert(out, abspath(p))
-      else
-        table.insert(out, abspath(root .. "/" .. p))
-      end
-    end
-  end
-  return out
 end
 
 local function filter_by_set(candidates, set)
@@ -83,64 +44,6 @@ local function filter_by_set(candidates, set)
     end
   end
   return matched
-end
-
-local function vcs_root()
-  local jj_root = first_system_line({ "jj", "root", "--no-pager" })
-  if jj_root then
-    return "jj", jj_root
-  end
-
-  local git_root = first_system_line({ "git", "rev-parse", "--show-toplevel" })
-  if git_root then
-    return "git", git_root
-  end
-
-  return nil, nil
-end
-
-local function git_base_ref(root)
-  for _, ref in ipairs({ "main", "master", "@{upstream}" }) do
-    if system_ok({ "git", "rev-parse", "--verify", ref }, root) then
-      return ref
-    end
-  end
-  return nil
-end
-
--- Parse `git status --porcelain` lines into path strings (final path for renames).
-local function parse_git_porcelain(lines)
-  local paths = {}
-  for _, entry in ipairs(lines) do
-    local renamed = entry:match("^.. .* %-> (.+)$")
-    if renamed then
-      table.insert(paths, renamed)
-    else
-      local plain = entry:match("^.. (.+)$")
-      if plain then
-        table.insert(paths, plain)
-      end
-    end
-  end
-  return paths
-end
-
-local function working_tree_paths(kind, root)
-  if kind == "jj" then
-    return systemlist({ "jj", "diff", "--name-only", "--no-pager" }, root)
-  end
-  return parse_git_porcelain(systemlist({ "git", "status", "--porcelain" }, root))
-end
-
-local function branch_changed_paths(kind, root)
-  if kind == "jj" then
-    return systemlist({ "jj", "diff", "--from", "trunk()", "--name-only", "--no-pager" }, root)
-  end
-  local base = git_base_ref(root)
-  if not base then
-    return {}
-  end
-  return systemlist({ "git", "diff", "--name-only", base .. "...HEAD" }, root)
 end
 
 local function open_buffer_matches(fname)
@@ -244,11 +147,11 @@ local function resolve_and_open()
     return
   end
 
-  local kind, root = vcs_root()
+  local kind, root = vcs.root()
   if kind then
     local wt = filter_by_set(
       candidates,
-      path_set(resolve_vcs_paths(root, working_tree_paths(kind, root)))
+      path_set(vcs.resolve_paths(root, vcs.working_tree_paths(kind, root)))
     )
     if #wt == 1 then
       drop(wt[1])
@@ -259,7 +162,7 @@ local function resolve_and_open()
     else
       local branch = filter_by_set(
         candidates,
-        path_set(resolve_vcs_paths(root, branch_changed_paths(kind, root)))
+        path_set(vcs.resolve_paths(root, vcs.branch_changed_paths(kind, root)))
       )
       if #branch == 1 then
         drop(branch[1])

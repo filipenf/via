@@ -460,12 +460,13 @@ mod tests {
             &[],
         );
         assert!(command.starts_with(
-            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;"
+            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")"
         ));
         assert!(command.contains("vim.cmd(\"drop +\" .. line .. \" \" .. escaped)"));
         assert!(command.contains("open_buffer_matches"));
         assert!(command.contains("telescope.builtin"));
         assert!(command.contains("vim.ui.select"));
+        assert!(command.contains("via.vcs"));
     }
 
     #[test]

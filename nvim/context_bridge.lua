@@ -139,86 +139,6 @@ local function send_diagnostics()
   })
 end
 
-local function systemlist(cmd, cwd)
-  local result = vim.system(cmd, { cwd = cwd, text = true }):wait()
-  if result.code ~= 0 then
-    return {}
-  end
-  local cleaned = {}
-  for item in (result.stdout or ""):gmatch("[^\n]+") do
-    if item ~= "" then
-      table.insert(cleaned, item)
-    end
-  end
-  return cleaned
-end
-
-local function system_ok(cmd, cwd)
-  return vim.system(cmd, { cwd = cwd }):wait().code == 0
-end
-
-local function first_system_line(cmd)
-  local out = systemlist(cmd)
-  return out[1]
-end
-
-local function vcs_root()
-  local jj_root = first_system_line({ "jj", "root", "--no-pager" })
-  if jj_root then
-    return "jj", jj_root
-  end
-
-  local git_root = first_system_line({ "git", "rev-parse", "--show-toplevel" })
-  if git_root then
-    return "git", git_root
-  end
-
-  return nil, nil
-end
-
-local function git_base_ref(root)
-  for _, ref in ipairs({ "main", "master", "@{upstream}" }) do
-    if system_ok({ "git", "rev-parse", "--verify", ref }, root) then
-      return ref
-    end
-  end
-  return nil
-end
-
-local function parse_git_porcelain(lines)
-  local paths = {}
-  for _, entry in ipairs(lines) do
-    local renamed = entry:match("^.. .* %-> (.+)$")
-    if renamed then
-      table.insert(paths, renamed)
-    else
-      local plain = entry:match("^.. (.+)$")
-      if plain then
-        table.insert(paths, plain)
-      end
-    end
-  end
-  return paths
-end
-
-local function working_tree_paths(kind, root)
-  if kind == "jj" then
-    return systemlist({ "jj", "diff", "--name-only", "--no-pager" }, root)
-  end
-  return parse_git_porcelain(systemlist({ "git", "status", "--porcelain" }, root))
-end
-
-local function branch_changed_paths(kind, root)
-  if kind == "jj" then
-    return systemlist({ "jj", "diff", "--from", "trunk()", "--name-only", "--no-pager" }, root)
-  end
-  local base = git_base_ref(root)
-  if not base then
-    return {}
-  end
-  return systemlist({ "git", "diff", "--name-only", base .. "...HEAD" }, root)
-end
-
 local function open_buffer_paths()
   local paths = {}
   local seen = {}
@@ -248,12 +168,13 @@ local function payload_equal(a, b)
 end
 
 local function send_file_index()
-  local kind, root = vcs_root()
+  local vcs = require("via.vcs")
+  local kind, root = vcs.root()
   local payload = {
     type = "file_index_changed",
     buffers = open_buffer_paths(),
-    vcs_working_tree = kind and working_tree_paths(kind, root) or {},
-    vcs_branch = kind and branch_changed_paths(kind, root) or {},
+    vcs_working_tree = kind and vcs.working_tree_paths(kind, root) or {},
+    vcs_branch = kind and vcs.branch_changed_paths(kind, root) or {},
   }
   if payload_equal(payload, last_file_index_payload) then
     return
