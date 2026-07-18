@@ -98,13 +98,14 @@ impl AcpTuiBridge {
     }
 
     /// Queue or write a host→TUI message.
+    ///
+    /// Always appends to [`Self::pending`] first so a partial write left in
+    /// [`Self::write_buf`] cannot let a newer message overtake older pending ones.
     pub fn send(&mut self, msg: HostToTui) -> Result<()> {
         self.try_accept()?;
+        self.pending.push_back(msg);
         if self.stream.is_some() {
-            self.enqueue_host_msg(&msg)?;
             self.flush_outbound()?;
-        } else {
-            self.pending.push_back(msg);
         }
         Ok(())
     }
@@ -448,6 +449,83 @@ mod tests {
                 text: "partial-write-safe".into(),
             }
         );
+
+        drop(bridge);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn send_preserves_fifo_when_write_buf_has_partial() {
+        let dir = std::env::temp_dir().join(format!("via-acp-ui-fifo-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = socket_path_for_agent(&dir, "coder");
+        let mut bridge = AcpTuiBridge::bind("coder", path.clone()).unwrap();
+        let mut client = UnixStream::connect(&path).unwrap();
+        client.set_nonblocking(true).unwrap();
+
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while bridge.stream.is_none() && Instant::now() < deadline {
+            bridge.try_accept().unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Partial msg2 already on the wire buffer; msg3 waiting in pending.
+        let msg2 = encode_host_line(&HostToTui::Transcript {
+            kind: TranscriptKind::Agent,
+            text: "two".into(),
+        })
+        .unwrap();
+        bridge.write_buf.extend_from_slice(msg2.as_bytes());
+        bridge.write_buf.push(b'\n');
+        let mid = 4.min(bridge.write_buf.len() - 1);
+        let already = bridge.write_buf.drain(..mid).collect::<Vec<u8>>();
+        bridge.pending.push_back(HostToTui::Transcript {
+            kind: TranscriptKind::Agent,
+            text: "three".into(),
+        });
+
+        // New send must queue behind msg3 (not append past it onto write_buf).
+        bridge
+            .send(HostToTui::Transcript {
+                kind: TranscriptKind::Agent,
+                text: "four".into(),
+            })
+            .unwrap();
+
+        // Drain everything to the client and check order of complete lines.
+        let mut got = String::from_utf8_lossy(&already).into_owned();
+        let mut buf = vec![0u8; 1024];
+        let deadline = Instant::now() + Duration::from_millis(1000);
+        while Instant::now() < deadline {
+            bridge.flush_outbound().unwrap();
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.push_str(&String::from_utf8_lossy(&buf[..n])),
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(err) => panic!("{err}"),
+            }
+            if bridge.write_buf.is_empty()
+                && bridge.pending.is_empty()
+                && got.matches('\n').count() >= 3
+            {
+                break;
+            }
+        }
+
+        let lines: Vec<_> = got
+            .lines()
+            .filter_map(|line| parse_host_line(line).ok().flatten())
+            .collect();
+        let texts: Vec<&str> = lines
+            .iter()
+            .filter_map(|m| match m {
+                HostToTui::Transcript { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["two", "three", "four"]);
 
         drop(bridge);
         let _ = std::fs::remove_dir_all(&dir);
