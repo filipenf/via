@@ -178,19 +178,6 @@ pub(super) fn try_clipboard_paste(
     Ok(true)
 }
 
-/// Plain clipboard text for UI fields (ACP prompt). Same read path as terminal paste; no bracketed
-/// paste wrapper.
-pub(super) fn read_clipboard_text() -> Option<String> {
-    match Clipboard::new().and_then(|mut c| c.get_text()) {
-        Ok(t) if !t.is_empty() => Some(t),
-        Ok(_) => None,
-        Err(error) => {
-            warn!(%error, "clipboard read failed");
-            None
-        }
-    }
-}
-
 pub(super) fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
     (key == Key::V && (modifiers.super_key || (modifiers.ctrl && modifiers.shift)))
         || (key == Key::Insert && (modifiers.shift || modifiers.super_key))

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -16,8 +17,12 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+use crate::acp_tui::{
+    AcpTuiBridge, HostToTui, TranscriptKind, TuiToHost, resolve_acp_tui_bin, socket_path_for_agent,
+    spawn_env_and_args,
+};
 use crate::config::{Config, PRIMARY_PTY_AGENT_ID, ReviewBackend};
-use crate::event::{AcpHandshakeAction, AcpModalKind, Event, UiCommand, UiEvent};
+use crate::event::{AcpHandshakeAction, AcpModalKind, EditorEvent, Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 use crate::reference_index::ReferenceIndex;
@@ -25,7 +30,6 @@ use crate::reference_index::ReferenceIndex;
 use self::links::ReferenceContext;
 
 mod acp_modal;
-mod acp_pane;
 mod config;
 mod font;
 mod input;
@@ -36,10 +40,9 @@ mod pane_controller;
 mod render;
 
 use acp_modal::{AcpModalState, render_acp_modal_buffer};
-use acp_pane::{AcpAgentPane, AcpPane};
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
-use input::{Key, Modifiers, paste_requested, read_clipboard_text};
+use input::{Key, Modifiers};
 use layout::{
     PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
     adjust_pane_indices_after_removal, focus_nvim_after_agent_reference, handle_layout_shortcuts,
@@ -132,6 +135,8 @@ struct WinitGhosttyApp {
     review_pane: Option<TerminalPaneController>,
     review_active: bool,
     acp_modal: Option<AcpModalState>,
+    /// Control-plane bridges for PTY-hosted `via --acp-tui` panes (keyed by agent id).
+    acp_tui_bridges: HashMap<String, AcpTuiBridge>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
@@ -155,15 +160,11 @@ struct WinitGhosttyApp {
 
 enum AppPane {
     Terminal(TerminalPaneController),
-    Acp(AcpAgentPane),
 }
 
 impl AppPane {
     fn is_agent_pane(&self) -> bool {
-        match self {
-            Self::Terminal(pane) => matches!(pane.role(), PaneRole::AgentTerminal { .. }),
-            Self::Acp(_) => true,
-        }
+        matches!(self, Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }))
     }
 
     fn is_agent_terminal(&self) -> bool {
@@ -171,110 +172,68 @@ impl AppPane {
     }
 
     fn agent_id_matches(&self, want: &str) -> bool {
-        match self {
-            Self::Terminal(pane) => {
-                matches!(pane.role(), PaneRole::AgentTerminal { id, .. } if id == want)
-            }
-            Self::Acp(acp) => acp.id == want,
-        }
+        matches!(self, Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { id, .. } if id == want))
     }
 
     /// Discovery record for an agent pane, or `None` for non-agent panes.
     fn agent_record(&self) -> Option<crate::agent_bus::AgentRecord> {
-        match self {
-            Self::Terminal(pane) => match pane.role() {
-                PaneRole::AgentTerminal { id, label, .. } => {
-                    let command = pane.command().map(str::to_string);
-                    Some(crate::agent_bus::AgentRecord {
-                        id: id.clone(),
-                        role: Some(label.clone()),
-                        command: command.clone(),
-                        mode: Some(crate::agent_bus::AgentMode::Pty),
-                        primary: id == PRIMARY_PTY_AGENT_ID,
-                    })
-                }
-                _ => None,
-            },
-            Self::Acp(acp) => Some(crate::agent_bus::AgentRecord {
-                id: acp.id.clone(),
-                role: Some(acp.label.clone()),
-                command: acp.command.clone(),
-                mode: Some(crate::agent_bus::AgentMode::Acp),
-                primary: false,
-            }),
+        let Self::Terminal(pane) = self;
+        match pane.role() {
+            PaneRole::AgentTerminal {
+                id, label, acp_tui, ..
+            } => {
+                let command = pane.command().map(str::to_string);
+                Some(crate::agent_bus::AgentRecord {
+                    id: id.clone(),
+                    role: Some(label.clone()),
+                    command: command.clone(),
+                    mode: Some(if *acp_tui {
+                        crate::agent_bus::AgentMode::Acp
+                    } else {
+                        crate::agent_bus::AgentMode::Pty
+                    }),
+                    primary: id == PRIMARY_PTY_AGENT_ID,
+                })
+            }
+            _ => None,
         }
     }
 
     fn as_terminal_mut(&mut self) -> Option<&mut TerminalPaneController> {
-        match self {
-            Self::Terminal(pane) => Some(pane),
-            Self::Acp(_) => None,
-        }
+        let Self::Terminal(pane) = self;
+        Some(pane)
     }
 
-    fn as_acp_mut(&mut self) -> Option<&mut AcpAgentPane> {
-        match self {
-            Self::Terminal(_) => None,
-            Self::Acp(pane) => Some(pane),
-        }
-    }
-
-    fn acp_pane_mut(&mut self) -> Option<&mut AcpPane> {
-        self.as_acp_mut().map(|acp| &mut acp.pane)
-    }
-
-    /// Bus id if this is an ACP agent pane.
-    fn acp_id(&self) -> Option<&str> {
-        match self {
-            Self::Acp(acp) => Some(acp.id.as_str()),
-            Self::Terminal(_) => None,
-        }
-    }
-
-    /// Bus id of this pane if it is any kind of agent pane (terminal or ACP).
+    /// Bus id of this pane if it is any kind of agent pane.
     fn agent_id(&self) -> Option<String> {
-        match self {
-            Self::Terminal(pane) => match pane.role() {
-                PaneRole::AgentTerminal { id, .. } => Some(id.clone()),
-                _ => None,
-            },
-            Self::Acp(acp) => Some(acp.id.clone()),
+        let Self::Terminal(pane) = self;
+        match pane.role() {
+            PaneRole::AgentTerminal { id, .. } => Some(id.clone()),
+            _ => None,
         }
     }
 
     fn resize_with_metrics(&mut self, width: usize, height: usize, metrics: TerminalMetrics) {
-        match self {
-            Self::Terminal(pane) => {
-                pane.resize_with_metrics(width, height, metrics);
-            }
-            Self::Acp(acp) => {
-                acp.pane.resize_with_metrics(width, height, metrics);
-            }
-        }
+        let Self::Terminal(pane) = self;
+        pane.resize_with_metrics(width, height, metrics);
     }
 
     fn apply_theme(&mut self, theme: &config::TerminalTheme) {
-        match self {
-            Self::Terminal(pane) => pane.apply_theme(theme),
-            Self::Acp(acp) => acp.pane.apply_theme(theme),
-        }
+        let Self::Terminal(pane) = self;
+        pane.apply_theme(theme);
     }
 
     /// Forward the new theme to the running program inside the pane. For PTY
     /// panes this injects a DSR 997 color-scheme notification, letting agents
     /// such as OpenCode update their `system` theme without a restart.
     fn notify_theme_changed(&mut self, theme: &config::TerminalTheme) -> Result<()> {
-        match self {
-            Self::Terminal(pane) => pane.write_all(&theme.color_scheme_notification()),
-            Self::Acp(_) => Ok(()),
-        }
+        let Self::Terminal(pane) = self;
+        pane.write_all(&theme.color_scheme_notification())
     }
 
     fn clear_selection(&mut self) -> bool {
-        match self {
-            Self::Terminal(pane) => pane.clear_selection(),
-            Self::Acp(_) => false,
-        }
+        let Self::Terminal(pane) = self;
+        pane.clear_selection()
     }
 
     fn handle_modifiers_changed(
@@ -282,57 +241,50 @@ impl AppPane {
         modifiers: Modifiers,
         ctx: ReferenceContext<'_>,
     ) -> PaneEventOutcome {
-        match self {
-            Self::Terminal(pane) => pane.handle_modifiers_changed(modifiers, ctx),
-            Self::Acp(_) => PaneEventOutcome::default(),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_modifiers_changed(modifiers, ctx)
     }
 
     fn drain_output(&mut self) -> bool {
-        match self {
-            Self::Terminal(pane) => pane.drain_output(),
-            Self::Acp(_) => false,
-        }
+        let Self::Terminal(pane) = self;
+        pane.drain_output()
     }
 
     fn has_exited_agent(&mut self) -> bool {
-        match self {
-            Self::Terminal(pane) => pane.has_exited(),
-            Self::Acp(_) => false,
-        }
+        let Self::Terminal(pane) = self;
+        pane.has_exited()
     }
 
     fn terminate_agent(&mut self) -> Result<()> {
-        if let Self::Terminal(pane) = self {
-            pane.terminate_agent()?;
-        }
-        Ok(())
+        let Self::Terminal(pane) = self;
+        pane.terminate_agent()
     }
 
     fn is_terminable_sub_agent(&self) -> bool {
-        match self {
-            Self::Terminal(pane) => matches!(
+        matches!(
+            self,
+            Self::Terminal(pane) if matches!(
                 pane.role(),
                 PaneRole::AgentTerminal { id, .. } if id != PRIMARY_PTY_AGENT_ID
-            ),
-            Self::Acp(_) => true,
-        }
+            )
+        )
     }
 
     fn drain_agent_output_chunks(&mut self) -> Option<Vec<Vec<u8>>> {
-        match self {
-            Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }) => {
-                Some(pane.drain_output_chunks())
-            }
-            _ => None,
+        let Self::Terminal(pane) = self;
+        // ACP TUI PTY output is CSI for Ghostty VT only — do not treat as agent protocol.
+        if pane.is_acp_tui() {
+            return None;
+        }
+        if matches!(pane.role(), PaneRole::AgentTerminal { .. }) {
+            Some(pane.drain_output_chunks())
+        } else {
+            None
         }
     }
 
-    fn tick_progress(&mut self) -> bool {
-        match self {
-            Self::Terminal(_) => false,
-            Self::Acp(acp) => acp.pane.tick_progress(),
-        }
+    fn is_acp_tui_agent(&self) -> bool {
+        matches!(self, Self::Terminal(pane) if pane.is_acp_tui())
     }
 
     fn handle_key_event(
@@ -344,31 +296,13 @@ impl AppPane {
         modifiers: Modifiers,
         suppress_input: bool,
     ) -> Result<PaneEventOutcome> {
-        match self {
-            Self::Terminal(pane) => {
-                pane.handle_terminal_key(pressed_keys, key, text, repeat, modifiers, suppress_input)
-            }
-            Self::Acp(acp) => Ok(handle_acp_key_event(
-                &mut acp.pane,
-                pressed_keys,
-                key,
-                text,
-                repeat,
-                modifiers,
-                suppress_input,
-            )),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_terminal_key(pressed_keys, key, text, repeat, modifiers, suppress_input)
     }
 
     fn handle_text_commit(&mut self, text: &str, modifiers: Modifiers) -> Result<PaneEventOutcome> {
-        match self {
-            Self::Terminal(pane) => pane.handle_text_commit(text, modifiers),
-            Self::Acp(acp) => Ok(PaneEventOutcome {
-                dirty: acp.pane.handle_text_input(text, modifiers),
-                force_redraw: false,
-                command: None,
-            }),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_text_commit(text, modifiers)
     }
 
     fn handle_mouse_wheel(
@@ -378,12 +312,8 @@ impl AppPane {
         local_y: usize,
         modifiers: Modifiers,
     ) -> Result<PaneEventOutcome> {
-        match self {
-            Self::Terminal(pane) => {
-                pane.handle_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
-            }
-            Self::Acp(acp) => Ok(handle_acp_mouse_wheel(&mut acp.pane, scroll_delta)),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_mouse_wheel(scroll_delta, local_x, local_y, modifiers)
     }
 
     fn handle_mouse_input(
@@ -395,12 +325,8 @@ impl AppPane {
         modifiers: Modifiers,
         ctx: ReferenceContext<'_>,
     ) -> Result<PaneEventOutcome> {
-        match self {
-            Self::Terminal(pane) => {
-                pane.handle_mouse_input(state, button, local_x, local_y, modifiers, ctx)
-            }
-            Self::Acp(_) => Ok(PaneEventOutcome::default()),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_mouse_input(state, button, local_x, local_y, modifiers, ctx)
     }
 
     fn handle_mouse_motion(
@@ -409,10 +335,8 @@ impl AppPane {
         local_y: usize,
         modifiers: Modifiers,
     ) -> Result<PaneEventOutcome> {
-        match self {
-            Self::Terminal(pane) => pane.handle_mouse_motion(local_x, local_y, modifiers),
-            Self::Acp(_) => Ok(PaneEventOutcome::default()),
-        }
+        let Self::Terminal(pane) = self;
+        pane.handle_mouse_motion(local_x, local_y, modifiers)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -428,109 +352,18 @@ impl AppPane {
         redraw_chrome: bool,
         damage: &mut Vec<DamageRect>,
     ) -> bool {
-        match self {
-            Self::Terminal(pane) => pane.draw(
-                font_renderer,
-                buffer,
-                buffer_width,
-                buffer_height,
-                rect,
-                active,
-                force_redraw,
-                redraw_chrome,
-                damage,
-            ),
-            Self::Acp(acp) => acp.pane.draw(
-                font_renderer,
-                buffer,
-                buffer_width,
-                buffer_height,
-                rect,
-                active,
-                force_redraw,
-                redraw_chrome,
-                damage,
-            ),
-        }
-    }
-}
-
-fn handle_acp_key_event(
-    pane: &mut AcpPane,
-    pressed_keys: &[Key],
-    key: Option<Key>,
-    text: Option<&str>,
-    repeat: bool,
-    modifiers: Modifiers,
-    suppress_input: bool,
-) -> PaneEventOutcome {
-    if suppress_input {
-        return PaneEventOutcome::default();
-    }
-
-    let step = pane.transcript_viewport_rows().max(1) as isize;
-    for key in pressed_keys.iter().copied() {
-        let dirty = match key {
-            Key::PageUp => pane.scroll_transcript(step),
-            Key::PageDown => pane.scroll_transcript(-step),
-            Key::Home => pane.scroll_transcript_to_top(),
-            Key::End => pane.scroll_transcript_to_bottom(),
-            _ => false,
-        };
-        if dirty {
-            return PaneEventOutcome {
-                dirty: true,
-                force_redraw: true,
-                command: None,
-            };
-        }
-    }
-
-    let paste_requested = !repeat
-        && key
-            .map(|key| paste_requested(key, modifiers))
-            .unwrap_or(false);
-    if paste_requested {
-        let dirty = read_clipboard_text()
-            .map(|text| pane.paste_text(&text))
-            .unwrap_or(false);
-        return PaneEventOutcome {
-            dirty,
-            force_redraw: false,
-            command: None,
-        };
-    }
-
-    let mut outcome = PaneEventOutcome::default();
-    if let Some(key) = key {
-        if let Some(prompt) = pane.handle_key(key, modifiers) {
-            outcome.command = Some(PaneCommand::AgentPromptSubmitted { text: prompt });
-        }
-    }
-
-    if let Some(text) = text.filter(|text| text.chars().all(|ch| !ch.is_control())) {
-        outcome.dirty |= pane.handle_text_input(text, modifiers);
-    }
-    outcome
-}
-
-fn handle_acp_mouse_wheel(pane: &mut AcpPane, scroll_delta: (f32, f32)) -> PaneEventOutcome {
-    let (sx, sy) = scroll_delta;
-    let sy = sy + sx;
-    if sy.abs() <= 1e-4 {
-        return PaneEventOutcome::default();
-    }
-
-    let scaled = -sy / 40.0;
-    let mut delta_y = scaled.round().clamp(-64.0, 64.0) as isize;
-    if delta_y == 0 {
-        delta_y = -sy.signum() as isize;
-    }
-    pane.scroll_transcript(delta_y);
-    PaneEventOutcome {
-        dirty: true,
-        force_redraw: true,
-        command: None,
+        let Self::Terminal(pane) = self;
+        pane.draw(
+            font_renderer,
+            buffer,
+            buffer_width,
+            buffer_height,
+            rect,
+            active,
+            force_redraw,
+            redraw_chrome,
+            damage,
+        )
     }
 }
 
@@ -568,6 +401,7 @@ impl WinitGhosttyApp {
             review_pane: None,
             review_active: false,
             acp_modal: None,
+            acp_tui_bridges: HashMap::new(),
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
@@ -707,16 +541,7 @@ impl WinitGhosttyApp {
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
         if crate::config::is_acp_command(&cmd) {
-            // ACP sub-agent: via drives it over the protocol (the mediator owns the client and
-            // connects it). This pane only renders the transcript; no PTY child here.
-            let mut pane = AcpPane::new(w / 2, h / 2, metrics, &self.terminal_config.theme);
-            pane.set_header_label(&label);
-            self.panes.push(AppPane::Acp(AcpAgentPane {
-                pane,
-                id: id.to_string(),
-                label,
-                command: Some(cmd),
-            }));
+            self.spawn_acp_tui_pane(id, &label, role.unwrap_or(id), &cmd, w, h, metrics)?;
         } else {
             // Leak a small string for the static title requirement of TerminalPane.
             let title: &'static str = Box::leak(label.clone().into_boxed_str());
@@ -738,6 +563,7 @@ impl WinitGhosttyApp {
                         id: id.to_string(),
                         label,
                         command: Some(cmd),
+                        acp_tui: false,
                     },
                     pane,
                     self.config.scroll_sensitivity,
@@ -748,6 +574,68 @@ impl WinitGhosttyApp {
         self.write_agent_registry();
         self.dirty = true;
         self.force_redraw = true;
+        Ok(())
+    }
+
+    /// Bind the ACP UI socket, then spawn `via --acp-tui` in a PTY pane.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_acp_tui_pane(
+        &mut self,
+        id: &str,
+        label: &str,
+        role_label: &str,
+        acp_command: &str,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Result<()> {
+        let runtime_dir = crate::config::runtime_base_dir();
+        let socket_path = socket_path_for_agent(&runtime_dir, id);
+        let bridge = AcpTuiBridge::bind(id, socket_path.clone())
+            .with_context(|| format!("bind ACP UI socket for agent {id}"))?;
+        let socket = bridge.socket_path().to_path_buf();
+        let socket_str = socket
+            .to_str()
+            .with_context(|| format!("ACP UI socket path is not UTF-8: {}", socket.display()))?
+            .to_string();
+
+        let bin = resolve_acp_tui_bin()?;
+        let bin_str = bin
+            .to_str()
+            .with_context(|| format!("via binary path is not UTF-8: {}", bin.display()))?
+            .to_string();
+        let (env, args) = spawn_env_and_args(id, role_label, &socket_str);
+
+        let title: &'static str = Box::leak(label.to_string().into_boxed_str());
+        let mut pane = TerminalPane::new(
+            title,
+            width / 2,
+            height / 2,
+            metrics,
+            &self.terminal_config.theme,
+        )?;
+        pane.spawn(
+            &bin_str,
+            args.iter().map(|s| OsString::from(*s)),
+            &self.config.working_directory,
+            &env,
+            self.output_notifier.clone(),
+        )
+        .with_context(|| format!("spawn via --acp-tui for agent {id}"))?;
+
+        self.acp_tui_bridges.insert(id.to_string(), bridge);
+        self.panes
+            .push(AppPane::Terminal(TerminalPaneController::new(
+                PaneRole::AgentTerminal {
+                    id: id.to_string(),
+                    label: label.to_string(),
+                    command: Some(acp_command.to_string()),
+                    acp_tui: true,
+                },
+                pane,
+                self.config.scroll_sensitivity,
+            )));
+        info!(%id, socket = %socket.display(), bin = %bin.display(), "spawned ACP TUI pane");
         Ok(())
     }
 
@@ -769,6 +657,7 @@ impl WinitGhosttyApp {
 
         self.panes[index].terminate_agent()?;
         self.panes.remove(index);
+        self.close_acp_tui_bridge(id);
 
         adjust_pane_indices_after_removal(
             &mut self.pane_layout_mode,
@@ -807,17 +696,33 @@ impl WinitGhosttyApp {
 
     /// Drop terminal agent panes whose PTY child has exited and refresh the registry.
     fn prune_exited_agent_panes(&mut self) {
-        let to_remove: Vec<usize> = self
-            .panes
-            .iter_mut()
-            .enumerate()
-            .filter_map(|(index, pane)| pane.has_exited_agent().then_some(index))
-            .collect();
-        if to_remove.is_empty() {
+        let mut acp_tui_exited: Vec<String> = Vec::new();
+        let mut pty_remove: Vec<usize> = Vec::new();
+        for (index, pane) in self.panes.iter_mut().enumerate() {
+            if !pane.has_exited_agent() {
+                continue;
+            }
+            if pane.is_acp_tui_agent() {
+                if let Some(id) = pane.agent_id() {
+                    acp_tui_exited.push(id);
+                }
+            } else {
+                pty_remove.push(index);
+            }
+        }
+
+        for id in acp_tui_exited {
+            self.close_acp_tui_bridge(&id);
+            // Tear down the mediator ACP session; UiCommand::TerminateAgent removes the pane.
+            self.events
+                .try_send(Event::Editor(EditorEvent::TerminateAgent { id }));
+        }
+
+        if pty_remove.is_empty() {
             return;
         }
 
-        for index in to_remove.into_iter().rev() {
+        for index in pty_remove.into_iter().rev() {
             self.panes.remove(index);
             adjust_pane_indices_after_removal(
                 &mut self.pane_layout_mode,
@@ -832,6 +737,59 @@ impl WinitGhosttyApp {
         self.dirty = true;
         self.force_redraw = true;
         info!("removed exited agent pane(s); refreshed agent registry");
+    }
+
+    fn close_acp_tui_bridge(&mut self, agent_id: &str) {
+        if let Some(mut bridge) = self.acp_tui_bridges.remove(agent_id) {
+            bridge.shutdown();
+        }
+    }
+
+    fn send_acp_tui(&mut self, agent_id: &str, msg: HostToTui) -> bool {
+        let Some(bridge) = self.acp_tui_bridges.get_mut(agent_id) else {
+            return false;
+        };
+        if let Err(err) = bridge.send(msg) {
+            warn!(%agent_id, %err, "failed to send ACP TUI host message");
+            return false;
+        }
+        true
+    }
+
+    fn poll_acp_tui_bridges(&mut self) -> Result<bool> {
+        let agent_ids: Vec<String> = self.acp_tui_bridges.keys().cloned().collect();
+        let mut changed = false;
+        for agent_id in agent_ids {
+            let Some(bridge) = self.acp_tui_bridges.get_mut(&agent_id) else {
+                continue;
+            };
+            let messages = match bridge.poll() {
+                Ok(messages) => messages,
+                Err(err) => {
+                    warn!(%agent_id, %err, "ACP TUI bridge poll failed");
+                    continue;
+                }
+            };
+            for msg in messages {
+                match msg {
+                    TuiToHost::Ready { agent_id: ready_id } => {
+                        debug!(%ready_id, "ACP TUI ready");
+                    }
+                    TuiToHost::Submit { text } => {
+                        changed = true;
+                        self.events
+                            .try_send(Event::Ui(UiEvent::AgentPromptSubmitted {
+                                text,
+                                agent_id: Some(agent_id.clone()),
+                            }));
+                    }
+                    TuiToHost::ShutdownAck => {
+                        debug!(%agent_id, "ACP TUI shutdown ack");
+                    }
+                }
+            }
+        }
+        Ok(changed)
     }
 
     fn resize_surface(
@@ -1460,11 +1418,6 @@ impl WinitGhosttyApp {
                 PaneCommand::UrlOpenRequested { url } => {
                     open_url_in_browser(&url);
                 }
-                PaneCommand::AgentPromptSubmitted { text } => {
-                    let agent_id = self.panes.get(self.active_pane).and_then(AppPane::agent_id);
-                    self.events
-                        .try_send(Event::Ui(UiEvent::AgentPromptSubmitted { text, agent_id }));
-                }
             }
         }
     }
@@ -1505,10 +1458,8 @@ impl WinitGhosttyApp {
         }
         self.dirty |= self.reload_theme_if_needed()?;
         self.dirty |= self.forward_ui_commands()?;
+        self.dirty |= self.poll_acp_tui_bridges()?;
         self.dirty |= self.flush_pending_agent_write()?;
-        for pane in self.panes.iter_mut() {
-            self.dirty |= pane.tick_progress();
-        }
         self.prune_exited_agent_panes();
         Ok(())
     }
@@ -1557,17 +1508,6 @@ impl WinitGhosttyApp {
             .iter_mut()
             .find(|pane| pane.is_agent_terminal())
             .and_then(AppPane::as_terminal_mut)
-    }
-
-    /// ACP transcript pane for `agent_id`, falling back to the first ACP pane (covers an empty
-    /// id or the single-agent case).
-    fn acp_pane_for(&mut self, agent_id: &str) -> Option<&mut AcpPane> {
-        let idx = self
-            .panes
-            .iter()
-            .position(|pane| pane.agent_id_matches(agent_id) && pane.acp_id().is_some())
-            .or_else(|| self.panes.iter().position(|pane| pane.acp_id().is_some()))?;
-        self.panes[idx].acp_pane_mut()
     }
 
     fn render(&mut self) -> Result<()> {
@@ -1728,11 +1668,19 @@ impl WinitGhosttyApp {
                         }
                         debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
                         if let Some(agent_pane) = self.panes[i].as_terminal_mut() {
-                            agent_pane.write_all(payload.as_bytes())?;
-                        } else if let Some(acp) = self.panes[i].acp_pane_mut() {
-                            acp.append_transcript_chunk("system", &payload);
-                            self.dirty = true;
-                            self.force_redraw = true;
+                            if agent_pane.is_acp_tui() {
+                                let agent_id = agent_pane.agent_id().unwrap_or("agent").to_string();
+                                self.send_acp_tui(
+                                    &agent_id,
+                                    HostToTui::Transcript {
+                                        kind: TranscriptKind::System,
+                                        text: payload,
+                                    },
+                                );
+                                self.dirty = true;
+                            } else {
+                                agent_pane.write_all(payload.as_bytes())?;
+                            }
                         }
                     } else {
                         warn!("no agent pane available to receive input");
@@ -1744,11 +1692,20 @@ impl WinitGhosttyApp {
                     kind,
                     text,
                 } => {
-                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
-                        continue;
-                    };
-                    debug!(agent_id, kind, "forwarding ACP transcript chunk to pane");
-                    acp_pane.append_transcript_chunk(&kind, &text);
+                    if self.send_acp_tui(
+                        &agent_id,
+                        HostToTui::Transcript {
+                            kind: TranscriptKind::from_acp(&kind),
+                            text: text.clone(),
+                        },
+                    ) {
+                        debug!(agent_id, kind, "forwarding ACP transcript chunk to TUI");
+                    } else {
+                        warn!(
+                            agent_id,
+                            kind, "no ACP TUI bridge for transcript chunk; dropping"
+                        );
+                    }
                 }
                 UiCommand::AcpProgress {
                     agent_id,
@@ -1756,14 +1713,21 @@ impl WinitGhosttyApp {
                     label,
                     active,
                 } => {
-                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
-                        continue;
-                    };
-                    debug!(
-                        agent_id,
-                        id, label, active, "forwarding ACP progress to pane"
-                    );
-                    acp_pane.update_progress(id, label, active);
+                    if self.send_acp_tui(
+                        &agent_id,
+                        HostToTui::Progress {
+                            id: id.clone(),
+                            label: label.clone(),
+                            active,
+                        },
+                    ) {
+                        debug!(
+                            agent_id,
+                            id, label, active, "forwarding ACP progress to TUI"
+                        );
+                    } else {
+                        warn!(agent_id, id, "no ACP TUI bridge for progress; dropping");
+                    }
                 }
                 UiCommand::AcpSessionStatus {
                     agent_id,
@@ -1771,17 +1735,24 @@ impl WinitGhosttyApp {
                     provider_error,
                     clear_provider_error,
                 } => {
-                    let Some(acp_pane) = self.acp_pane_for(&agent_id) else {
-                        continue;
-                    };
-                    debug!(
-                        agent_id,
-                        ?model,
-                        ?provider_error,
-                        clear_provider_error,
-                        "forwarding ACP session status to pane"
-                    );
-                    acp_pane.apply_session_status(model, provider_error, clear_provider_error);
+                    if self.send_acp_tui(
+                        &agent_id,
+                        HostToTui::SessionStatus {
+                            model: model.clone(),
+                            provider_error: provider_error.clone(),
+                            clear_provider_error,
+                        },
+                    ) {
+                        debug!(
+                            agent_id,
+                            ?model,
+                            ?provider_error,
+                            clear_provider_error,
+                            "forwarding ACP session status to TUI"
+                        );
+                    } else {
+                        warn!(agent_id, "no ACP TUI bridge for session status; dropping");
+                    }
                 }
                 UiCommand::AcpModalPrompt {
                     agent_id,
@@ -2192,44 +2163,6 @@ mod tests {
         LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks,
         reference_target_from_row, reference_target_from_uri,
     };
-
-    #[test]
-    fn app_pane_routes_acp_prompt_submission() {
-        let terminal_config = TerminalConfig::default();
-        let mut pane = AppPane::Acp(AcpAgentPane {
-            pane: AcpPane::new(100, 50, terminal_config.metrics, &terminal_config.theme),
-            id: "orchestrator".to_string(),
-            label: "agent".to_string(),
-            command: None,
-        });
-
-        let no_keys: &[Key] = &[];
-        pane.handle_key_event(
-            no_keys,
-            None,
-            Some("hello"),
-            false,
-            Modifiers::default(),
-            false,
-        )
-        .unwrap();
-        let enter_keys: &[Key] = &[Key::Enter];
-        let outcome = pane
-            .handle_key_event(
-                enter_keys,
-                Some(Key::Enter),
-                None,
-                false,
-                Modifiers::default(),
-                false,
-            )
-            .unwrap();
-
-        assert!(matches!(
-            outcome.command,
-            Some(PaneCommand::AgentPromptSubmitted { ref text }) if text == "hello"
-        ));
-    }
 
     #[test]
     fn parses_ghostty_config_entries() {

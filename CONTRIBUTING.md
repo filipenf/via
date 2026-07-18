@@ -250,9 +250,9 @@ Key invariants the tests and benches protect:
 
 - Pane layout and resize edge cases (`src/ui/ghostty/layout.rs` and its tests).
 - Link/symbol scanning robustness and performance (`src/ui/ghostty/links.rs`).
-- Completing the ACP pane UX (model/mode selection, tool call rendering, diff
-  preview, styling to match Neovim) — see `src/ui/ghostty/acp_pane.rs`,
-  `acp_modal.rs`, and `mediator.rs`.
+- Completing the ACP TUI UX (model/mode selection, tool call rendering, diff
+  preview, styling) — see `src/acp_tui/`, `src/ui/ghostty/acp_modal.rs`, and
+  `mediator.rs`.
 - Review backend improvements or the "hunk" backend.
 - Diagnostics / session CLI ergonomics and the Lua side (`nvim/diagnostics.lua`,
   `src/cli/session.rs`).
