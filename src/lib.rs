@@ -30,7 +30,6 @@ use tracing::info;
 
 use crate::cli::Cli;
 use crate::mediator::Mediator;
-use crate::nvim::FileTarget;
 use crate::ui::ghostty::GhosttyUi;
 
 /// Library entry point so that benches (and a thin binary) can link against `via`
@@ -84,19 +83,6 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     let config = config::Config::load(cli.config_overrides())?;
     info!(?config, "starting via");
-
-    if let Some(open) = cli.open {
-        nvim::log_socket_warning(&config.nvim_socket_path);
-        let target = FileTarget::parse(&open, &config.working_directory);
-        nvim::open_file(
-            &config.nvim_socket_path,
-            &config.working_directory,
-            target,
-            &[],
-        )
-        .await?;
-        return Ok(());
-    }
 
     let _session_guard = session::SessionGuard::create(&config)?;
 

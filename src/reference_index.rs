@@ -128,11 +128,18 @@ impl ReferenceIndex {
     /// rewrites bare basenames, and path-shaped opens must keep their concrete path
     /// (e.g. `vendor/main.rs` must not become a unique indexed `src/main.rs`).
     /// Cold / unique / unknown basenames leave `target` unchanged and return no candidates.
+    ///
+    /// Leading-truncated paths (`...` / `…`) use longest path-suffix match first; when
+    /// ambiguous, open-buffer hits are preferred over the full suffix set.
     pub fn resolve_open_from_index(
         &self,
         path: PathBuf,
         line: Option<u32>,
     ) -> (FileTarget, Vec<PathBuf>) {
+        if let Some(resolved) = self.resolve_truncated(&path, line) {
+            return resolved;
+        }
+
         let Some(basename) = path.file_name().and_then(|n| n.to_str()) else {
             return (FileTarget { path, line }, Vec::new());
         };
@@ -143,6 +150,101 @@ impl ReferenceIndex {
         }
 
         (FileTarget { path, line }, Vec::new())
+    }
+
+    /// Indexed paths whose slash-normalized form ends at a path-component boundary
+    /// with `suffix` (e.g. `long/path/main.rs`).
+    pub fn paths_matching_suffix(&self, suffix: &str) -> Vec<PathBuf> {
+        let suffix = normalize_slashes(suffix);
+        if suffix.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        for path in self.indexed_paths() {
+            let ps = normalize_slashes(&path.to_string_lossy());
+            if path_ends_with_suffix(&ps, &suffix) && !matches.iter().any(|p| p == path) {
+                matches.push(path.clone());
+            }
+        }
+        matches
+    }
+
+    /// Resolve a leading-truncated path via longest suffix match against the index.
+    ///
+    /// “Leading” means the first `...` / `…` marker in the string (raw token or
+    /// cwd-joined absolute path like `/repo/...z/foo.rs`), not necessarily byte 0.
+    /// A literal path component containing `...` (e.g. `foo...bar`) can therefore
+    /// false-positive; that is accepted for v1.
+    ///
+    /// Returns `None` when the path is not truncated or no suffix matches.
+    /// Unique (or single open-buffer) hits rewrite the target and return no candidates;
+    /// otherwise the original path is kept and candidates are returned for Lua.
+    pub fn resolve_truncated(
+        &self,
+        path: &Path,
+        line: Option<u32>,
+    ) -> Option<(FileTarget, Vec<PathBuf>)> {
+        let lossy = path.to_string_lossy();
+        let query = truncated_query_from(&lossy)?;
+
+        for suffix in path_suffix_queries(query) {
+            let hits = self.paths_matching_suffix(&suffix);
+            if hits.is_empty() {
+                continue;
+            }
+            return Some(self.finish_truncated_hits(path, line, hits));
+        }
+        None
+    }
+
+    fn finish_truncated_hits(
+        &self,
+        original: &Path,
+        line: Option<u32>,
+        hits: Vec<PathBuf>,
+    ) -> (FileTarget, Vec<PathBuf>) {
+        if hits.len() == 1 {
+            return (
+                FileTarget {
+                    path: hits[0].clone(),
+                    line,
+                },
+                Vec::new(),
+            );
+        }
+
+        let buf_hits: Vec<PathBuf> = hits
+            .iter()
+            .filter(|p| self.buffers.contains(*p))
+            .cloned()
+            .collect();
+        let candidates = if buf_hits.is_empty() { hits } else { buf_hits };
+
+        if candidates.len() == 1 {
+            return (
+                FileTarget {
+                    path: candidates[0].clone(),
+                    line,
+                },
+                Vec::new(),
+            );
+        }
+
+        (
+            FileTarget {
+                path: original.to_path_buf(),
+                line,
+            },
+            candidates,
+        )
+    }
+
+    fn indexed_paths(&self) -> impl Iterator<Item = &PathBuf> {
+        self.buffers
+            .iter()
+            .chain(self.vcs_working_tree.iter())
+            .chain(self.vcs_branch.iter())
     }
 
     pub fn contains_symbol(&self, name: &str) -> bool {
@@ -229,20 +331,34 @@ impl ReferenceIndex {
     }
 
     /// Resolve a token to a FileTarget, rewriting unique bare basenames via the index.
+    ///
+    /// Leading-truncated paths (`...` / `…`) rewrite when the longest suffix match is unique
+    /// (or collapses to a single open buffer). Ambiguous truncated hits keep the parsed
+    /// path so [`Self::resolve_open_from_index`] can inject candidates.
     pub fn file_target_for_token(&self, token: &str, working_directory: &Path) -> FileTarget {
+        let parsed = FileTarget::parse(token, working_directory);
+
+        if let Some((target, candidates)) = self.resolve_truncated(&parsed.path, parsed.line) {
+            if candidates.is_empty() {
+                return target;
+            }
+            return parsed;
+        }
+
         let path_part = token_path_part(token);
         if path_part.contains('/') || path_part.contains('\\') {
-            return FileTarget::parse(token, working_directory);
+            return parsed;
         }
 
         let basename = token_basename(token);
-        let line = FileTarget::parse(token, working_directory).line;
-
         if let Some(path) = self.unique_path_for_basename(basename) {
-            return FileTarget { path, line };
+            return FileTarget {
+                path,
+                line: parsed.line,
+            };
         }
 
-        FileTarget::parse(token, working_directory)
+        parsed
     }
 
     /// Resolve an indexed symbol to a FileTarget when unique; otherwise None.
@@ -262,6 +378,58 @@ pub fn token_has_file_shape(token: &str) -> bool {
         || token
             .rsplit_once(':')
             .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+}
+
+const ASCII_ELLIPSIS: &str = "...";
+const UNICODE_ELLIPSIS: &str = "\u{2026}";
+
+/// Path query after the first `...` / `…` marker in `s`, if any.
+///
+/// “Leading” means the earliest marker by byte index (cwd-joined `/repo/...z/foo.rs`
+/// counts), not necessarily byte 0. A literal component like `foo...bar` can
+/// therefore false-positive; that is accepted for v1.
+fn truncated_query_from(s: &str) -> Option<&str> {
+    let ascii = s
+        .find(ASCII_ELLIPSIS)
+        .map(|idx| (idx, ASCII_ELLIPSIS.len()));
+    let unicode = s
+        .find(UNICODE_ELLIPSIS)
+        .map(|idx| (idx, UNICODE_ELLIPSIS.len()));
+    let (idx, marker_len) = match (ascii, unicode) {
+        (Some(a), Some(u)) if u.0 < a.0 => u,
+        (Some(a), _) => a,
+        (None, Some(u)) => u,
+        (None, None) => return None,
+    };
+    let after = s[idx + marker_len..].trim_start_matches(['/', '\\']);
+    if after.is_empty() { None } else { Some(after) }
+}
+
+fn normalize_slashes(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+fn path_ends_with_suffix(path: &str, suffix: &str) -> bool {
+    if !path.ends_with(suffix) {
+        return false;
+    }
+    if path.len() == suffix.len() {
+        return true;
+    }
+    path.as_bytes()
+        .get(path.len() - suffix.len() - 1)
+        .is_some_and(|b| *b == b'/')
+}
+
+/// Progressive path suffixes, longest first (`a/b/c.rs` → `a/b/c.rs`, `b/c.rs`, `c.rs`).
+fn path_suffix_queries(stripped: &str) -> Vec<String> {
+    let normalized = normalize_slashes(stripped);
+    let components: Vec<&str> = normalized.split('/').filter(|c| !c.is_empty()).collect();
+    let mut out = Vec::with_capacity(components.len());
+    for start in 0..components.len() {
+        out.push(components[start..].join("/"));
+    }
+    out
 }
 
 /// Strength gate for bare symbol cues (no uppercase bias).
@@ -529,5 +697,141 @@ mod tests {
         let mut idx = ReferenceIndex::default();
         idx.set_symbols([symbol("ab", "/repo/src/main.rs", 10)]);
         assert!(!idx.should_cue_symbol_token("ab"));
+    }
+
+    #[test]
+    fn truncated_unique_suffix_rewrites_file_target() {
+        let idx =
+            ReferenceIndex::from_parts([PathBuf::from("/repo/some/long/path/main.rs")], [], []);
+        let target = idx.file_target_for_token("...z/some/long/path/main.rs", Path::new("/repo"));
+        assert_eq!(target.path, PathBuf::from("/repo/some/long/path/main.rs"));
+    }
+
+    #[test]
+    fn resolve_open_unique_truncated_rewrites_and_has_no_candidates() {
+        let idx =
+            ReferenceIndex::from_parts([PathBuf::from("/repo/some/long/path/main.rs")], [], []);
+        let (target, candidates) = idx
+            .resolve_open_from_index(PathBuf::from("/repo/...z/some/long/path/main.rs"), Some(9));
+        assert_eq!(target.path, PathBuf::from("/repo/some/long/path/main.rs"));
+        assert_eq!(target.line, Some(9));
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn truncated_unique_suffix_preserves_line() {
+        let idx =
+            ReferenceIndex::from_parts([PathBuf::from("/repo/some/long/path/main.rs")], [], []);
+        let target =
+            idx.file_target_for_token("...z/some/long/path/main.rs:42", Path::new("/repo"));
+        assert_eq!(target.path, PathBuf::from("/repo/some/long/path/main.rs"));
+        assert_eq!(target.line, Some(42));
+    }
+
+    #[test]
+    fn truncated_unicode_ellipsis_rewrites() {
+        let idx = ReferenceIndex::from_parts([PathBuf::from("/repo/src/lib.rs")], [], []);
+        let target = idx.file_target_for_token("\u{2026}/src/lib.rs", Path::new("/repo"));
+        assert_eq!(target.path, PathBuf::from("/repo/src/lib.rs"));
+    }
+
+    #[test]
+    fn truncated_ambiguous_prefers_open_buffers() {
+        let idx = ReferenceIndex::from_parts(
+            [PathBuf::from("/repo/src/main.rs")],
+            [PathBuf::from("/repo/tests/main.rs")],
+            [],
+        );
+        // Basename-only suffix after dropping junk still hits both; buffer wins.
+        let (target, candidates) =
+            idx.resolve_open_from_index(PathBuf::from("/repo/...z/main.rs"), Some(3));
+        assert_eq!(target.path, PathBuf::from("/repo/src/main.rs"));
+        assert_eq!(target.line, Some(3));
+        assert!(candidates.is_empty());
+    }
+
+    #[test]
+    fn truncated_ambiguous_without_buffer_returns_candidates() {
+        let idx = ReferenceIndex::from_parts(
+            [],
+            [
+                PathBuf::from("/repo/src/main.rs"),
+                PathBuf::from("/repo/tests/main.rs"),
+            ],
+            [],
+        );
+        let original = PathBuf::from("/cwd/.../main.rs");
+        let (target, candidates) = idx.resolve_open_from_index(original.clone(), None);
+        assert_eq!(target.path, original);
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn truncated_multi_buffer_returns_buffer_subset_as_candidates() {
+        let idx = ReferenceIndex::from_parts(
+            [
+                PathBuf::from("/repo/src/main.rs"),
+                PathBuf::from("/repo/tests/main.rs"),
+            ],
+            [PathBuf::from("/repo/vendor/main.rs")],
+            [],
+        );
+        let original = PathBuf::from("/cwd/.../main.rs");
+        let (target, candidates) = idx.resolve_open_from_index(original.clone(), Some(1));
+        assert_eq!(target.path, original);
+        assert_eq!(target.line, Some(1));
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates.contains(&PathBuf::from("/repo/src/main.rs")));
+        assert!(candidates.contains(&PathBuf::from("/repo/tests/main.rs")));
+        assert!(!candidates.contains(&PathBuf::from("/repo/vendor/main.rs")));
+    }
+
+    #[test]
+    fn truncated_longest_suffix_preferred_over_shorter() {
+        let idx = ReferenceIndex::from_parts(
+            [
+                PathBuf::from("/repo/other/path/main.rs"),
+                PathBuf::from("/repo/some/long/path/main.rs"),
+            ],
+            [],
+            [],
+        );
+        let target = idx.file_target_for_token("...z/some/long/path/main.rs", Path::new("/repo"));
+        assert_eq!(target.path, PathBuf::from("/repo/some/long/path/main.rs"));
+    }
+
+    #[test]
+    fn non_truncated_path_shaped_still_does_not_steal_basename() {
+        let idx = index();
+        let target = idx.file_target_for_token("vendor/main.rs", Path::new("/repo"));
+        assert_eq!(target.path, PathBuf::from("/repo/vendor/main.rs"));
+    }
+
+    #[test]
+    fn truncated_query_from_detects_markers() {
+        assert_eq!(
+            truncated_query_from("...z/some/long/path/main.rs"),
+            Some("z/some/long/path/main.rs")
+        );
+        assert_eq!(
+            truncated_query_from("/repo/.../src/lib.rs"),
+            Some("src/lib.rs")
+        );
+        assert_eq!(
+            truncated_query_from("\u{2026}/src/lib.rs"),
+            Some("src/lib.rs")
+        );
+        assert!(truncated_query_from("vendor/main.rs").is_none());
+        assert!(truncated_query_from("...").is_none());
+    }
+
+    #[test]
+    fn truncated_query_from_uses_earliest_marker() {
+        // Unicode ellipsis before ASCII `...` must win by byte position.
+        assert_eq!(truncated_query_from("\u{2026}foo...bar"), Some("foo...bar"));
+        assert_eq!(
+            truncated_query_from("...foo\u{2026}bar"),
+            Some("foo\u{2026}bar")
+        );
     }
 }

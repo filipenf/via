@@ -15,10 +15,6 @@ pub use task::TaskCommand;
 #[derive(Parser)]
 #[command(name = "via", version, about, propagate_version = true)]
 pub struct Cli {
-    /// Open a file in Neovim and exit (requires a running via instance with a matching socket).
-    #[arg(long)]
-    pub open: Option<String>,
-
     /// Neovim command to run.
     #[arg(long = "nvim")]
     pub nvim: Option<String>,

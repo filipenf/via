@@ -62,7 +62,7 @@ pub async fn open_file(
 ) -> Result<()> {
     if !socket_path.exists() {
         bail!(
-            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before using --open.",
+            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before opening files.",
             socket_path.display()
         );
     }
@@ -364,8 +364,6 @@ fn lua_string_literal(input: &str) -> String {
     quoted
 }
 
-pub fn log_socket_warning(_socket_path: &Path) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,13 +458,14 @@ mod tests {
             &[],
         );
         assert!(command.starts_with(
-            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")"
+            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")\nlocal path_match = require(\"via.path_match\")"
         ));
         assert!(command.contains("vim.cmd(\"drop +\" .. line .. \" \" .. escaped)"));
         assert!(command.contains("open_buffer_matches"));
         assert!(command.contains("telescope.builtin"));
         assert!(command.contains("vim.ui.select"));
         assert!(command.contains("via.vcs"));
+        assert!(command.contains("via.path_match"));
     }
 
     #[test]
