@@ -458,13 +458,14 @@ mod tests {
             &[],
         );
         assert!(command.starts_with(
-            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")"
+            "lua local path = \"src/main.rs\"; local line = 42; local index_candidates = nil;\nlocal vcs = require(\"via.vcs\")\nlocal path_match = require(\"via.path_match\")"
         ));
         assert!(command.contains("vim.cmd(\"drop +\" .. line .. \" \" .. escaped)"));
         assert!(command.contains("open_buffer_matches"));
         assert!(command.contains("telescope.builtin"));
         assert!(command.contains("vim.ui.select"));
         assert!(command.contains("via.vcs"));
+        assert!(command.contains("via.path_match"));
     }
 
     #[test]

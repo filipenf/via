@@ -1,5 +1,6 @@
 local path = __PATH__; local line = __LINE__; local index_candidates = __CANDIDATES__;
 local vcs = require("via.vcs")
+local path_match = require("via.path_match")
 
 local function basename(p)
   return vim.fn.fnamemodify(p, ":t")
@@ -57,6 +58,23 @@ local function open_buffer_matches(fname)
     end
   end
   return matches
+end
+
+-- Open buffers whose path ends with the longest matching truncated suffix.
+local function open_buffer_suffix_matches(query)
+  if not query or query == "" then
+    return {}
+  end
+  local names = {}
+  for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(bufnr) and vim.bo[bufnr].buflisted then
+      local name = vim.api.nvim_buf_get_name(bufnr)
+      if name ~= "" then
+        table.insert(names, abspath(name))
+      end
+    end
+  end
+  return path_match.filter_by_longest_suffix(names, query)
 end
 
 local function filesystem_matches(fname)
@@ -131,6 +149,19 @@ local function resolve_and_open()
     return
   end
 
+  local trunc_query = path_match.truncated_query_from(path)
+  if trunc_query then
+    local buf_suffix = open_buffer_suffix_matches(trunc_query)
+    if #buf_suffix == 1 then
+      drop(buf_suffix[1])
+      return
+    end
+    if #buf_suffix > 1 then
+      select_candidate(fname, buf_suffix)
+      return
+    end
+  end
+
   local buf_matches = open_buffer_matches(fname)
   if #buf_matches == 1 then
     drop(buf_matches[1])
@@ -138,6 +169,10 @@ local function resolve_and_open()
   end
 
   local candidates = filesystem_matches(fname)
+  if trunc_query and #candidates > 0 then
+    candidates = path_match.filter_by_longest_suffix(candidates, trunc_query)
+  end
+
   if #candidates == 0 then
     drop(path)
     return

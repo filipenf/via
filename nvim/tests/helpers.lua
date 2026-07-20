@@ -84,6 +84,14 @@ function M.load_vcs_module()
   return chunk()
 end
 
+--- Load a fresh copy of nvim/path_match.lua (`require("via.path_match")` source).
+function M.load_path_match_module()
+  local helpers_src = debug.getinfo(1, "S").source:sub(2)
+  local nvim_dir = vim.fn.fnamemodify(helpers_src, ":h:h")
+  local chunk = assert(loadfile(nvim_dir .. "/path_match.lua"))
+  return chunk()
+end
+
 --- Run all registered tests, printing TAP-ish output. Returns true if all passed.
 function M.run()
   for _, t in ipairs(M._tests) do
