@@ -200,8 +200,8 @@ VIA_FOREGROUND=1 cargo run -- --agent claude
 In Neovim:
 
 - `<leader>ab` or `:ViaBufferSend` — explicitly send the current buffer (or
-  visual selection) to the agent. This is the single source of truth for
-  context.
+  visual selection) to the primary PTY `agent` pane. For ACP helpers, use
+  `via agent send --to <id>` or Lua `require('via').agent.send`.
 - `via session refresh [--file PATH]` — ask Neovim to reload externally changed
   buffers after agent edits. via also runs `:checktime` on `FocusGained` and
   `BufEnter`.
@@ -243,8 +243,8 @@ Key invariants the tests and benches protect:
   respects its min/max range.
 - Clicking references (file + optional `:line`, or symbol URIs) must be fast and
   focus the editor pane appropriately.
-- Explicit context (`:ViaBufferSend`) is the contract for both PTY and ACP
-  paths.
+- Explicit context for the primary pane is `:ViaBufferSend`; ACP helpers use
+  targeted `via agent send --to <id>` / Lua `agent.send`.
 
 ## Good places to start contributing
 

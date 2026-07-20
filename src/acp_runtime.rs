@@ -20,7 +20,7 @@ use tracing::{error, info, warn};
 use crate::acp::AcpClient;
 use crate::agent_bus;
 use crate::agent_delivery::PendingAcpPrompt;
-use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
+use crate::config::PRIMARY_PTY_AGENT_ID;
 use crate::event::{AcpAgentEvent, AcpHandshakeAction, AcpModalKind, UiCommand};
 use crate::mediator::EventSender;
 
@@ -379,21 +379,6 @@ impl AcpRuntime {
     /// Look up a connected ACP session by exact id (no fallback).
     pub async fn session(&self, agent_id: &str) -> Option<AcpSession> {
         self.sessions.lock().await.get(agent_id).cloned()
-    }
-
-    /// Resolve the ACP session to use for a prompt, preferring an explicit id, then the
-    /// primary/orchestrator, then any single connected agent.
-    pub async fn session_for_prompt(&self, agent_id: Option<&str>) -> Option<AcpSession> {
-        let map = self.sessions.lock().await;
-        if let Some(id) = agent_id {
-            if let Some(session) = map.get(id) {
-                return Some(session.clone());
-            }
-        }
-        if let Some(session) = map.get(ORCHESTRATOR_AGENT_ID) {
-            return Some(session.clone());
-        }
-        map.values().next().cloned()
     }
 
     /// Drain mailbox + pending prompts and deliver when the session is connected.

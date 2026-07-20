@@ -76,7 +76,7 @@ pub enum UiCommand {
         payload: String,
         focus_agent: bool,
         /// If Some(id), route to the AgentTerminal pane whose id matches.
-        /// If None or not found, fall back to the first agent pane.
+        /// If None or not found, fall back to the primary PTY agent, then any pane.
         target_agent_id: Option<String>,
     },
     AcpTranscriptChunk {

@@ -27,17 +27,19 @@ clients.
   - Spawn an agent subprocess (`opencode acp`, `cursor-agent acp`, etc.)
   - Perform the `initialize` handshake
   - Create sessions via `new_session`
-  - Send prompts (including explicit buffer context via `:ViaBufferSend`)
+  - Send prompts (including messages delivered over the agent bus)
 - Integration into `Mediator`:
   - Sub-agents connect on spawn: when a spawn command `is_acp_command`, the
     mediator establishes a session for that id and starts its reader
-  - `BufferSendRequested` events are routed through ACP when a client is
-    connected (otherwise fall back to normal/PTY injection)
-- The primary agent pane is always PTY (`--agent opencode`). Spawned helpers
-  use ACP when the configured agent supports it (`opencode acp`, etc.).
+  - `BufferSendRequested` (`:ViaBufferSend` / `<leader>ab`) always injects
+    `@path` into the primary PTY `agent` pane; ACP helpers are not recipients
+  - Targeted prompts to ACP helpers use `via agent send --to <id>` or Lua
+    `require('via').agent.send`
+- The primary agent pane is always PTY (`--agent opencode`). Spawned helpers use
+  ACP when the configured agent supports it (`opencode acp`, etc.).
 
-The explicit `:ViaBufferSend` mechanism is the single source of truth for
-injecting context on both paths.
+`:ViaBufferSend` is the contract for primary-pane context. ACP helpers receive
+context only through explicit targeted sends.
 
 ### Phase 2 (ACP/PTY hybrid) (in progress)
 
@@ -83,12 +85,12 @@ Next steps:
 ACP is also how via does **automatic** agent-to-agent handoff. The two agent
 modes split coordination cleanly:
 
-- **PTY = interactive/manual.** A `via agent send` to a PTY agent is mailbox-only;
-  that agent reads `via agent inbox` and acts on its own. via never auto-submits
-  or injects coordination pings into an interactive pane.
+- **PTY = interactive/manual.** A `via agent send` to a PTY agent is
+  mailbox-only; that agent reads `via agent inbox` and acts on its own. via
+  never auto-submits or injects coordination pings into an interactive pane.
 - **ACP = orchestrated/automatic.** Inbound text for an ACP agent — typed into
-  its pane or delivered over the bus — resolves to its session and goes through a
-  single primitive, `client.prompt()`, which starts the agent's next turn with
+  its pane or delivered over the bus — resolves to its session and goes through
+  a single primitive, `client.prompt()`, which starts the agent's next turn with
   no human in the loop. Reader events carry the `agent_id` so transcript,
   progress, and permission modals route to the right pane.
 
