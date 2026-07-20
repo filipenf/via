@@ -62,7 +62,7 @@ pub async fn open_file(
 ) -> Result<()> {
     if !socket_path.exists() {
         bail!(
-            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before using --open.",
+            "Neovim RPC socket does not exist at {}. Start via with the same VIA_NVIM_SOCKET before opening files.",
             socket_path.display()
         );
     }
@@ -363,8 +363,6 @@ fn lua_string_literal(input: &str) -> String {
     quoted.push('"');
     quoted
 }
-
-pub fn log_socket_warning(_socket_path: &Path) {}
 
 #[cfg(test)]
 mod tests {
