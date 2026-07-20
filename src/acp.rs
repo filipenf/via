@@ -300,23 +300,6 @@ impl AcpClient {
             .await
     }
 
-    pub async fn prompt_context(
-        &mut self,
-        session_id: &str,
-        path: &Path,
-        display_path: &Path,
-        line_range: Option<(u32, u32)>,
-    ) -> Result<()> {
-        let mut prompt_text = format!("Use `{}` as context.", display_path.display());
-        let resource = selected_file_resource(path, line_range).await?;
-
-        if let Some((start, end)) = line_range {
-            prompt_text = format!("Use `{}:{start}-{end}` as context.", display_path.display());
-        }
-
-        self.prompt(session_id, &prompt_text, resource).await
-    }
-
     async fn send_request(
         &mut self,
         method: &str,
@@ -758,42 +741,6 @@ fn content_text(content: &serde_json::Value) -> Option<&str> {
         Some("text") => content.get("text").and_then(serde_json::Value::as_str),
         _ => None,
     }
-}
-
-async fn selected_file_resource(
-    path: &Path,
-    line_range: Option<(u32, u32)>,
-) -> Result<Option<PromptResource>> {
-    let text = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read context file {}", path.display()))?;
-    let text = match line_range {
-        Some((start, end)) => {
-            let start = start.max(1) as usize;
-            let end = end.max(start as u32) as usize;
-            text.lines()
-                .skip(start - 1)
-                .take(end - start + 1)
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
-        None => text,
-    };
-
-    if text.trim().is_empty() {
-        return Ok(None);
-    }
-
-    let uri = match line_range {
-        Some((start, end)) => format!("file://{}#L{start}-L{end}", path.display()),
-        None => format!("file://{}", path.display()),
-    };
-
-    Ok(Some(PromptResource {
-        uri,
-        mime_type: Some("text/plain".to_string()),
-        text,
-    }))
 }
 
 #[cfg(test)]

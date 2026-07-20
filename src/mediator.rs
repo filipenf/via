@@ -17,7 +17,7 @@ use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim;
 
-use crate::config::ORCHESTRATOR_AGENT_ID;
+use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
 
 const EVENT_BUFFER_SIZE: usize = 128;
 
@@ -340,36 +340,21 @@ impl Mediator {
                 start_line,
                 end_line,
             } => {
+                // Explicit buffer/selection send always targets the primary PTY
+                // agent pane — never a spawned ACP helper (reviewer/coder/…).
                 let display_path = path
                     .strip_prefix(&self.config.working_directory)
                     .unwrap_or(path);
-                if let Some(session) = self.acp_runtime.session_for_prompt(None).await {
-                    let client = Arc::clone(&session.client);
-                    let session_id = session.session_id;
-                    let path = path.clone();
-                    let display_path = display_path.to_path_buf();
-                    let line_range = start_line.zip(*end_line);
-                    tokio::spawn(async move {
-                        let mut guard = client.lock().await;
-                        if let Err(err) = guard
-                            .prompt_context(&session_id, &path, &display_path, line_range)
-                            .await
-                        {
-                            debug!(%err, "failed to send ACP context prompt");
-                        }
-                    });
+                let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
+                    format!("@{}:{start}-{end}\n", display_path.display())
                 } else {
-                    let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
-                        format!("@{}:{start}-{end}\n", display_path.display())
-                    } else {
-                        format!("@{}\n", display_path.display())
-                    };
-                    self.send_ui_command(UiCommand::AgentInput {
-                        payload,
-                        focus_agent: true,
-                        target_agent_id: None,
-                    });
-                }
+                    format!("@{}\n", display_path.display())
+                };
+                self.send_ui_command(UiCommand::AgentInput {
+                    payload,
+                    focus_agent: true,
+                    target_agent_id: Some(PRIMARY_PTY_AGENT_ID.to_string()),
+                });
             }
             EditorEvent::AgentSend {
                 agent_id,
@@ -908,6 +893,38 @@ mod tests {
             "PTY bus send should not emit AgentInput ping"
         );
         std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn buffer_send_targets_primary_agent_not_spawned_helpers() {
+        let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(test_config());
+
+        mediator
+            .apply_editor_event(EditorEvent::BufferSendRequested {
+                path: PathBuf::from("/tmp/src/main.rs"),
+                start_line: Some(3),
+                end_line: Some(8),
+            })
+            .await;
+
+        let command = tokio::time::timeout(Duration::from_millis(100), ui_rx.recv())
+            .await
+            .expect("buffer send command")
+            .expect("ui command");
+        assert_eq!(
+            command,
+            UiCommand::AgentInput {
+                payload: "@src/main.rs:3-8\n".to_string(),
+                focus_agent: true,
+                target_agent_id: Some(PRIMARY_PTY_AGENT_ID.to_string()),
+            }
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), ui_rx.recv())
+                .await
+                .is_err(),
+            "buffer send should emit exactly one AgentInput"
+        );
     }
 
     #[test]

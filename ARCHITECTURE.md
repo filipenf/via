@@ -78,9 +78,10 @@ The central async coordinator. It owns:
 
 Key paths:
 
-- On `BufferSendRequested` (from `:ViaBufferSend` / `<leader>ab` or explicit
-  CLI): if ACP client is connected, sends an ACP context prompt with the file
-  (or selection); otherwise falls back to writing `@path` into the PTY.
+- On `BufferSendRequested` (from `:ViaBufferSend` / `<leader>ab`): always
+  injects `@path` / `@path:start-end` into the primary PTY `agent` pane — never
+  a spawned ACP helper. Targeted ACP context uses `via agent send --to <id>`
+  (or Lua `require('via').agent.send`).
 - Incoming Neovim events (diagnostics, visual selection, LSP client list)
   update `editor_state` and are forwarded where relevant.
 - Reference navigation (file or symbol clicks) results in `nvim::open_file` /
@@ -137,11 +138,12 @@ system browser without changing Neovim focus.
   the agent. Output is fed to a libghostty `Terminal` in the agent pane. Context
   is injected by writing text into the PTY.
 - ACP mode (spawned helpers, e.g. `opencode acp`): `AcpClient` spawns the agent
-  as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, explicit
-  context is sent as prompts (e.g. `:ViaBufferSend`). The agent UI is a PTY pane
-  running `via --acp-tui` (plain ratatui), glued to the mediator over a side
-  Unix socket. Permission / ask-question modals stay in-process. Tool permissions
-  and results flow through the mediator.
+  as a stdio JSON-RPC subprocess. After `initialize` + `new_session`, prompts
+  arrive via `via agent send --to <id>` / Lua `agent.send` (or typed into the
+  ACP TUI). The agent UI is a PTY pane running `via --acp-tui` (plain ratatui),
+  glued to the mediator over a side Unix socket. Permission / ask-question
+  modals stay in-process. Tool permissions and results flow through the
+  mediator.
 
 `AcpClient` is intentionally minimal (handshake, session create, prompt,
 tool result serialization). It is not a full agent SDK.
@@ -331,8 +333,9 @@ and are mitigated by the native + GPU nature of the stack.
   get the classic two-pane (or review) layout with raw terminal; ACP mode agents
   get the single-pane (editor-only) layout + a Ratatui transcript/prompt
   surface.
-- Context is explicit (`:ViaBufferSend`) on both paths; auto-push of the active
-  buffer was removed to reduce noise.
+- Explicit context for the primary PTY pane is `:ViaBufferSend` / `<leader>ab`;
+  ACP helpers get context via `via agent send --to <id>`. Auto-push of the
+  active buffer was removed to reduce noise.
 - The review backend can be `nvim` (opens a Neovim diff/review layout) or
   `hunk`.
 - A "via-editor" skill is auto-installed for ACP agents so they can pull

@@ -1504,6 +1504,14 @@ impl WinitGhosttyApp {
     }
 
     fn first_agent_terminal_mut(&mut self) -> Option<&mut TerminalPaneController> {
+        // Prefer the primary PTY agent when multiple agent panes exist.
+        if let Some(i) = self
+            .panes
+            .iter()
+            .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+        {
+            return self.panes[i].as_terminal_mut();
+        }
         self.panes
             .iter_mut()
             .find(|pane| pane.is_agent_terminal())
@@ -1657,7 +1665,14 @@ impl WinitGhosttyApp {
                     } else {
                         None
                     };
-                    let idx = idx.or_else(|| self.panes.iter().position(AppPane::is_agent_pane));
+                    // Default to the primary PTY agent
+                    let idx = idx
+                        .or_else(|| {
+                            self.panes
+                                .iter()
+                                .position(|p| p.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                        })
+                        .or_else(|| self.panes.iter().position(AppPane::is_agent_pane));
 
                     if let Some(i) = idx {
                         if focus_agent {
