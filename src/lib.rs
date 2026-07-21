@@ -16,6 +16,7 @@ mod nvim;
 mod plugin;
 mod pty;
 mod reference_index;
+mod remote;
 mod session;
 mod task_delivery;
 mod task_store;
@@ -25,7 +26,7 @@ pub mod ui;
 mod util;
 mod workspace;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing::info;
 
@@ -43,6 +44,12 @@ pub fn run() -> Result<()> {
     // opens a window.
     if cli.acp_tui {
         return acp_tui::run(cli.acp_tui_args());
+    }
+
+    // Remote helper / SSH pipe proxy — same early-dispatch rule as `--acp-tui`.
+    let remote_args = cli.remote_args();
+    if remote_args.wants_early_dispatch() {
+        return remote::run(remote_args);
     }
 
     if cli.persist {
@@ -108,7 +115,20 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
-    let mediator = Mediator::new(config.clone());
+    let remote_client = if let Some(remote) = &config.remote {
+        let opts = crate::remote::ConnectOptions::from_host(&remote.host, remote.socket.clone());
+        let client = crate::remote::connect(opts)
+            .with_context(|| format!("connect remote helper at {}", remote.host))?;
+        info!(host = %remote.host, "connected to remote helper");
+        Some(client)
+    } else {
+        None
+    };
+
+    let mut mediator = Mediator::new(config.clone());
+    if let Some(client) = remote_client.clone() {
+        mediator = mediator.with_remote_client(client);
+    }
 
     if let Some(cmd) = &config.agent_command {
         info!(agent = %cmd, "primary PTY agent");
@@ -118,7 +138,12 @@ async fn async_main(cli: Cli) -> Result<()> {
     }
 
     let mut handle = mediator.spawn();
-    let ui = GhosttyUi::new(config.clone(), handle.events(), handle.take_ui_commands());
+    let ui = GhosttyUi::new(
+        config.clone(),
+        handle.events(),
+        handle.take_ui_commands(),
+        remote_client,
+    );
     ui.describe_backend();
 
     ui.run()?;

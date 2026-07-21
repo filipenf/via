@@ -59,6 +59,8 @@ pub struct AcpConnectCtx {
     pub cwd: PathBuf,
     pub event_sender: Option<EventSender>,
     pub ui_commands: mpsc::Sender<UiCommand>,
+    /// When set, ACP agent OS processes are spawned on the remote helper (tunneled stdio).
+    pub remote_client: Option<Arc<crate::remote::RemoteClient>>,
 }
 
 /// Spawn an ACP agent process, run the initialize handshake, and create a session.
@@ -70,18 +72,34 @@ async fn establish_acp(
     args: &[&str],
     cwd: &Path,
     preset_model: Option<&str>,
+    remote: Option<&Arc<crate::remote::RemoteClient>>,
 ) -> Result<AcpSession> {
     let handshake = async {
-        let mut client = AcpClient::spawn(
-            agent_id,
-            command,
-            args,
-            &[
-                (agent_bus::VIA_AGENT_ID_ENV, agent_id),
-                (agent_bus::VIA_AGENT_ROLE_ENV, role),
-            ],
-        )
-        .await?;
+        let mut client = if let Some(remote) = remote {
+            AcpClient::spawn_remote(
+                remote,
+                agent_id,
+                command,
+                args,
+                &[
+                    (agent_bus::VIA_AGENT_ID_ENV, agent_id),
+                    (agent_bus::VIA_AGENT_ROLE_ENV, role),
+                ],
+                Some(cwd.display().to_string()),
+            )
+            .await?
+        } else {
+            AcpClient::spawn(
+                agent_id,
+                command,
+                args,
+                &[
+                    (agent_bus::VIA_AGENT_ID_ENV, agent_id),
+                    (agent_bus::VIA_AGENT_ROLE_ENV, role),
+                ],
+            )
+            .await?
+        };
         let init = client.initialize().await?;
         let agent_name = init
             .agent_info
@@ -161,7 +179,7 @@ fn truncate_acp_status_error(message: &str) -> String {
 
 /// Surface handshake failure in the agent pane. Queued prompts are kept unless the user
 /// explicitly discards them via the retry modal.
-fn notify_acp_handshake_failed(
+async fn notify_acp_handshake_failed(
     ui_commands: &mpsc::Sender<UiCommand>,
     agent_id: &str,
     err: &anyhow::Error,
@@ -191,24 +209,24 @@ fn notify_acp_handshake_failed(
             active: false,
         });
         let _ = ui_commands.try_send(UiCommand::AcpModalPrompt {
-            agent_id: agent_id.to_string(),
-            jsonrpc_id: serde_json::Value::Null,
-            title: "Agent connection failed".to_string(),
-            message: format!(
-                "{err_msg}\n\n{queued_count} message(s) are queued and will be sent once the agent connects."
-            ),
-            options: vec![
-                crate::event::AcpPermissionOption {
-                    option_id: "retry".to_string(),
-                    name: "Retry connection".to_string(),
-                },
-                crate::event::AcpPermissionOption {
-                    option_id: "discard".to_string(),
-                    name: format!("Discard {queued_count} queued message(s)"),
-                },
-            ],
-            kind: AcpModalKind::HandshakeRetry,
-        });
+                agent_id: agent_id.to_string(),
+                jsonrpc_id: serde_json::Value::Null,
+                title: "Agent connection failed".to_string(),
+                message: format!(
+                    "{err_msg}\n\n{queued_count} message(s) are queued and will be sent once the agent connects."
+                ),
+                options: vec![
+                    crate::event::AcpPermissionOption {
+                        option_id: "retry".to_string(),
+                        name: "Retry connection".to_string(),
+                    },
+                    crate::event::AcpPermissionOption {
+                        option_id: "discard".to_string(),
+                        name: format!("Discard {queued_count} queued message(s)"),
+                    },
+                ],
+                kind: AcpModalKind::HandshakeRetry,
+            });
     }
     let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
         agent_id: agent_id.to_string(),
@@ -227,10 +245,11 @@ async fn establish_acp_with_retries(
     args: &[&str],
     cwd: &Path,
     preset_model: Option<&str>,
+    remote: Option<&Arc<crate::remote::RemoteClient>>,
 ) -> Result<AcpSession> {
     let mut last_err = None;
     for attempt in 1..=ACP_HANDSHAKE_MAX_ATTEMPTS {
-        match establish_acp(agent_id, role, program, args, cwd, preset_model).await {
+        match establish_acp(agent_id, role, program, args, cwd, preset_model, remote).await {
             Ok(session) => return Ok(session),
             Err(err) => {
                 if attempt < ACP_HANDSHAKE_MAX_ATTEMPTS {
@@ -475,6 +494,7 @@ impl AcpRuntime {
         let agents_dir = ctx.agents_dir.clone();
         let cwd = ctx.cwd.clone();
         let pending = Arc::clone(&ctx.pending);
+        let remote = ctx.remote_client.clone();
         let role = role.unwrap_or_else(|| id.clone());
         tokio::spawn(async move {
             {
@@ -503,6 +523,7 @@ impl AcpRuntime {
                 args,
                 &cwd,
                 preset_model.as_deref(),
+                remote.as_ref(),
             )
             .await
             {
@@ -544,7 +565,7 @@ impl AcpRuntime {
                 Err(err) => {
                     connecting.lock().await.remove(&id);
                     let queued_count = pending.lock().await.get(&id).map(|v| v.len()).unwrap_or(0);
-                    notify_acp_handshake_failed(&ui_commands, &id, &err, queued_count);
+                    notify_acp_handshake_failed(&ui_commands, &id, &err, queued_count).await;
                 }
             }
         });
@@ -762,13 +783,13 @@ impl AcpRuntime {
                 options,
             } => {
                 let _ = ui_commands.try_send(UiCommand::AcpModalPrompt {
-                    agent_id,
-                    jsonrpc_id,
-                    title,
-                    message: prompt,
-                    options,
-                    kind: AcpModalKind::AskQuestion { question_id },
-                });
+                        agent_id,
+                        jsonrpc_id,
+                        title,
+                        message: prompt,
+                        options,
+                        kind: AcpModalKind::AskQuestion { question_id },
+                    });
             }
             AcpAgentEvent::SessionStatus { provider_error } => {
                 self.send_session_status(
@@ -990,6 +1011,7 @@ done
             &[],
             Path::new("/tmp"),
             Some("composer-2.5"),
+            None,
         )
         .await
         .expect("establish with preset model");
@@ -1037,6 +1059,7 @@ done
             &[],
             Path::new("/tmp"),
             None,
+            None,
         )
         .await
         .expect("establish without preset model");
@@ -1058,6 +1081,7 @@ done
             cwd: PathBuf::from("/tmp"),
             event_sender: None,
             ui_commands: ui_tx,
+            remote_client: None,
         };
 
         rt.register_spawn(

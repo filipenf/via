@@ -79,6 +79,8 @@ pub struct Mediator {
     agent_delivery: AgentDelivery,
     /// Event sender retained after `spawn()` so dynamically connected agents can start readers.
     event_sender: Option<EventSender>,
+    /// Shared with Ghostty when `via --remote` is set (ACP stdio tunnel).
+    remote_client: Option<Arc<crate::remote::RemoteClient>>,
 }
 
 #[derive(Clone)]
@@ -114,7 +116,14 @@ impl Mediator {
             acp_runtime: AcpRuntime::new(auto_approve),
             agent_delivery: AgentDelivery::new(),
             event_sender: None,
+            remote_client: None,
         }
+    }
+
+    /// Attach a shared remote helper client (GUI and mediator use the same connection).
+    pub fn with_remote_client(mut self, client: Arc<crate::remote::RemoteClient>) -> Self {
+        self.remote_client = Some(client);
+        self
     }
 
     /// Build the context passed to ACP connect/retry tasks: pending queue +
@@ -126,6 +135,7 @@ impl Mediator {
             cwd: self.config.working_directory.clone(),
             event_sender: self.event_sender.clone(),
             ui_commands: self.ui_commands.clone(),
+            remote_client: self.remote_client.clone(),
         }
     }
 
@@ -736,6 +746,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: crate::config::default_agent_presets(),
             auto_approve: crate::config::AutoApproveConfig::default(),
+            remote: None,
         }
     }
 

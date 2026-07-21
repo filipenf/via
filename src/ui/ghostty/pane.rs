@@ -15,6 +15,7 @@ use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 use tracing::{debug, warn};
 
 use crate::pty::{OutputNotifier, PtySession, TerminalSize};
+use crate::remote::{PtySpawnOpts, RemoteClient, RemotePane};
 
 use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
@@ -31,7 +32,12 @@ const PTY_DRAIN_WARN_THRESHOLD: Duration = Duration::from_millis(100);
 pub(super) struct TerminalPane {
     pub(super) title: &'static str,
     view: TerminalView,
-    pty: Option<Rc<RefCell<PtySession>>>,
+    io: Option<PaneIo>,
+}
+
+enum PaneIo {
+    Local(Rc<RefCell<PtySession>>),
+    Remote(Rc<RefCell<RemotePane>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,7 +77,7 @@ impl TerminalPane {
         Ok(Self {
             title,
             view,
-            pty: None,
+            io: None,
         })
     }
 
@@ -96,8 +102,25 @@ impl TerminalPane {
             self.view.size,
             output_notifier,
         )?));
-        self.view.set_pty_response_writer(pty.clone())?;
-        self.pty = Some(pty);
+        self.view.set_local_pty_response_writer(pty.clone())?;
+        self.io = Some(PaneIo::Local(pty));
+        Ok(())
+    }
+
+    /// Spawn (or reattach) a PTY on the remote helper.
+    pub(super) fn spawn_remote(
+        &mut self,
+        client: &std::sync::Arc<RemoteClient>,
+        session_id: &str,
+        argv: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        opts: PtySpawnOpts,
+    ) -> Result<()> {
+        let pane = client.spawn_or_attach(session_id, argv, env, cwd, self.view.size, opts)?;
+        let pane = Rc::new(RefCell::new(pane));
+        self.view.set_remote_pty_response_writer(pane.clone())?;
+        self.io = Some(PaneIo::Remote(pane));
         Ok(())
     }
 
@@ -120,21 +143,53 @@ impl TerminalPane {
         )
     }
 
+    /// Remote equivalent of [`Self::spawn_shell_command`].
+    pub(super) fn spawn_shell_command_remote(
+        &mut self,
+        client: &std::sync::Arc<RemoteClient>,
+        session_id: &str,
+        command: &str,
+        cwd: Option<String>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<()> {
+        let env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        self.spawn_remote(
+            client,
+            session_id,
+            vec!["sh".into(), "-lc".into(), command.to_string()],
+            env,
+            cwd,
+            crate::remote::PtySpawnOpts::primary_screen(session_id),
+        )
+    }
+
     pub(super) fn drain_output(&mut self) -> bool {
         !self.drain_output_chunks().is_empty()
     }
 
     pub(super) fn drain_output_chunks(&mut self) -> Vec<Vec<u8>> {
-        if let Some(pty) = &self.pty {
-            let output = pty.borrow().output().clone();
-            return drain_pty_output(&output, &mut self.view, |response| {
-                if let Err(error) = pty.borrow_mut().write_all(response) {
-                    debug!(%error, "failed to write OSC color query response");
-                }
-            });
+        match &self.io {
+            Some(PaneIo::Local(pty)) => {
+                let output = pty.borrow().output().clone();
+                drain_pty_output(&output, &mut self.view, |response| {
+                    if let Err(error) = pty.borrow_mut().write_all(response) {
+                        debug!(%error, "failed to write OSC color query response");
+                    }
+                })
+            }
+            Some(PaneIo::Remote(pane)) => {
+                let output = pane.borrow().output().clone();
+                drain_pty_output(&output, &mut self.view, |response| {
+                    if let Err(error) = pane.borrow_mut().write_all(response) {
+                        debug!(%error, "failed to write OSC color query response");
+                    }
+                })
+            }
+            None => Vec::new(),
         }
-
-        Vec::new()
     }
 
     pub(super) fn resize_with_metrics(
@@ -145,10 +200,18 @@ impl TerminalPane {
     ) -> Option<TerminalSize> {
         let size = self.view.resize_with_metrics(width, height, metrics)?;
 
-        if let Some(pty) = &self.pty {
-            if let Err(error) = pty.borrow_mut().resize(size) {
-                debug!(pane = self.title, %error, "failed to resize PTY");
+        match &self.io {
+            Some(PaneIo::Local(pty)) => {
+                if let Err(error) = pty.borrow_mut().resize(size) {
+                    debug!(pane = self.title, %error, "failed to resize PTY");
+                }
             }
+            Some(PaneIo::Remote(pane)) => {
+                if let Err(error) = pane.borrow_mut().resize(size) {
+                    debug!(pane = self.title, %error, "failed to resize remote PTY");
+                }
+            }
+            None => {}
         }
 
         Some(size)
@@ -210,21 +273,23 @@ impl TerminalPane {
     }
 
     pub(super) fn child_has_exited(&mut self) -> bool {
-        match &self.pty {
+        match &self.io {
             None => true,
-            Some(pty) => pty.borrow_mut().has_exited(),
+            Some(PaneIo::Local(pty)) => pty.borrow_mut().has_exited(),
+            Some(PaneIo::Remote(pane)) => pane.borrow_mut().has_exited(),
         }
     }
 
     pub(super) fn terminate_child(&mut self) -> Result<()> {
         self.view.clear_pty_response_writer()?;
-        self.pty = None;
+        self.io = None;
         Ok(())
     }
 
     pub(super) fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
-        let result = match &self.pty {
-            Some(pty) => pty.borrow_mut().write_all(bytes),
+        let result = match &self.io {
+            Some(PaneIo::Local(pty)) => pty.borrow_mut().write_all(bytes),
+            Some(PaneIo::Remote(pane)) => pane.borrow_mut().write_all(bytes),
             None => Ok(()),
         };
 
@@ -234,7 +299,7 @@ impl TerminalPane {
                 %error,
                 "terminal pane rejected input; dropping PTY session"
             );
-            self.pty = None;
+            self.io = None;
             self.view.clear_pty_response_writer()?;
         }
 
@@ -497,9 +562,16 @@ impl TerminalView {
         Ok(payload)
     }
 
-    fn set_pty_response_writer(&mut self, pty: Rc<RefCell<PtySession>>) -> Result<()> {
+    fn set_local_pty_response_writer(&mut self, pty: Rc<RefCell<PtySession>>) -> Result<()> {
         self.terminal.on_pty_write(move |_term, data| {
             let _ = pty.borrow_mut().write_all(data);
+        })?;
+        Ok(())
+    }
+
+    fn set_remote_pty_response_writer(&mut self, pane: Rc<RefCell<RemotePane>>) -> Result<()> {
+        self.terminal.on_pty_write(move |_term, data| {
+            let _ = pane.borrow_mut().write_all(data);
         })?;
         Ok(())
     }

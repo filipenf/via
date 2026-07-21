@@ -127,6 +127,18 @@ pub struct Config {
     pub agent_presets: HashMap<String, AgentPreset>,
     /// ACP permission auto-approve extensions (built-in allows always on).
     pub auto_approve: AutoApproveConfig,
+    /// When set, pane PTYs are owned by a remote helper (`via --remote <host>`).
+    pub remote: Option<RemoteMode>,
+}
+
+/// Local GUI attached to a remote helper session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMode {
+    pub host: String,
+    /// Working directory on the remote host for spawned panes.
+    pub cwd: Option<PathBuf>,
+    /// Optional control socket override (also used for `host=local` / `VIA_REMOTE_SOCKET`).
+    pub socket: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -141,6 +153,7 @@ pub struct ConfigOverrides {
     pub plugin_dir: Option<String>,
     pub agent_presets: HashMap<String, AgentPreset>,
     pub auto_approve: AutoApproveConfig,
+    pub remote: Option<RemoteMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -274,6 +287,7 @@ impl From<FileConfig> for ConfigOverrides {
             plugin_dir: config.plugin_dir,
             agent_presets: config.agents,
             auto_approve: config.auto_approve,
+            remote: None,
         }
     }
 }
@@ -296,6 +310,7 @@ impl ConfigOverrides {
             plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         }
     }
 }
@@ -311,6 +326,7 @@ struct ResolvedUserConfig {
     plugin_dir: Option<String>,
     agent_presets: HashMap<String, AgentPreset>,
     auto_approve: AutoApproveConfig,
+    remote: Option<RemoteMode>,
 }
 
 fn resolve_user_config_from_sources(
@@ -349,6 +365,7 @@ fn resolve_user_config_from_sources(
         .or(env.plugin_dir)
         .or(file.plugin_dir)
         .filter(|s| !s.is_empty());
+    let remote = cli.remote.or(env.remote);
 
     ResolvedUserConfig {
         nvim_command,
@@ -363,6 +380,7 @@ fn resolve_user_config_from_sources(
         plugin_dir,
         agent_presets: file.agent_presets,
         auto_approve: file.auto_approve,
+        remote,
     }
 }
 
@@ -486,6 +504,12 @@ impl Config {
             .map(PathBuf::from)
             .unwrap_or_else(default_lsp_bridge_socket_path);
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        // Prefer remote cwd for workspace semantics when attached to a helper.
+        let working_directory = user_config
+            .remote
+            .as_ref()
+            .and_then(|r| r.cwd.clone())
+            .unwrap_or(working_directory);
 
         Ok(Self {
             nvim_command: user_config.nvim_command,
@@ -505,6 +529,7 @@ impl Config {
             plugin_dir: user_config.plugin_dir.map(PathBuf::from),
             agent_presets: merge_agent_presets(user_config.agent_presets),
             auto_approve: user_config.auto_approve,
+            remote: user_config.remote,
         })
     }
 
@@ -851,6 +876,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -862,6 +888,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
@@ -873,6 +900,7 @@ mod tests {
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -900,6 +928,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -911,6 +940,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -949,6 +979,7 @@ mod tests {
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         });
 
         assert_eq!(
@@ -1007,6 +1038,7 @@ scroll_sensitivity = 1.5
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1032,6 +1064,7 @@ scroll_sensitivity = 1.5
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1097,6 +1130,7 @@ scroll_sensitivity = 1.5
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
         let orchestration = user
             .agent_command
@@ -1133,6 +1167,7 @@ scroll_sensitivity = 1.5
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
         let launch = config.resolve_spawn_command(None);
         assert_eq!(launch.command, "opencode acp");
@@ -1269,6 +1304,7 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets: merge_agent_presets(file.agents),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1295,6 +1331,7 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let preset = config.apply_spawn_preset("reviewer", None, None, None);
@@ -1358,6 +1395,7 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1393,6 +1431,7 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, Some("from-cli".to_string()));
@@ -1420,6 +1459,7 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets,
             auto_approve: AutoApproveConfig::default(),
+            remote: None,
         });
 
         assert!(output.contains("[agents.coder]"));

@@ -2,23 +2,30 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tracing::debug;
 
 use crate::event::{AcpAgentEvent, AcpPermissionOption, AgentEvent, Event};
 use crate::mediator::EventSender;
+use crate::remote::{RemoteClient, RemotePane};
 
 /// Minimal ACP (Agent Client Protocol) client.
 ///
 /// This implements a lightweight JSON-RPC 2.0 client that speaks the
-/// Agent Client Protocol over stdio with a subprocess agent.
+/// Agent Client Protocol over stdio with a subprocess agent (local or remote).
 pub struct AcpClient {
-    child: Child,
+    transport: AcpTransport,
     next_id: u64,
     /// Bus id of the agent this client drives (e.g. "orchestrator", "reviewer").
     /// Used to stamp emitted events so the UI can route them to the right pane.
     agent_id: String,
+}
+
+enum AcpTransport {
+    Local(Child),
+    Remote { pane: RemotePane, line_buf: Vec<u8> },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -283,10 +290,53 @@ impl AcpClient {
 
         debug!(command, "ACP agent process started");
         Ok(Self {
-            child,
+            transport: AcpTransport::Local(child),
             next_id: 1,
             agent_id: agent_id.to_string(),
         })
+    }
+
+    /// Adopt a remote helper stdio session (spike: local AcpClient + tunneled agent stdio).
+    pub fn adopt_remote(agent_id: &str, pane: RemotePane) -> Self {
+        debug!(agent_id, session_id = %pane.session_id(), "adopting remote ACP stdio session");
+        Self {
+            transport: AcpTransport::Remote {
+                pane,
+                line_buf: Vec::new(),
+            },
+            next_id: 1,
+            agent_id: agent_id.to_string(),
+        }
+    }
+
+    /// Spawn the ACP agent on the remote helper and adopt its stdio.
+    pub async fn spawn_remote(
+        client: &Arc<RemoteClient>,
+        agent_id: &str,
+        command: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+        cwd: Option<String>,
+    ) -> Result<Self> {
+        let mut argv = Vec::with_capacity(1 + args.len());
+        argv.push(command.to_string());
+        argv.extend(args.iter().map(|s| (*s).to_string()));
+        let env: Vec<(String, String)> = extra_env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let session_id = format!("acp-stdio-{agent_id}");
+        let pane = client
+            .spawn_stdio(
+                session_id,
+                argv,
+                env,
+                cwd,
+                Some("acp".into()),
+                Some(agent_id.to_string()),
+            )
+            .with_context(|| format!("remote spawn ACP agent: {command}"))?;
+        Ok(Self::adopt_remote(agent_id, pane))
     }
 
     /// Perform the ACP initialize handshake.
@@ -354,45 +404,87 @@ impl AcpClient {
     /// from the agent's stdout, logs them, and forwards recognized updates to the bus.
     pub fn spawn_reader(&mut self, events: EventSender) {
         let agent_id = self.agent_id.clone();
-        if let Some(stdout) = self.child.stdout.take() {
-            let events = events.clone();
-            let agent_id = agent_id.clone();
-            tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if !line.trim().is_empty() {
-                        for event in process_acp_line(&line, &agent_id) {
-                            events.send(Event::Agent(event)).await;
+        match &mut self.transport {
+            AcpTransport::Local(child) => {
+                if let Some(stdout) = child.stdout.take() {
+                    let events = events.clone();
+                    let agent_id = agent_id.clone();
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stdout);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            if !line.trim().is_empty() {
+                                for event in process_acp_line(&line, &agent_id) {
+                                    events.send(Event::Agent(event)).await;
+                                }
+                            }
+                        }
+                        tracing::debug!(agent_id, "ACP agent stdout closed");
+                    });
+                }
+                if let Some(stderr) = child.stderr.take() {
+                    tokio::spawn(async move {
+                        let reader = BufReader::new(stderr);
+                        let mut lines = reader.lines();
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            tracing::warn!(agent_id, stderr = %line, "ACP agent stderr");
+                            if looks_like_provider_error(line) {
+                                events
+                                    .send(Event::Agent(AgentEvent::acp(
+                                        &agent_id,
+                                        AcpAgentEvent::SessionStatus {
+                                            provider_error: Some(truncate_provider_error(line)),
+                                        },
+                                    )))
+                                    .await;
+                            }
+                        }
+                        tracing::debug!(agent_id, "ACP agent stderr closed");
+                    });
+                }
+            }
+            AcpTransport::Remote { pane, line_buf } => {
+                let Some(output) = pane.take_output() else {
+                    tracing::warn!(
+                        agent_id = %self.agent_id,
+                        "remote ACP stdout already taken; reader not started"
+                    );
+                    return;
+                };
+                let leftover = std::mem::take(line_buf);
+                let events = events.clone();
+                let agent_id = agent_id.clone();
+                tokio::spawn(async move {
+                    let mut buf = leftover;
+                    loop {
+                        match output.try_recv() {
+                            Ok(chunk) => {
+                                buf.extend_from_slice(&chunk);
+                                while let Some(idx) = buf.iter().position(|&b| b == b'\n') {
+                                    let line =
+                                        String::from_utf8_lossy(&buf[..=idx]).trim().to_string();
+                                    buf.drain(..=idx);
+                                    if line.is_empty() {
+                                        continue;
+                                    }
+                                    for event in process_acp_line(&line, &agent_id) {
+                                        events.send(Event::Agent(event)).await;
+                                    }
+                                }
+                            }
+                            Err(crossbeam_channel::TryRecvError::Empty) => {
+                                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                            }
+                            Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                         }
                     }
-                }
-                tracing::debug!(agent_id, "ACP agent stdout closed");
-            });
-        }
-        if let Some(stderr) = self.child.stderr.take() {
-            tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let line = line.trim();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    tracing::warn!(agent_id, stderr = %line, "ACP agent stderr");
-                    if looks_like_provider_error(line) {
-                        events
-                            .send(Event::Agent(AgentEvent::acp(
-                                &agent_id,
-                                AcpAgentEvent::SessionStatus {
-                                    provider_error: Some(truncate_provider_error(line)),
-                                },
-                            )))
-                            .await;
-                    }
-                }
-                tracing::debug!(agent_id, "ACP agent stderr closed");
-            });
+                    tracing::debug!(agent_id, "remote ACP agent stdout closed");
+                });
+            }
         }
     }
 
@@ -460,13 +552,16 @@ impl AcpClient {
         let mut json = serde_json::to_string(value)?;
         json.push('\n');
         debug!(json = %json.trim_end(), "writing ACP message to agent stdin");
-        let stdin = self
-            .child
-            .stdin
-            .as_mut()
-            .context("agent stdin unavailable")?;
-        stdin.write_all(json.as_bytes()).await?;
-        stdin.flush().await?;
+        match &mut self.transport {
+            AcpTransport::Local(child) => {
+                let stdin = child.stdin.as_mut().context("agent stdin unavailable")?;
+                stdin.write_all(json.as_bytes()).await?;
+                stdin.flush().await?;
+            }
+            AcpTransport::Remote { pane, .. } => {
+                pane.write_all(json.as_bytes())?;
+            }
+        }
         debug!("ACP message flushed to agent");
         Ok(())
     }
@@ -487,62 +582,118 @@ impl AcpClient {
 
     async fn read_response(&mut self, expected_id: u64) -> Result<serde_json::Value> {
         debug!(expected_id, "waiting for ACP response");
-        let stdout = self
-            .child
-            .stdout
-            .as_mut()
-            .context("agent stdout unavailable")?;
-        let reader = BufReader::new(stdout);
-        let mut lines = reader.lines();
+        match &mut self.transport {
+            AcpTransport::Local(child) => {
+                let stdout = child.stdout.as_mut().context("agent stdout unavailable")?;
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
 
-        while let Some(line) = lines.next_line().await? {
-            if line.trim().is_empty() {
-                continue;
-            }
-
-            let msg: JsonRpcMessage = serde_json::from_str(&line)
-                .with_context(|| format!("invalid JSON-RPC from agent: {line}"))?;
-
-            match msg {
-                JsonRpcMessage::Response {
-                    jsonrpc: _,
-                    id,
-                    result,
-                    error,
-                } if jsonrpc_id_matches(&id, expected_id) => {
-                    if let Some(err) = error {
-                        anyhow::bail!(
-                            "ACP error {}: {}{}",
-                            err.code,
-                            err.message,
-                            err.data
-                                .map(|data| format!(" data={data}"))
-                                .unwrap_or_default()
-                        );
+                while let Some(line) = lines.next_line().await? {
+                    if line.trim().is_empty() {
+                        continue;
                     }
-                    return Ok(result.unwrap_or(serde_json::Value::Null));
+
+                    let msg: JsonRpcMessage = serde_json::from_str(&line)
+                        .with_context(|| format!("invalid JSON-RPC from agent: {line}"))?;
+
+                    match msg {
+                        JsonRpcMessage::Response {
+                            jsonrpc: _,
+                            id,
+                            result,
+                            error,
+                        } if jsonrpc_id_matches(&id, expected_id) => {
+                            if let Some(err) = error {
+                                anyhow::bail!(
+                                    "ACP error {}: {}{}",
+                                    err.code,
+                                    err.message,
+                                    err.data
+                                        .map(|data| format!(" data={data}"))
+                                        .unwrap_or_default()
+                                );
+                            }
+                            return Ok(result.unwrap_or(serde_json::Value::Null));
+                        }
+                        JsonRpcMessage::Notification {
+                            jsonrpc: _,
+                            method,
+                            params,
+                        } => {
+                            tracing::debug!(method, ?params, "received ACP notification");
+                        }
+                        _ => {}
+                    }
                 }
-                // Ignore responses for other IDs (future improvement: queue them)
-                JsonRpcMessage::Notification {
-                    jsonrpc: _,
-                    method,
-                    params,
-                } => {
-                    // Handle streaming notifications here in a real implementation
-                    tracing::debug!(method, ?params, "received ACP notification");
+
+                anyhow::bail!("agent closed connection before response")
+            }
+            AcpTransport::Remote { pane, line_buf } => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+                loop {
+                    while let Some(idx) = line_buf.iter().position(|&b| b == b'\n') {
+                        let line = String::from_utf8_lossy(&line_buf[..=idx])
+                            .trim()
+                            .to_string();
+                        line_buf.drain(..=idx);
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let msg: JsonRpcMessage = serde_json::from_str(&line)
+                            .with_context(|| format!("invalid JSON-RPC from agent: {line}"))?;
+                        match msg {
+                            JsonRpcMessage::Response {
+                                id, result, error, ..
+                            } if jsonrpc_id_matches(&id, expected_id) => {
+                                if let Some(err) = error {
+                                    anyhow::bail!(
+                                        "ACP error {}: {}{}",
+                                        err.code,
+                                        err.message,
+                                        err.data
+                                            .map(|data| format!(" data={data}"))
+                                            .unwrap_or_default()
+                                    );
+                                }
+                                return Ok(result.unwrap_or(serde_json::Value::Null));
+                            }
+                            JsonRpcMessage::Notification { method, params, .. } => {
+                                tracing::debug!(method, ?params, "received ACP notification");
+                            }
+                            _ => {}
+                        }
+                    }
+                    match pane.output().try_recv() {
+                        Ok(chunk) => line_buf.extend_from_slice(&chunk),
+                        Err(crossbeam_channel::TryRecvError::Empty) => {
+                            if pane.has_exited() {
+                                anyhow::bail!("remote agent closed connection before response");
+                            }
+                            if std::time::Instant::now() > deadline {
+                                anyhow::bail!("timed out waiting for ACP response {expected_id}");
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                            anyhow::bail!("remote agent closed connection before response");
+                        }
+                    }
                 }
-                _ => {}
             }
         }
-
-        anyhow::bail!("agent closed connection before response")
     }
 }
 
 impl Drop for AcpClient {
     fn drop(&mut self) {
-        // Best effort: kill the agent process when we go away
-        let _ = self.child.start_kill();
+        match &mut self.transport {
+            AcpTransport::Local(child) => {
+                let _ = child.start_kill();
+            }
+            AcpTransport::Remote { .. } => {
+                // RemotePane Drop sends Kill for stdio sessions.
+            }
+        }
     }
 }
 

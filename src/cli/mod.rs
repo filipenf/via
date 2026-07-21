@@ -74,12 +74,42 @@ pub struct Cli {
     #[arg(long = "socket")]
     pub socket: Option<std::path::PathBuf>,
 
+    /// Run the remote helper daemon (detachable PTY session authority). Does not start the GUI.
+    #[arg(long = "remote-serve")]
+    pub remote_serve: bool,
+
+    /// Bridge stdio to the remote helper control socket (SSH pipe target). Does not start the GUI.
+    #[arg(long = "remote-proxy")]
+    pub remote_proxy: bool,
+
+    /// Keep `--remote-serve` in the foreground (no double-fork daemonize).
+    #[arg(long = "remote-foreground")]
+    pub remote_foreground: bool,
+
+    /// Control socket for `--remote-serve` / `--remote-proxy`
+    /// (default: `$XDG_DATA_HOME/via/remote/control.sock`).
+    #[arg(long = "remote-socket")]
+    pub remote_socket: Option<std::path::PathBuf>,
+
+    /// Connect the local GUI to a remote SSH host (`local` / `VIA_REMOTE_SOCKET` for unix).
+    #[arg(long = "remote", value_name = "HOST")]
+    pub remote: Option<String>,
+
+    /// Remote working directory when using `--remote` (spike: `via --remote host --cwd /path`).
+    #[arg(long = "cwd", value_name = "DIR")]
+    pub cwd: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
 
 impl Cli {
     pub fn config_overrides(&self) -> crate::config::ConfigOverrides {
+        let remote = self.remote.as_ref().map(|host| crate::config::RemoteMode {
+            host: host.clone(),
+            cwd: self.cwd.clone(),
+            socket: self.remote_socket.clone(),
+        });
         crate::config::ConfigOverrides {
             nvim: self.nvim.clone(),
             agent: self.agent.clone(),
@@ -90,6 +120,7 @@ impl Cli {
             plugin_dir: self.plugin_dir.clone(),
             agent_presets: Default::default(),
             auto_approve: Default::default(),
+            remote,
         }
     }
 
@@ -101,6 +132,16 @@ impl Cli {
             demo: self.demo,
             no_input: self.no_input,
             socket: self.socket.clone(),
+        }
+    }
+
+    /// Options for [`crate::remote::run`] when `--remote-serve` / `--remote-proxy` is set.
+    pub fn remote_args(&self) -> crate::remote::Args {
+        crate::remote::Args {
+            serve: self.remote_serve,
+            proxy: self.remote_proxy,
+            foreground: self.remote_foreground,
+            socket: self.remote_socket.clone(),
         }
     }
 }
@@ -436,6 +477,62 @@ mod tests {
         assert!(args.demo);
         assert!(args.no_input);
         assert_eq!(args.agent_id.as_deref(), Some("coder"));
+    }
+
+    #[test]
+    fn parses_remote_helper_flags() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "--remote-serve",
+            "--remote-foreground",
+            "--remote-socket",
+            "/tmp/via-remote.sock",
+        ])
+        .unwrap();
+        assert!(cli.remote_serve);
+        assert!(cli.remote_foreground);
+        assert_eq!(
+            cli.remote_socket.as_deref(),
+            Some(std::path::Path::new("/tmp/via-remote.sock"))
+        );
+        let args = cli.remote_args();
+        assert!(args.serve);
+        assert!(args.foreground);
+        assert!(args.wants_early_dispatch());
+
+        let proxy = Cli::try_parse_from(["via", "--remote-proxy"]).unwrap();
+        assert!(proxy.remote_proxy);
+        assert!(proxy.remote_args().wants_early_dispatch());
+
+        let host = Cli::try_parse_from(["via", "--remote", "codespace"]).unwrap();
+        assert_eq!(host.remote.as_deref(), Some("codespace"));
+        assert!(!host.remote_args().wants_early_dispatch());
+        let overrides = host.config_overrides();
+        assert_eq!(
+            overrides.remote.as_ref().map(|r| r.host.as_str()),
+            Some("codespace")
+        );
+
+        let with_cwd = Cli::try_parse_from([
+            "via",
+            "--remote",
+            "local",
+            "--cwd",
+            "/tmp/proj",
+            "--remote-socket",
+            "/tmp/c.sock",
+        ])
+        .unwrap();
+        let remote = with_cwd.config_overrides().remote.unwrap();
+        assert_eq!(remote.host, "local");
+        assert_eq!(
+            remote.cwd.as_deref(),
+            Some(std::path::Path::new("/tmp/proj"))
+        );
+        assert_eq!(
+            remote.socket.as_deref(),
+            Some(std::path::Path::new("/tmp/c.sock"))
+        );
     }
 
     #[test]

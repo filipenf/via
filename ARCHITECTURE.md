@@ -322,6 +322,24 @@ projects them into the detected agent family's skill roots.
 - `src/editor.rs`: the in-memory `EditorState` updated by the Lua bridge events.
 - `src/event.rs`: the enum of all cross-layer messages (EditorEvent, AgentEvent,
   UiCommand, etc.).
+- `src/remote/`: remote execution helper. Early-dispatch `via --remote-serve`
+  owns detachable PTYs (and ACP stdio processes) and speaks NDJSON on
+  `$XDG_DATA_HOME/via/remote/control.sock`; `via --remote-proxy` bridges stdio
+  to that socket (SSH pipe). Local GUI: `via --remote <host>` ensures the
+  daemon, opens an SSH proxy, and spawns nvim/shells/agents/ACP-TUI panes
+  through [`RemoteClient`]. Local `AcpClient` keeps ownership; agent stdio is
+  tunneled via `SpawnStdio`. Protocol: `RemoteRequest` / `RemoteEvent` in
+  `src/remote/protocol.rs`.
+
+  **Reconnect / detach (GUI quit ≠ kill):** Dropping the SSH proxy or closing
+  the local window only **Detaches**; remote PTYs and ACP processes keep
+  running under the daemon. Reopening `via --remote <host>` reuses session ids
+  (`Spawn` is idempotent) and **Attach** returns `Replay` for primary-screen
+  panes (~4 MiB ring). Neovim skips Replay (redraw via resize/SIGWINCH).
+  `ListSessions` exposes roster metadata (`role` / `label` / cols) for
+  best-effort layout; perfect chrome restore is not promised. Explicit
+  teardown is `Shutdown` / stopping the daemon — not implied by GUI quit.
+  Nvim RPC / ACP-TUI Unix socket mux is still a follow-up.
 - `build.rs`: currently a no-op (just rerun-if-changed). The real compile-time
   work happens inside the `libghostty-vt` crate's build script.
 

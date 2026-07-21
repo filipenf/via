@@ -26,6 +26,7 @@ use crate::event::{AcpHandshakeAction, AcpModalKind, EditorEvent, Event, UiComma
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
 use crate::reference_index::ReferenceIndex;
+use crate::remote::{PtySpawnOpts, RemoteClient};
 
 use self::links::ReferenceContext;
 
@@ -65,6 +66,7 @@ pub struct GhosttyUi {
     events: EventSender,
     ui_commands: TokioReceiver<UiCommand>,
     pending_agent_write: Option<PendingAgentWrite>,
+    remote_client: Option<Arc<RemoteClient>>,
 }
 
 struct PendingAgentWrite {
@@ -73,12 +75,18 @@ struct PendingAgentWrite {
 }
 
 impl GhosttyUi {
-    pub fn new(config: Config, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
+    pub fn new(
+        config: Config,
+        events: EventSender,
+        ui_commands: TokioReceiver<UiCommand>,
+        remote_client: Option<Arc<RemoteClient>>,
+    ) -> Self {
         Self {
             config,
             events,
             ui_commands,
             pending_agent_write: None,
+            remote_client,
         }
     }
 
@@ -137,6 +145,8 @@ struct WinitGhosttyApp {
     acp_modal: AcpModalQueue,
     /// Control-plane bridges for PTY-hosted `via --acp-tui` panes (keyed by agent id).
     acp_tui_bridges: HashMap<String, AcpTuiBridge>,
+    /// Present when `config.remote` is set; owns the SSH/unix control channel.
+    remote_client: Option<Arc<RemoteClient>>,
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
@@ -370,6 +380,13 @@ impl AppPane {
 impl WinitGhosttyApp {
     fn new(ui: GhosttyUi, event_loop_proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let output_notifier = CoalescedOutputNotifier::new(event_loop_proxy);
+        let remote_client = ui.remote_client;
+        if let Some(client) = &remote_client {
+            client.set_output_notifier(output_notifier.clone());
+            if let Some(remote) = &ui.config.remote {
+                info!(host = %remote.host, "remote pane backend enabled");
+            }
+        }
         let terminal_config = TerminalConfig::load();
         let font_renderer = FontRenderer::new(&terminal_config)?;
         let pane_split_direction = PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
@@ -402,6 +419,7 @@ impl WinitGhosttyApp {
             review_active: false,
             acp_modal: AcpModalQueue::new(),
             acp_tui_bridges: HashMap::new(),
+            remote_client,
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
@@ -457,17 +475,52 @@ impl WinitGhosttyApp {
                 self.height,
                 self.terminal_config.metrics,
             )?];
-            let nvim_args = nvim_args(&self.config);
+            let remote_client = self.remote_client.clone();
+            let remote_cwd = self.remote_cwd();
+            let remote_nvim = remote_client
+                .as_ref()
+                .map(|_| remote_nvim_argv(&self.config));
+            let local_nvim_args = nvim_args(&self.config);
+            let nvim_command = self.config.nvim_command.clone();
+            let working_directory = self.config.working_directory.clone();
+            let output_notifier = self.output_notifier.clone();
+
             let Some(editor_pane) = self.panes[0].as_terminal_mut() else {
                 return Err(anyhow!("editor pane is not a terminal"));
             };
-            editor_pane.spawn(
-                &self.config.nvim_command,
-                nvim_args,
-                &self.config.working_directory,
-                &[],
-                self.output_notifier.clone(),
-            )?;
+            if let (Some(client), Some(argv)) = (remote_client, remote_nvim) {
+                // Log remote roster for reconnect visibility (best-effort layout).
+                match client.list_sessions() {
+                    Ok(sessions) if !sessions.is_empty() => {
+                        info!(
+                            count = sessions.len(),
+                            sessions = ?sessions
+                                .iter()
+                                .map(|s| s.session_id.as_str())
+                                .collect::<Vec<_>>(),
+                            "reattaching to existing remote sessions"
+                        );
+                    }
+                    Ok(_) => info!("no existing remote sessions; spawning fresh panes"),
+                    Err(err) => warn!(%err, "ListSessions failed; spawning panes anyway"),
+                }
+                editor_pane.spawn_remote(
+                    &client,
+                    "nvim",
+                    argv,
+                    vec![],
+                    remote_cwd,
+                    PtySpawnOpts::nvim(),
+                )?;
+            } else {
+                editor_pane.spawn(
+                    &nvim_command,
+                    local_nvim_args,
+                    &working_directory,
+                    &[],
+                    output_notifier,
+                )?;
+            }
             if let Some(agent_command) = self.config.agent_command.clone() {
                 self.create_agent_pane(
                     PRIMARY_PTY_AGENT_ID,
@@ -517,6 +570,20 @@ impl WinitGhosttyApp {
         )))
     }
 
+    fn remote_cwd(&self) -> Option<String> {
+        self.config
+            .remote
+            .as_ref()
+            .and_then(|r| r.cwd.as_ref())
+            .map(|p| p.display().to_string())
+            .or_else(|| {
+                self.config
+                    .remote
+                    .as_ref()
+                    .map(|_| self.config.working_directory.display().to_string())
+            })
+    }
+
     fn create_agent_pane(
         &mut self,
         id: &str,
@@ -548,15 +615,20 @@ impl WinitGhosttyApp {
             let mut pane =
                 TerminalPane::new(title, w / 2, h / 2, metrics, &self.terminal_config.theme)?;
             let role_label = role.unwrap_or(id);
-            pane.spawn_shell_command(
-                &cmd,
-                &self.config.working_directory,
-                &[
-                    (crate::agent_bus::VIA_AGENT_ID_ENV, id),
-                    (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
-                ],
-                self.output_notifier.clone(),
-            )?;
+            let env = [
+                (crate::agent_bus::VIA_AGENT_ID_ENV, id),
+                (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
+            ];
+            if let Some(client) = &self.remote_client {
+                pane.spawn_shell_command_remote(client, id, &cmd, self.remote_cwd(), &env)?;
+            } else {
+                pane.spawn_shell_command(
+                    &cmd,
+                    &self.config.working_directory,
+                    &env,
+                    self.output_notifier.clone(),
+                )?;
+            }
             self.panes
                 .push(AppPane::Terminal(TerminalPaneController::new(
                     PaneRole::AgentTerminal {
@@ -589,23 +661,6 @@ impl WinitGhosttyApp {
         height: usize,
         metrics: TerminalMetrics,
     ) -> Result<()> {
-        let runtime_dir = crate::config::runtime_base_dir();
-        let socket_path = socket_path_for_agent(&runtime_dir, id);
-        let bridge = AcpTuiBridge::bind(id, socket_path.clone())
-            .with_context(|| format!("bind ACP UI socket for agent {id}"))?;
-        let socket = bridge.socket_path().to_path_buf();
-        let socket_str = socket
-            .to_str()
-            .with_context(|| format!("ACP UI socket path is not UTF-8: {}", socket.display()))?
-            .to_string();
-
-        let bin = resolve_acp_tui_bin()?;
-        let bin_str = bin
-            .to_str()
-            .with_context(|| format!("via binary path is not UTF-8: {}", bin.display()))?
-            .to_string();
-        let (env, args) = spawn_env_and_args(id, role_label, &socket_str);
-
         let title: &'static str = Box::leak(label.to_string().into_boxed_str());
         let mut pane = TerminalPane::new(
             title,
@@ -614,16 +669,78 @@ impl WinitGhosttyApp {
             metrics,
             &self.terminal_config.theme,
         )?;
-        pane.spawn(
-            &bin_str,
-            args.iter().map(|s| OsString::from(*s)),
-            &self.config.working_directory,
-            &env,
-            self.output_notifier.clone(),
-        )
-        .with_context(|| format!("spawn via --acp-tui for agent {id}"))?;
 
-        self.acp_tui_bridges.insert(id.to_string(), bridge);
+        if let Some(client) = &self.remote_client {
+            // Remote display PTY; transcript bridge still needs socket mux (tracked separately).
+            // ACP agent process uses SpawnStdio via AcpClient::spawn_remote.
+            let socket = format!("/tmp/via-acp-ui-{id}.sock");
+            let env = vec![
+                (
+                    crate::agent_bus::VIA_AGENT_ID_ENV.to_string(),
+                    id.to_string(),
+                ),
+                (
+                    crate::agent_bus::VIA_AGENT_ROLE_ENV.to_string(),
+                    role_label.to_string(),
+                ),
+                (
+                    crate::acp_tui::VIA_ACP_UI_SOCKET_ENV.to_string(),
+                    socket.clone(),
+                ),
+            ];
+            pane.spawn_remote(
+                client,
+                &format!("acp-tui-{id}"),
+                vec![
+                    "via".into(),
+                    "--acp-tui".into(),
+                    "--agent-id".into(),
+                    id.to_string(),
+                    "--role".into(),
+                    role_label.to_string(),
+                    "--socket".into(),
+                    socket,
+                ],
+                env,
+                self.remote_cwd(),
+                PtySpawnOpts::primary_screen(format!("acp-tui-{id}")),
+            )
+            .with_context(|| format!("remote spawn via --acp-tui for agent {id}"))?;
+            warn!(
+                %id,
+                "remote ACP TUI pane spawned without control-socket mux; transcript bridge inactive"
+            );
+        } else {
+            let runtime_dir = crate::config::runtime_base_dir();
+            let socket_path = socket_path_for_agent(&runtime_dir, id);
+            let bridge = AcpTuiBridge::bind(id, socket_path.clone())
+                .with_context(|| format!("bind ACP UI socket for agent {id}"))?;
+            let socket = bridge.socket_path().to_path_buf();
+            let socket_str = socket
+                .to_str()
+                .with_context(|| format!("ACP UI socket path is not UTF-8: {}", socket.display()))?
+                .to_string();
+
+            let bin = resolve_acp_tui_bin()?;
+            let bin_str = bin
+                .to_str()
+                .with_context(|| format!("via binary path is not UTF-8: {}", bin.display()))?
+                .to_string();
+            let (env, args) = spawn_env_and_args(id, role_label, &socket_str);
+
+            pane.spawn(
+                &bin_str,
+                args.iter().map(|s| OsString::from(*s)),
+                &self.config.working_directory,
+                &env,
+                self.output_notifier.clone(),
+            )
+            .with_context(|| format!("spawn via --acp-tui for agent {id}"))?;
+
+            self.acp_tui_bridges.insert(id.to_string(), bridge);
+            info!(%id, socket = %socket.display(), bin = %bin.display(), "spawned ACP TUI pane");
+        }
+
         self.panes
             .push(AppPane::Terminal(TerminalPaneController::new(
                 PaneRole::AgentTerminal {
@@ -635,7 +752,6 @@ impl WinitGhosttyApp {
                 pane,
                 self.config.scroll_sensitivity,
             )));
-        info!(%id, socket = %socket.display(), bin = %bin.display(), "spawned ACP TUI pane");
         Ok(())
     }
 
@@ -1207,12 +1323,22 @@ impl WinitGhosttyApp {
                 self.terminal_config.metrics,
                 &self.terminal_config.theme,
             )?;
-            pane.spawn_shell_command(
-                hunk_review_command(),
-                &self.config.working_directory,
-                &[],
-                self.output_notifier.clone(),
-            )?;
+            if let Some(client) = &self.remote_client {
+                pane.spawn_shell_command_remote(
+                    client,
+                    "review",
+                    hunk_review_command(),
+                    self.remote_cwd(),
+                    &[],
+                )?;
+            } else {
+                pane.spawn_shell_command(
+                    hunk_review_command(),
+                    &self.config.working_directory,
+                    &[],
+                    self.output_notifier.clone(),
+                )?;
+            }
             let controller = TerminalPaneController::new(
                 PaneRole::ReviewTerminal,
                 pane,
@@ -1957,6 +2083,10 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 
         let result = match event {
             WindowEvent::CloseRequested => {
+                // GUI quit = Detach (spike); do not Shutdown the remote daemon.
+                if let Some(client) = &self.remote_client {
+                    client.detach_all();
+                }
                 event_loop.exit();
                 Ok(())
             }
@@ -2109,6 +2239,15 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
             "luafile {}",
             vim_fnameescape(&config.nvim_context_bridge_path)
         )),
+    ]
+}
+
+/// Remote nvim argv: interactive editor PTY without local Unix socket bridges (mux TBD).
+fn remote_nvim_argv(config: &Config) -> Vec<String> {
+    vec![
+        config.nvim_command.clone(),
+        "--listen".into(),
+        "/tmp/via-remote-nvim.sock".into(),
     ]
 }
 
@@ -2632,6 +2771,7 @@ mod tests {
             plugin_dir: None,
             agent_presets: crate::config::default_agent_presets(),
             auto_approve: crate::config::AutoApproveConfig::default(),
+            remote: None,
         };
         let args = nvim_args(&config);
 
