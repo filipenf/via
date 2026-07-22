@@ -617,6 +617,27 @@ t.it("open_task_body: replaces the task board window instead of splitting", func
   vim.fn.delete(path)
 end)
 
+t.it("open_task_body: refuses when the via-tasks board buffer is modified", function()
+  local mod = t.load_tasks_module()
+  local board = vim.api.nvim_create_buf(false, false)
+  vim.api.nvim_buf_set_name(board, "via://tasks-modified-guard")
+  vim.bo[board].buftype = "acwrite"
+  vim.bo[board].filetype = "via-tasks"
+  vim.api.nvim_buf_set_lines(board, 0, -1, false, { "via:t1  queued  -  unsaved" })
+  vim.api.nvim_win_set_buf(0, board)
+  vim.bo[board].modified = true
+  local ran = false
+  mod.run = function()
+    ran = true
+    return "/tmp/should-not-open.md\n", 0
+  end
+  mod.open_task_body("t1")
+  t.eq(false, ran, "must not resolve task path when board has unsaved edits")
+  t.eq(board, vim.api.nvim_get_current_buf(), "must stay on the board buffer")
+  t.eq(true, vim.bo[board].modified, "modified flag must remain")
+  pcall(vim.api.nvim_buf_delete, board, { force = true })
+end)
+
 t.it("open_task_body: regular Markdown buffers remain editable and listed", function()
   local mod = t.load_tasks_module()
   local path = vim.fn.tempname() .. ".md"

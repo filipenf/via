@@ -308,6 +308,10 @@ fn assign_task(cwd: &Path, agent_id: &str, task_id: &str) -> Result<()> {
         task_id,
         TaskUpdate {
             assignee: Some(Some(agent_id.to_string())),
+            append_body: Some(crate::task_store::lifecycle_note(
+                &format!("Assigned to `{agent_id}`"),
+                "via agent assign",
+            )),
             ..TaskUpdate::default()
         },
     )?;
@@ -502,6 +506,11 @@ mod tests {
         let task = get_task(&ctx.tasks_dir, "assign-test").unwrap().unwrap();
         assert_eq!(task.assignee.as_deref(), Some("human"));
         assert_eq!(task.status, TaskStatus::Queued); // status unchanged
+        let body = task.body.as_deref().unwrap_or("");
+        assert!(
+            body.contains("Assigned to `human`"),
+            "assign should auto-append a lifecycle note: {body}"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

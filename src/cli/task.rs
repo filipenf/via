@@ -8,7 +8,7 @@ use crate::session;
 use crate::task_delivery;
 use crate::task_store::{
     CreateTask, Task, TaskFilter, TaskStatus, TaskUpdate, claim_task, create_task, done_task,
-    get_task, list_tasks, update_task,
+    get_task, list_tasks, review_task, update_task,
 };
 use crate::workspace::{
     BoardMeta, TasksContext, active_board_id, create_board, list_boards, resolve_tasks_context,
@@ -83,8 +83,13 @@ pub enum TaskCommand {
         /// Replace blocked-by list (comma-separated).
         #[arg(long, value_delimiter = ',')]
         blocked_by: Option<Vec<String>>,
-        #[arg(long, short = 'm')]
+        /// Replace the task body.
+        #[arg(long, short = 'm', allow_hyphen_values = true)]
         body: Option<String>,
+        /// Append a status note to the task body. via inserts a `---` separator
+        /// before the note when the body is non-empty — send only the note text.
+        #[arg(long, allow_hyphen_values = true)]
+        append: Option<String>,
         #[arg(long)]
         clear_body: bool,
         #[arg(long)]
@@ -181,6 +186,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             clear_assignee,
             blocked_by,
             body,
+            append,
             clear_body,
             json,
         } => run_update(UpdateArgs {
@@ -191,6 +197,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             clear_assignee,
             blocked_by,
             body,
+            append,
             clear_body,
             json,
         }),
@@ -405,6 +412,7 @@ struct UpdateArgs {
     clear_assignee: bool,
     blocked_by: Option<Vec<String>>,
     body: Option<String>,
+    append: Option<String>,
     clear_body: bool,
     json: bool,
 }
@@ -413,8 +421,12 @@ fn run_update(args: UpdateArgs) -> Result<()> {
     if args.clear_assignee && args.assignee.is_some() {
         bail!("pass only one of --assignee and --clear-assignee");
     }
-    if args.clear_body && args.body.is_some() {
-        bail!("pass only one of --body and --clear-body");
+    let body_ops = [args.body.is_some(), args.append.is_some(), args.clear_body]
+        .into_iter()
+        .filter(|set| *set)
+        .count();
+    if body_ops > 1 {
+        bail!("pass only one of --body, --append, and --clear-body");
     }
 
     let assignee_update = if args.clear_assignee {
@@ -439,6 +451,7 @@ fn run_update(args: UpdateArgs) -> Result<()> {
             assignee: assignee_update,
             blocked_by: args.blocked_by,
             body: body_update,
+            append_body: args.append,
         },
     )?;
     task_delivery::deliver_task_notifications(&task, previous.as_ref(), self_id().as_deref());
@@ -448,7 +461,7 @@ fn run_update(args: UpdateArgs) -> Result<()> {
 fn run_done(id: String, json: bool) -> Result<()> {
     let ctx = tasks_context()?;
     let previous = get_task(&ctx.tasks_dir, &id)?;
-    let task = done_task(&ctx.tasks_dir, &id)?;
+    let task = done_task(&ctx.tasks_dir, &id, self_id().as_deref())?;
     task_delivery::deliver_task_notifications(&task, previous.as_ref(), self_id().as_deref());
     print_task_result(&task, json, "done")
 }
@@ -462,15 +475,7 @@ fn run_done(id: String, json: bool) -> Result<()> {
 fn run_review(id: String, json: bool) -> Result<()> {
     let ctx = tasks_context()?;
     let previous = get_task(&ctx.tasks_dir, &id)?;
-    let task = update_task(
-        &ctx.tasks_dir,
-        &id,
-        TaskUpdate {
-            status: Some(TaskStatus::Review),
-            assignee: Some(Some(crate::config::HUMAN_ASSIGNEE_ID.to_string())),
-            ..TaskUpdate::default()
-        },
-    )?;
+    let task = review_task(&ctx.tasks_dir, &id, self_id().as_deref())?;
     task_delivery::deliver_task_notifications(&task, previous.as_ref(), self_id().as_deref());
     print_task_result(&task, json, "review")
 }
@@ -661,6 +666,48 @@ mod tests {
                 },
             }) if id == "t1"
         ));
+
+        let cli = Cli::try_parse_from([
+            "via",
+            "task",
+            "update",
+            "t1",
+            "--append",
+            "### coder\n- Done: claimed",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Task {
+                command: TaskCommand::Update {
+                    id,
+                    append: Some(text),
+                    body: None,
+                    clear_body: false,
+                    ..
+                },
+            }) if id == "t1" && text == "### coder\n- Done: claimed"
+        ));
+
+        // Status notes often start with `---`; must not be parsed as a flag.
+        let cli = Cli::try_parse_from([
+            "via",
+            "task",
+            "update",
+            "t1",
+            "--append",
+            "---\n### via\n- Claimed by `coder`",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Task {
+                command: TaskCommand::Update {
+                    append: Some(text),
+                    ..
+                },
+            }) if text.starts_with("---\n### via")
+        ));
     }
 
     #[test]
@@ -748,6 +795,11 @@ mod tests {
         assert_eq!(
             task.assignee.as_deref(),
             Some(crate::config::HUMAN_ASSIGNEE_ID)
+        );
+        let body = task.body.as_deref().unwrap_or("");
+        assert!(
+            body.contains("Handed to `human` for review"),
+            "review should auto-append a lifecycle note: {body}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

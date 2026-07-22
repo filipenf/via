@@ -379,6 +379,31 @@ mod tests {
     }
 
     #[test]
+    fn spawn_board_snapshot_limits_queued_to_oldest() {
+        let mut tasks = Vec::new();
+        for i in 0..(SPAWN_QUEUED_LIMIT + 2) {
+            tasks.push(Task {
+                id: format!("q{i}"),
+                title: format!("Queued {i}"),
+                status: TaskStatus::Queued,
+                assignee: None,
+                blocked_by: Vec::new(),
+                created_at: i as u64,
+                updated_at: i as u64,
+                created_by: None,
+                body: None,
+            });
+        }
+        let text = format_spawn_board_snapshot("default", &tasks, "coder");
+        assert!(text.contains("via:q0"));
+        assert!(text.contains(&format!("via:q{}", SPAWN_QUEUED_LIMIT - 1)));
+        assert!(
+            !text.contains(&format!("via:q{SPAWN_QUEUED_LIMIT}")),
+            "must truncate after {SPAWN_QUEUED_LIMIT} oldest queued"
+        );
+    }
+
+    #[test]
     fn skip_self_notification() {
         let task = sample_task(TaskStatus::InProgress, Some("coder"));
         assert!(!assignee_should_be_notified(&task, None, "coder"));

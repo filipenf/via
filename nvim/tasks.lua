@@ -825,7 +825,15 @@ end
 
 --- Open the task Markdown file in the current window (`<CR>` / Ctrl+click on
 --- `via:<id>`), replacing the task board pane rather than splitting below it.
+--- Refuses when the board buffer has unsaved edits (same guard as gn/gb/gc),
+--- because `:edit` would hide those edits behind the task file.
 function M.open_task_body(task_id)
+  local board_bufnr = vim.api.nvim_get_current_buf()
+  if vim.bo[board_bufnr].filetype == "via-tasks" and vim.bo[board_bufnr].modified then
+    vim.notify("via: save or discard board edits before opening a task", vim.log.levels.WARN)
+    return
+  end
+
   local id = task_id
   if not id then
     local line = vim.api.nvim_get_current_line()
