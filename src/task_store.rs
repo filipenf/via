@@ -60,7 +60,12 @@ pub struct TaskUpdate {
     pub status: Option<TaskStatus>,
     pub assignee: Option<Option<String>>,
     pub blocked_by: Option<Vec<String>>,
+    /// Replace the body (`Some(None)` clears it). Mutually exclusive with
+    /// [`Self::append_body`] at the CLI layer.
     pub body: Option<Option<String>>,
+    /// Append text to the existing body (blank-line separated). Applied after
+    /// [`Self::body`] when both are somehow set.
+    pub append_body: Option<String>,
 }
 
 /// Optional filters for [`list_tasks`].
@@ -215,13 +220,50 @@ pub fn update_task(tasks_dir: &Path, id: &str, update: TaskUpdate) -> Result<Tas
     if let Some(body) = update.body {
         task.body = body;
     }
+    if let Some(chunk) = update.append_body {
+        task.body = Some(append_body_text(task.body.as_deref(), &chunk));
+    }
 
     task.updated_at = now_millis();
     write_task(tasks_dir, &task)?;
     Ok(task)
 }
 
+/// Join `existing` body with `chunk`, inserting a markdown `---` rule when
+/// appending onto non-empty content. Clients should send only the note text;
+/// via owns the separator so agents need not (and should not) prefix `---`.
+///
+/// A leading `---` in `chunk` is stripped so older callers that still send one
+/// do not produce a double rule. Leading/trailing whitespace around the join
+/// is normalized.
+pub fn append_body_text(existing: Option<&str>, chunk: &str) -> String {
+    let chunk = strip_leading_hr(chunk.trim_start_matches(['\r', '\n']));
+    match existing.map(str::trim_end).filter(|s| !s.is_empty()) {
+        None => chunk.to_string(),
+        Some(base) if chunk.is_empty() => base.to_string(),
+        Some(base) => format!("{base}\n\n---\n{chunk}"),
+    }
+}
+
+/// Drop a leading markdown horizontal rule (`---` on its own line) from an
+/// append chunk so separator ownership stays on the server.
+fn strip_leading_hr(chunk: &str) -> String {
+    let trimmed = chunk.trim_start();
+    for prefix in ["---\r\n", "---\n", "---\r"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return rest.to_string();
+        }
+    }
+    if trimmed == "---" {
+        return String::new();
+    }
+    trimmed.to_string()
+}
+
 /// Assign a task to `assignee` and move it to `in_progress`.
+///
+/// Also appends an automatic status note so humans/other agents see the claim
+/// without a separate `--append` round trip.
 pub fn claim_task(tasks_dir: &Path, id: &str, assignee: &str) -> Result<Task> {
     let trimmed = assignee.trim();
     if trimmed.is_empty() {
@@ -233,21 +275,58 @@ pub fn claim_task(tasks_dir: &Path, id: &str, assignee: &str) -> Result<Task> {
         TaskUpdate {
             assignee: Some(Some(trimmed.to_string())),
             status: Some(TaskStatus::InProgress),
+            append_body: Some(lifecycle_note(
+                &format!("Claimed by `{trimmed}`"),
+                "status → in_progress",
+            )),
             ..TaskUpdate::default()
         },
     )
 }
 
-/// Mark a task as `done`.
-pub fn done_task(tasks_dir: &Path, id: &str) -> Result<Task> {
+/// Mark a task as `done`, recording `by` in the automatic status note when set.
+pub fn done_task(tasks_dir: &Path, id: &str, by: Option<&str>) -> Result<Task> {
+    let summary = match by.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(actor) => format!("Marked done by `{actor}`"),
+        None => "Marked done".to_string(),
+    };
     update_task(
         tasks_dir,
         id,
         TaskUpdate {
             status: Some(TaskStatus::Done),
+            append_body: Some(lifecycle_note(&summary, "status → done")),
             ..TaskUpdate::default()
         },
     )
+}
+
+/// Hand a task to `human` for review (status `review`).
+///
+/// Appends an automatic status note; `by` is the acting agent id when known.
+pub fn review_task(tasks_dir: &Path, id: &str, by: Option<&str>) -> Result<Task> {
+    let summary = match by.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(actor) => format!("Handed to `human` for review by `{actor}`"),
+        None => "Handed to `human` for review".to_string(),
+    };
+    update_task(
+        tasks_dir,
+        id,
+        TaskUpdate {
+            status: Some(TaskStatus::Review),
+            assignee: Some(Some(crate::config::HUMAN_ASSIGNEE_ID.to_string())),
+            append_body: Some(lifecycle_note(&summary, "status → review")),
+            ..TaskUpdate::default()
+        },
+    )
+}
+
+/// Format a system-authored status note appended on via-controlled transitions.
+///
+/// Kept short and greppable; agents still add richer `--append` notes for work
+/// progress. The `---` separator is added by [`append_body_text`], not here.
+pub fn lifecycle_note(summary: &str, detail: &str) -> String {
+    format!("### via\n- {summary}\n- {detail}")
 }
 
 fn write_task(tasks_dir: &Path, task: &Task) -> Result<()> {
@@ -615,10 +694,29 @@ mod tests {
         assert_eq!(claimed.status, TaskStatus::InProgress);
         assert_eq!(claimed.assignee.as_deref(), Some("agent"));
         assert!(claimed.updated_at >= claimed.created_at);
+        let claim_body = claimed.body.as_deref().unwrap_or("");
+        assert!(
+            claim_body.contains("Claimed by `agent`"),
+            "claim should auto-append: {claim_body}"
+        );
 
-        let finished = done_task(&dir, "work").unwrap();
+        let finished = done_task(&dir, "work", None).unwrap();
         assert_eq!(finished.status, TaskStatus::Done);
+        let done_body = finished.body.as_deref().unwrap_or("");
+        assert!(
+            done_body.contains("Claimed by `agent`") && done_body.contains("Marked done"),
+            "done should append after claim note: {done_body}"
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn lifecycle_note_format() {
+        let note = lifecycle_note("Claimed by `coder`", "status → in_progress");
+        assert_eq!(
+            note,
+            "### via\n- Claimed by `coder`\n- status → in_progress"
+        );
     }
 
     #[test]
@@ -652,6 +750,57 @@ mod tests {
         assert_eq!(updated.title, "New title");
         assert_eq!(updated.status, TaskStatus::Review);
         assert_eq!(updated.blocked_by, vec!["other-task"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn append_body_text_inserts_hr_separator() {
+        assert_eq!(append_body_text(None, "first"), "first");
+        assert_eq!(append_body_text(Some(""), "first"), "first");
+        assert_eq!(
+            append_body_text(Some("Goal: ship\n"), "### update\n- Done: x"),
+            "Goal: ship\n\n---\n### update\n- Done: x"
+        );
+        assert_eq!(append_body_text(Some("keep"), ""), "keep");
+        // Client-supplied leading HR is stripped (no double rule).
+        assert_eq!(
+            append_body_text(Some("Goal"), "---\n### coder\n- Done: x"),
+            "Goal\n\n---\n### coder\n- Done: x"
+        );
+    }
+
+    #[test]
+    fn update_append_body_preserves_existing() {
+        let dir = temp_dir("append-body");
+        create_task(
+            &dir,
+            CreateTask {
+                title: "Work".to_string(),
+                id: Some("app".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: Some("Goal: finish\n\n## Status updates".to_string()),
+            },
+        )
+        .unwrap();
+
+        let updated = update_task(
+            &dir,
+            "app",
+            TaskUpdate {
+                append_body: Some("### coder\n- Done: claimed".to_string()),
+                ..TaskUpdate::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            updated.body.as_deref(),
+            Some("Goal: finish\n\n## Status updates\n\n---\n### coder\n- Done: claimed")
+        );
+        let loaded = get_task(&dir, "app").unwrap().unwrap();
+        assert_eq!(loaded.body, updated.body);
         std::fs::remove_dir_all(&dir).ok();
     }
 
