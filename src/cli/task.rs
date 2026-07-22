@@ -334,6 +334,7 @@ fn run_create(
     body: Option<String>,
     json: bool,
 ) -> Result<()> {
+    let warn_missing_body = create_body_missing(body.as_deref());
     let ctx = tasks_context()?;
     let task = create_task(
         &ctx.tasks_dir,
@@ -346,8 +347,19 @@ fn run_create(
             body,
         },
     )?;
+    if warn_missing_body {
+        eprintln!(
+            "warning: task '{}' created without -m/--body; durable handoffs need Goal/Scope/Acceptance in the body",
+            task.id
+        );
+    }
     task_delivery::deliver_task_notifications(&task, None, self_id().as_deref());
     print_task_result(&task, json, "created")
+}
+
+/// True when create should warn that `-m/--body` was omitted or blank.
+fn create_body_missing(body: Option<&str>) -> bool {
+    body.map(|s| s.trim().is_empty()).unwrap_or(true)
 }
 
 fn run_show(id: String, json: bool) -> Result<()> {
@@ -603,6 +615,14 @@ mod tests {
                 && blocked_by.is_empty()
                 && body == "via task subcommands"
         ));
+    }
+
+    #[test]
+    fn create_body_missing_detects_absent_or_blank() {
+        assert!(create_body_missing(None));
+        assert!(create_body_missing(Some("")));
+        assert!(create_body_missing(Some("   \n")));
+        assert!(!create_body_missing(Some("Goal: ship it")));
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Deliver task lifecycle events to agent mailboxes (and the mediator for ACP recipients).
 
 use crate::agent_bus;
-use crate::config::PRIMARY_PTY_AGENT_ID;
+use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
 use crate::session::{self, SessionManifest};
-use crate::task_store::{Task, TaskStatus};
+use crate::task_store::{Task, TaskFilter, TaskStatus, list_tasks};
+use crate::workspace::resolve_tasks_context;
 
 const TASK_SENDER: &str = "tasks";
+/// Max unassigned queued tasks included in a spawn board snapshot.
+const SPAWN_QUEUED_LIMIT: usize = 5;
 
 /// After a task is created or updated, notify the assignee and/or human reviewer when appropriate.
 ///
@@ -18,6 +21,10 @@ pub fn deliver_task_notifications(task: &Task, previous: Option<&Task>, from: Op
     let from = from.unwrap_or(TASK_SENDER);
 
     notify_task_changed(&session, task, previous);
+
+    if previous.is_none() && task.assignee.is_none() {
+        notify_unassigned_create(&session, task, from);
+    }
 
     if entered_review(task, previous) {
         try_notify(
@@ -41,6 +48,104 @@ pub fn deliver_task_notifications(task: &Task, previous: Option<&Task>, from: Op
             );
         }
     }
+}
+
+/// Notify the primary agent (and orchestrator if registered) that unassigned
+/// work landed on the board. Skips the sender so creators are not pinged about
+/// their own create.
+fn notify_unassigned_create(session: &SessionManifest, task: &Task, from: &str) {
+    let message = format_task_message(task, "work available (unassigned)");
+    let orchestrator_registered = agent_is_registered(session, ORCHESTRATOR_AGENT_ID);
+    for target in unassigned_create_notify_targets(from, orchestrator_registered) {
+        try_notify(session, from, target, message.clone(), false);
+    }
+}
+
+/// Recipients for an unassigned create notification.
+fn unassigned_create_notify_targets(
+    from: &str,
+    orchestrator_registered: bool,
+) -> Vec<&'static str> {
+    let mut targets = Vec::new();
+    if from != PRIMARY_PTY_AGENT_ID {
+        targets.push(PRIMARY_PTY_AGENT_ID);
+    }
+    if orchestrator_registered && from != ORCHESTRATOR_AGENT_ID {
+        targets.push(ORCHESTRATOR_AGENT_ID);
+    }
+    targets
+}
+
+fn agent_is_registered(session: &SessionManifest, id: &str) -> bool {
+    agent_bus::read_registry(&session.agents_dir)
+        .map(|agents| agents.iter().any(|agent| agent.id == id))
+        .unwrap_or(false)
+}
+
+/// Deliver a compact active-board snapshot to a newly spawned agent (mailbox +
+/// ACP notify). No-op when the session/board cannot be resolved.
+pub fn deliver_spawn_board_snapshot(session: &SessionManifest, agent_id: &str) {
+    let Ok(ctx) = resolve_tasks_context(&session.cwd) else {
+        return;
+    };
+    let Ok(tasks) = list_tasks(&ctx.tasks_dir, &TaskFilter::default()) else {
+        return;
+    };
+    let message = format_spawn_board_snapshot(&ctx.board_id, &tasks, agent_id);
+    try_notify(session, TASK_SENDER, agent_id, message, false);
+}
+
+/// Format board context for a helper's first prompt / mailbox note: active board,
+/// tasks assigned to `agent_id`, and the top unassigned queued items.
+pub fn format_spawn_board_snapshot(board_id: &str, tasks: &[Task], agent_id: &str) -> String {
+    let mut lines = vec![
+        format!("[board:{board_id}] spawn context for agent '{agent_id}'"),
+        String::new(),
+        "Assigned to you:".to_string(),
+    ];
+    let assigned: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.assignee.as_deref() == Some(agent_id))
+        .filter(|task| task.status != TaskStatus::Done)
+        .collect();
+    if assigned.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for task in assigned {
+            lines.push(format_snapshot_task_line(task));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push("Queued (unassigned):".to_string());
+    let queued: Vec<&Task> = tasks
+        .iter()
+        .filter(|task| task.status == TaskStatus::Queued && task.assignee.is_none())
+        .take(SPAWN_QUEUED_LIMIT)
+        .collect();
+    if queued.is_empty() {
+        lines.push("  (none)".to_string());
+    } else {
+        for task in queued {
+            lines.push(format_snapshot_task_line(task));
+        }
+    }
+
+    lines.push(String::new());
+    lines.push(
+        "Use `via task list` / `via task claim <id>` / `via task show <id>`. Prefer the board for durable work."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
+fn format_snapshot_task_line(task: &Task) -> String {
+    format!(
+        "  via:{}  {}  {}",
+        task.id,
+        task_status_label(task.status),
+        task.title
+    )
 }
 
 fn entered_review(task: &Task, previous: Option<&Task>) -> bool {
@@ -196,6 +301,81 @@ mod tests {
     fn notify_assignee_on_create() {
         let task = sample_task(TaskStatus::Queued, Some("coder"));
         assert!(assignee_should_be_notified(&task, None, TASK_SENDER));
+    }
+
+    #[test]
+    fn unassigned_create_notifies_primary_and_orchestrator() {
+        assert_eq!(
+            unassigned_create_notify_targets(TASK_SENDER, true),
+            vec![PRIMARY_PTY_AGENT_ID, ORCHESTRATOR_AGENT_ID]
+        );
+    }
+
+    #[test]
+    fn unassigned_create_skips_orchestrator_when_absent() {
+        assert_eq!(
+            unassigned_create_notify_targets(TASK_SENDER, false),
+            vec![PRIMARY_PTY_AGENT_ID]
+        );
+    }
+
+    #[test]
+    fn unassigned_create_skips_sender() {
+        assert_eq!(
+            unassigned_create_notify_targets(PRIMARY_PTY_AGENT_ID, true),
+            vec![ORCHESTRATOR_AGENT_ID]
+        );
+        assert!(
+            unassigned_create_notify_targets(ORCHESTRATOR_AGENT_ID, true)
+                .contains(&PRIMARY_PTY_AGENT_ID)
+        );
+        assert!(
+            !unassigned_create_notify_targets(ORCHESTRATOR_AGENT_ID, true)
+                .contains(&ORCHESTRATOR_AGENT_ID)
+        );
+    }
+
+    #[test]
+    fn spawn_board_snapshot_lists_assigned_and_queued() {
+        let assigned = Task {
+            id: "a1".to_string(),
+            title: "Mine".to_string(),
+            status: TaskStatus::InProgress,
+            assignee: Some("coder".to_string()),
+            blocked_by: Vec::new(),
+            created_at: 1,
+            updated_at: 1,
+            created_by: None,
+            body: None,
+        };
+        let queued = Task {
+            id: "q1".to_string(),
+            title: "Open work".to_string(),
+            status: TaskStatus::Queued,
+            assignee: None,
+            blocked_by: Vec::new(),
+            created_at: 2,
+            updated_at: 2,
+            created_by: None,
+            body: None,
+        };
+        let other = Task {
+            id: "o1".to_string(),
+            title: "Someone else".to_string(),
+            status: TaskStatus::InProgress,
+            assignee: Some("reviewer".to_string()),
+            blocked_by: Vec::new(),
+            created_at: 3,
+            updated_at: 3,
+            created_by: None,
+            body: None,
+        };
+        let text = format_spawn_board_snapshot("default", &[assigned, queued, other], "coder");
+        assert!(text.contains("[board:default]"));
+        assert!(text.contains("via:a1"));
+        assert!(text.contains("via:q1"));
+        assert!(!text.contains("via:o1"));
+        assert!(text.contains("via task claim"));
     }
 
     #[test]

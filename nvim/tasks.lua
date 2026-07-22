@@ -823,8 +823,8 @@ function M.open_task_at_mouse()
   end
 end
 
---- Open the task Markdown file in a regular split buffer (`<CR>` / Ctrl+click
---- on `via:<id>`).
+--- Open the task Markdown file in the current window (`<CR>` / Ctrl+click on
+--- `via:<id>`), replacing the task board pane rather than splitting below it.
 function M.open_task_body(task_id)
   local id = task_id
   if not id then
@@ -850,7 +850,7 @@ function M.open_task_body(task_id)
     return
   end
 
-  vim.cmd("split " .. vim.fn.fnameescape(path))
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
   vim.bo.filetype = "markdown"
 end
 

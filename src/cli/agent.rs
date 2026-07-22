@@ -175,6 +175,8 @@ fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Resul
     for _ in 0..30 {
         if let Ok(agents) = agent_bus::read_registry(&session.agents_dir) {
             if agents.iter().any(|agent| agent.id == id) {
+                // Seed the helper with active-board context (mailbox + ACP notify).
+                crate::task_delivery::deliver_spawn_board_snapshot(&session, &id);
                 println!("spawned agent '{id}'");
                 return Ok(());
             }

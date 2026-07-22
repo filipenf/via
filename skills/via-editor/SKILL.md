@@ -4,6 +4,7 @@ description: >-
   Pull Neovim LSP diagnostics and via session state via CLI when VIA_SESSION is set.
   Use at the start of a via-backed session, before marking work done, after editing
   files Neovim may have open, or when checking errors with via session diagnostics.
+  Also check the via task board and agent inbox at session start before large work.
 ---
 
 # via editor skill
@@ -44,19 +45,39 @@ This is the only resolution mechanism. If `VIA_SESSION` is not set (you are not 
    via session get
    ```
 
-2. Pull diagnostics (JSON on stdout). This refreshes unchanged Neovim buffers from disk with `:checktime` before reading diagnostics:
+2. Check the task board and mailbox (structured work first):
+
+   ```bash
+   via task list
+   via agent inbox --peek
+   ```
+
+   - If a task is assigned to you (or claimable and unassigned), `via task claim <id>`
+     and work that before inventing parallel work.
+   - Before large multi-step work with no matching board item, create one with a
+     rich body so progress survives handoff/restart:
+
+     ```bash
+     via task create "<short title>" -m "<goal / scope / acceptance>"
+     via task claim <id>
+     ```
+
+   Tiny one-line fixes do not need a task. Prefer the board for durable or
+   multi-step work. Full lifecycle guidance lives in the **via-agents** skill.
+
+3. Pull diagnostics (JSON on stdout). This refreshes unchanged Neovim buffers from disk with `:checktime` before reading diagnostics:
 
    ```bash
    via session diagnostics --json
    ```
 
-3. For a specific file:
+4. For a specific file:
 
    ```bash
    via session diagnostics --file src/lib.rs --json
    ```
 
-4. If `summary.errors > 0`, fix issues and re-run diagnostics before finishing.
+5. If `summary.errors > 0`, fix issues and re-run diagnostics before finishing.
 
 If files were edited outside Neovim and you want to refresh buffers without reading diagnostics:
 
@@ -97,3 +118,4 @@ If you see "VIA_SESSION is not set", you are not running inside a terminal or ag
 
 - `:ViaBufferSend` / `<leader>ab` — push buffer or visual selection to the agent (explicit context)
 - Diagnostics CLI — pull structured state on demand (this skill)
+- Task board / agent bus — see the **via-agents** skill (`via task …`, `via agent …`)

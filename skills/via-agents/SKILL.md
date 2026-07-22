@@ -1,10 +1,12 @@
 ---
 name: via-agents
 description: >-
-  Coordinate with other AI agents in a via session: discover running agents,
-  spawn new role-based agents (orchestrator, reviewer, coder), and message them.
-  Use when VIA_SESSION is set and you need another agent's help, want to
-  delegate a sub-task, or were asked to review/hand off work to another agent.
+  Coordinate with other AI agents and the via task board in a via session:
+  discover running agents, spawn role-based helpers (orchestrator, reviewer,
+  coder), message them, and manage workspace-scoped tasks (create, claim,
+  update, review, done). Use when VIA_SESSION is set and you need another
+  agent's help, want to delegate or hand off work, track multi-step work on
+  the board, or move a task through claim / review / done.
 ---
 
 # via agents skill
@@ -108,6 +110,18 @@ PTY orchestration loops can use `--wait` instead of `sleep` + immediate `inbox`:
 the command returns as soon as a message lands, or after the timeout with an
 empty result.
 
+## Tasks vs messages
+
+| Need                                              | Use                                      |
+| ------------------------------------------------- | ---------------------------------------- |
+| Durable work that survives restart / handoff      | `via task create` / claim / update / done |
+| Multi-step plan with dependencies or review gate  | Task board                                |
+| Assigning work to a helper or human for sign-off  | Task (`claim` / `assignee` / `review`)    |
+| Ephemeral chat, quick question, one-off nudge     | `via agent send`                         |
+| Live prompt to an ACP pane without board state    | `via agent send`                         |
+
+Prefer the board for structured workflow; use `via agent send` for ad-hoc messages.
+
 ## Task boards (workspace-scoped)
 
 Tasks survive via restarts; they live on a **board** within a **workspace**
@@ -127,6 +141,17 @@ via task claim task-1
 via task update task-1 --status review
 via task done task-1
 ```
+
+### Lifecycle checklist
+
+1. **Create** — short title + rich `-m` body (required for durable handoff).
+2. **Claim** — `via task claim <id>` (sets assignee to you, status `in_progress`).
+3. **Work** — keep status `in_progress`; append notes to the body when useful.
+4. **Review** — `via task review <id>` or `via task update <id> --status review`
+   (notifies the primary `agent` pane and opens the review surface).
+5. **Done** — only after human/reviewer sign-off: `via task done <id>`.
+
+Do not mark work `done` yourself when a review gate is expected.
 
 ### Add context when you create a task
 
@@ -162,6 +187,8 @@ directory without a live instance.
 
 When a live via instance is running, task transitions also deliver to agents:
 
+- **Unassigned create**: notifies the primary `agent` pane (and `orchestrator`
+  if spawned) that work is available on the board
 - **Assignee**: notified on create, assignee change, or status change (ACP
   agents get a live prompt; PTY agents read `via agent inbox`)
 - **Review gate**: moving a task to `review` notifies the primary `agent` pane
@@ -170,7 +197,8 @@ When a live via instance is running, task transitions also deliver to agents:
   `review_backend = "hunk"` opens the inline hunk pane). This is the task-level
   human gate - distinct from ACP `session/request_permission` tool modals.
 
-Use `via agent send` for ad-hoc messages; tasks are for structured workflow.
+Spawned helpers also receive a compact board snapshot (active board, their
+assigned tasks, top queued items) in their first prompt / mailbox note.
 
 Tasks can optionally have a status update/report section for capturing the
 decisions, risks, caveats and trade-offs found during implementation
