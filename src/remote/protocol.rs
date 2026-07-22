@@ -1,16 +1,21 @@
-//! Host ↔ remote-helper control-plane messages (newline-delimited JSON).
+//! Host ↔ remote-helper control-plane messages (length-prefixed CBOR).
 //!
-//! PTY payloads are base64 in JSON so framing stays line-oriented. Pane I/O uses
-//! Spawn/Attach/Input/Output. ACP agent stdio reuses the same session I/O with
-//! [`RemoteRequest::SpawnStdio`] (piped, not PTY). Nvim RPC / ACP-TUI Unix socket
-//! mux remains a later frame type.
+//! Framing: `[u32 BE length][cbor payload]`. `Input` / `Output` / `Replay` carry
+//! native CBOR byte strings (no base64). Pane I/O uses Spawn/Attach/Input/Output.
+//! ACP agent stdio reuses the same session I/O with [`RemoteRequest::SpawnStdio`]
+//! (piped, not PTY). Nvim RPC / ACP-TUI Unix socket mux remains a later frame type.
 //!
 //! Reconnect: Detach keeps processes; Attach returns [`RemoteEvent::Replay`] for
 //! primary-screen PTYs (not nvim / stdio). [`SessionInfo`] carries roster metadata
 //! for best-effort local layout restore.
 
-use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use std::io::{Read, Write};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
+
+/// Reject frames larger than this (DoS guard on the length prefix).
+pub const MAX_FRAME_LEN: u32 = 16 * 1024 * 1024;
 
 /// Host → helper requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +52,7 @@ pub enum RemoteRequest {
     },
     Input {
         session_id: String,
-        #[serde(with = "b64")]
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     /// Spawn a non-PTY process with piped stdio (ACP agent). Same Input/Output framing.
@@ -86,12 +91,12 @@ pub enum RemoteEvent {
     },
     Output {
         session_id: String,
-        #[serde(with = "b64")]
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     Replay {
         session_id: String,
-        #[serde(with = "b64")]
+        #[serde(with = "serde_bytes")]
         bytes: Vec<u8>,
     },
     Exit {
@@ -134,119 +139,81 @@ pub struct SessionInfo {
     pub label: Option<String>,
 }
 
-/// Parse one trimmed JSON line. Empty / comment lines yield `Ok(None)`.
-pub fn parse_request_line(line: &str) -> Result<Option<RemoteRequest>> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return Ok(None);
+/// Encode `msg` as CBOR and write `[u32 BE len][cbor]`.
+pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> Result<()> {
+    let mut payload = Vec::new();
+    ciborium::into_writer(msg, &mut payload).context("encode remote CBOR frame")?;
+    let len = u32::try_from(payload.len()).context("remote frame too large")?;
+    if len > MAX_FRAME_LEN {
+        bail!("remote frame length {len} exceeds max {MAX_FRAME_LEN}");
     }
-    let msg: RemoteRequest =
-        serde_json::from_str(line).with_context(|| format!("invalid remote request: {line}"))?;
+    writer
+        .write_all(&len.to_be_bytes())
+        .context("write remote frame length")?;
+    writer
+        .write_all(&payload)
+        .context("write remote frame payload")?;
+    Ok(())
+}
+
+/// Read one length-prefixed CBOR frame. Returns `Ok(None)` on clean EOF before
+/// any length bytes. Partial frames after a length prefix are errors.
+pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<Option<T>> {
+    let mut len_buf = [0u8; 4];
+    match read_exact_or_eof(reader, &mut len_buf)? {
+        false => return Ok(None),
+        true => {}
+    }
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME_LEN {
+        bail!("remote frame length {len} exceeds max {MAX_FRAME_LEN}");
+    }
+    let mut payload = vec![0u8; len as usize];
+    reader
+        .read_exact(&mut payload)
+        .context("read remote frame payload")?;
+    let msg = ciborium::from_reader(payload.as_slice()).context("decode remote CBOR frame")?;
     Ok(Some(msg))
 }
 
-/// Serialize a request to a JSON line (no trailing newline).
-pub fn encode_request_line(msg: &RemoteRequest) -> Result<String> {
-    serde_json::to_string(msg).context("encode remote request")
-}
-
-/// Parse one trimmed JSON line. Empty / comment lines yield `Ok(None)`.
-pub fn parse_event_line(line: &str) -> Result<Option<RemoteEvent>> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
+/// Try to peel one complete frame from the front of `buf`. Returns `Ok(None)` if
+/// more bytes are needed. On success, drains the frame bytes from `buf`.
+pub fn try_read_frame_from_buf<T: DeserializeOwned>(buf: &mut Vec<u8>) -> Result<Option<T>> {
+    if buf.len() < 4 {
         return Ok(None);
     }
-    let msg: RemoteEvent =
-        serde_json::from_str(line).with_context(|| format!("invalid remote event: {line}"))?;
+    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
+    if len > MAX_FRAME_LEN {
+        bail!("remote frame length {len} exceeds max {MAX_FRAME_LEN}");
+    }
+    let total = 4 + len as usize;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let payload = buf[4..total].to_vec();
+    buf.drain(..total);
+    let msg = ciborium::from_reader(payload.as_slice()).context("decode remote CBOR frame")?;
     Ok(Some(msg))
 }
 
-/// Serialize an event to a JSON line (no trailing newline).
-pub fn encode_event_line(msg: &RemoteEvent) -> Result<String> {
-    serde_json::to_string(msg).context("encode remote event")
-}
-
-mod b64 {
-    use serde::{Deserialize, Deserializer, Serializer};
-
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(&encode(bytes))
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        decode(&s).map_err(serde::de::Error::custom)
-    }
-
-    pub(super) fn encode(input: &[u8]) -> String {
-        let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-        for chunk in input.chunks(3) {
-            let b0 = chunk[0] as u32;
-            let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-            let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-            let n = (b0 << 16) | (b1 << 8) | b2;
-            out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-            out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-            if chunk.len() > 1 {
-                out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
-            if chunk.len() > 2 {
-                out.push(TABLE[(n & 0x3f) as usize] as char);
-            } else {
-                out.push('=');
-            }
+fn read_exact_or_eof(reader: &mut impl Read, buf: &mut [u8]) -> Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) if filled == 0 => return Ok(false),
+            Ok(0) => bail!("unexpected EOF while reading remote frame header"),
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err).context("read remote frame header"),
         }
-        out
     }
-
-    pub(super) fn decode(input: &str) -> Result<Vec<u8>, String> {
-        let clean: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-        if clean.len() % 4 != 0 {
-            return Err("invalid base64 length".into());
-        }
-        let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-        for chunk in clean.chunks(4) {
-            let mut n = 0u32;
-            let mut pads = 0;
-            for (i, b) in chunk.iter().enumerate() {
-                let v = match *b {
-                    b'A'..=b'Z' => b - b'A',
-                    b'a'..=b'z' => b - b'a' + 26,
-                    b'0'..=b'9' => b - b'0' + 52,
-                    b'+' => 62,
-                    b'/' => 63,
-                    b'=' => {
-                        pads += 1;
-                        0
-                    }
-                    other => return Err(format!("invalid base64 byte {other}")),
-                };
-                if *b != b'=' && pads > 0 {
-                    return Err("pad in the middle of base64".into());
-                }
-                if i < 4 - pads {
-                    n |= (v as u32) << (18 - 6 * i);
-                }
-            }
-            out.push((n >> 16) as u8);
-            if pads < 2 {
-                out.push((n >> 8) as u8);
-            }
-            if pads < 1 {
-                out.push(n as u8);
-            }
-        }
-        Ok(out)
-    }
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn request_roundtrip_spawn_and_input() {
@@ -261,23 +228,59 @@ mod tests {
             role: Some("agent".into()),
             label: Some("agent".into()),
         };
-        let line = encode_request_line(&spawn).unwrap();
-        assert_eq!(parse_request_line(&line).unwrap().unwrap(), spawn);
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &spawn).unwrap();
+        let parsed: RemoteRequest = read_frame(&mut Cursor::new(&buf)).unwrap().unwrap();
+        assert_eq!(parsed, spawn);
 
         let input = RemoteRequest::Input {
             session_id: "agent".into(),
             bytes: b"hello\n".to_vec(),
         };
-        let line = encode_request_line(&input).unwrap();
-        let parsed = parse_request_line(&line).unwrap().unwrap();
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &input).unwrap();
+        // Native byte string — payload must contain raw bytes, not base64.
+        assert!(
+            buf.windows(6).any(|w| w == b"hello\n"),
+            "expected raw bytes in frame, got {buf:?}"
+        );
+        assert!(
+            !buf.windows(8).any(|w| w == b"aGVsbG8K"),
+            "must not base64-encode Input bytes"
+        );
+        let parsed: RemoteRequest = read_frame(&mut Cursor::new(&buf)).unwrap().unwrap();
         assert_eq!(parsed, input);
-        assert!(line.contains("aGVsbG8K"), "expected base64 payload: {line}");
     }
 
     #[test]
     fn spawn_defaults_replay_true_when_omitted() {
-        let line = r#"{"type":"spawn","session_id":"x","argv":["true"],"cols":80,"rows":24}"#;
-        match parse_request_line(line).unwrap().unwrap() {
+        // Manually build a CBOR map without `replay_scrollback`.
+        let value = ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("type".into()),
+                ciborium::Value::Text("spawn".into()),
+            ),
+            (
+                ciborium::Value::Text("session_id".into()),
+                ciborium::Value::Text("x".into()),
+            ),
+            (
+                ciborium::Value::Text("argv".into()),
+                ciborium::Value::Array(vec![ciborium::Value::Text("true".into())]),
+            ),
+            (
+                ciborium::Value::Text("cols".into()),
+                ciborium::Value::Integer(80.into()),
+            ),
+            (
+                ciborium::Value::Text("rows".into()),
+                ciborium::Value::Integer(24.into()),
+            ),
+        ]);
+        let mut payload = Vec::new();
+        ciborium::into_writer(&value, &mut payload).unwrap();
+        let req: RemoteRequest = ciborium::from_reader(payload.as_slice()).unwrap();
+        match req {
             RemoteRequest::Spawn {
                 replay_scrollback, ..
             } => assert!(replay_scrollback),
@@ -286,18 +289,19 @@ mod tests {
     }
 
     #[test]
-    fn event_roundtrip_output_replay_exit() {
+    fn event_roundtrip_output_replay_exit_with_csi() {
+        let csi = b"\x1b[31mred\x00\xff".to_vec();
         for event in [
             RemoteEvent::Ready {
                 session_id: "nvim".into(),
             },
             RemoteEvent::Output {
                 session_id: "nvim".into(),
-                bytes: b"\x1b[31mred".to_vec(),
+                bytes: csi.clone(),
             },
             RemoteEvent::Replay {
                 session_id: "nvim".into(),
-                bytes: b"scrollback".to_vec(),
+                bytes: csi.clone(),
             },
             RemoteEvent::Exit {
                 session_id: "nvim".into(),
@@ -320,31 +324,53 @@ mod tests {
                 session_id: Some("x".into()),
             },
         ] {
-            let line = encode_event_line(&event).unwrap();
-            assert_eq!(parse_event_line(&line).unwrap().unwrap(), event);
+            let mut buf = Vec::new();
+            write_frame(&mut buf, &event).unwrap();
+            let parsed: RemoteEvent = read_frame(&mut Cursor::new(&buf)).unwrap().unwrap();
+            assert_eq!(parsed, event);
         }
     }
 
     #[test]
-    fn skips_blank_and_comment_lines() {
-        assert!(parse_request_line("").unwrap().is_none());
-        assert!(parse_request_line("  # wait").unwrap().is_none());
-        assert!(parse_event_line("\n").unwrap().is_none());
+    fn read_frame_eof_before_header() {
+        let mut empty: &[u8] = &[];
+        let got: Option<RemoteRequest> = read_frame(&mut empty).unwrap();
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn try_read_frame_from_buf_needs_more() {
+        let mut buf = vec![0, 0, 0, 10]; // length 10, no payload yet
+        let got: Option<RemoteRequest> = try_read_frame_from_buf(&mut buf).unwrap();
+        assert!(got.is_none());
+        assert_eq!(buf.len(), 4);
     }
 
     #[test]
     fn rejects_unknown_type() {
-        assert!(parse_request_line(r#"{"type":"nope"}"#).is_err());
-        assert!(parse_event_line(r#"{"type":"nope"}"#).is_err());
+        let value = ciborium::Value::Map(vec![(
+            ciborium::Value::Text("type".into()),
+            ciborium::Value::Text("nope".into()),
+        )]);
+        let mut payload = Vec::new();
+        ciborium::into_writer(&value, &mut payload).unwrap();
+        assert!(ciborium::from_reader::<RemoteRequest, _>(payload.as_slice()).is_err());
+        assert!(ciborium::from_reader::<RemoteEvent, _>(payload.as_slice()).is_err());
     }
 
     #[test]
-    fn b64_roundtrip_empty_and_binary() {
-        assert_eq!(b64::decode(&b64::encode(b"")).unwrap(), b"");
-        assert_eq!(b64::decode(&b64::encode(b"a")).unwrap(), b"a");
-        assert_eq!(b64::decode(&b64::encode(b"ab")).unwrap(), b"ab");
-        assert_eq!(b64::decode(&b64::encode(b"abc")).unwrap(), b"abc");
+    fn binary_payload_roundtrip_all_bytes() {
         let bin: Vec<u8> = (0..=255).collect();
-        assert_eq!(b64::decode(&b64::encode(&bin)).unwrap(), bin);
+        let event = RemoteEvent::Output {
+            session_id: "bin".into(),
+            bytes: bin.clone(),
+        };
+        let mut buf = Vec::new();
+        write_frame(&mut buf, &event).unwrap();
+        let parsed: RemoteEvent = read_frame(&mut Cursor::new(&buf)).unwrap().unwrap();
+        match parsed {
+            RemoteEvent::Output { bytes, .. } => assert_eq!(bytes, bin),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

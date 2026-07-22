@@ -218,6 +218,30 @@ has some rough edges. Some things I have planned:
   feedback to the agent directly from the Neovim pane (may use an existing
   Neovim plugin for this)
 
+## Remote execution (experimental)
+
+Run panes on a remote host while the GUI stays local:
+
+```sh
+# on the remote (once; or let connect ensure it)
+via --remote-serve
+
+# on the laptop — one helper per host, no session picker
+via --remote <ssh-host>
+# alias:
+via remote <ssh-host>
+
+# local helper over a Unix socket (dev / same machine)
+via --remote local
+```
+
+Closing the GUI **Detaches**; remote PTYs keep running. Reopen with the same
+`--remote <host>` to reattach. Explicit teardown stops the helper (`Shutdown` /
+killing the daemon), not a normal window close.
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) (`src/remote/`) for framing and reconnect
+policy.
+
 ## Runtime requirements
 
 via is primarily developed and tested on Linux (Wayland compositors such as

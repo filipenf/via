@@ -1,4 +1,9 @@
 //! Connect the local GUI to a remote helper (SSH ensure + proxy, or local Unix socket).
+//!
+//! **Ensure-on-connect:** if the control socket is not accepting connections, start
+//! `via --remote-serve` (locally or via `ssh <host> -- via --remote-serve`) before
+//! opening the proxy. One helper per host — callers never pick among multiple
+//! remote sessions.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

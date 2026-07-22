@@ -1,7 +1,7 @@
-//! Local GUI client for the remote helper control protocol (NDJSON over a pipe).
+//! Local GUI client for the remote helper control protocol (length-prefixed CBOR).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,7 +14,7 @@ use tracing::{debug, warn};
 
 use crate::pty::{OutputNotifier, TerminalSize};
 
-use super::protocol::{RemoteEvent, RemoteRequest, encode_request_line, parse_event_line};
+use super::protocol::{RemoteEvent, RemoteRequest, read_frame, write_frame};
 
 struct SessionChannels {
     output_tx: Sender<Vec<u8>>,
@@ -58,7 +58,8 @@ impl ControlWriter {
     }
 }
 
-/// Shared NDJSON control connection to a remote helper (via SSH proxy or local socket).
+/// Shared length-prefixed CBOR control connection to a remote helper (via SSH proxy
+/// or local socket).
 ///
 /// Writer and session map use separate locks so a blocking write cannot deadlock the
 /// reader thread (which only needs the session map to dispatch Output).
@@ -201,18 +202,11 @@ impl RemoteClient {
         }
     }
 
-    fn read_loop(&self, reader: Box<dyn std::io::Read + Send>) {
-        let mut lines = BufReader::new(reader);
-        let mut buf = String::new();
+    fn read_loop(&self, mut reader: Box<dyn Read + Send>) {
         loop {
-            buf.clear();
-            match lines.read_line(&mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    if let Ok(Some(event)) = parse_event_line(&buf) {
-                        self.dispatch_event(event);
-                    }
-                }
+            match read_frame::<_, RemoteEvent>(&mut reader) {
+                Ok(None) => break,
+                Ok(Some(event)) => self.dispatch_event(event),
                 Err(err) => {
                     warn!(error = %err, "remote client reader stopped");
                     break;
@@ -266,9 +260,8 @@ impl RemoteClient {
     }
 
     fn send(&self, request: &RemoteRequest) -> Result<()> {
-        let line = encode_request_line(request)?;
         let mut writer = self.writer.lock().unwrap_or_else(|e| e.into_inner());
-        writeln!(writer, "{line}").context("write remote request")?;
+        write_frame(&mut *writer, request).context("write remote request")?;
         writer.flush().context("flush remote request")?;
         Ok(())
     }

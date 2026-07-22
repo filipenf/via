@@ -4,8 +4,10 @@
 //! - `via --remote-serve` — session authority (daemon or `--remote-foreground`)
 //! - `via --remote-proxy` — stdio ↔ control socket (SSH pipe target)
 //!
-//! Local GUI: `via --remote <host>` connects via [`connect`] and spawns panes through
-//! [`client::RemoteClient`].
+//! Local GUI attach (one helper per host; no session picker):
+//! - `via --remote <host>` (primary) or `via remote <host>` (alias)
+//! - Connect ensures the helper is up, then attaches. GUI quit = Detach.
+//!
 //! See Obsidian `Spike — Remote execution` / `Spec — Remote execution`.
 
 mod client;
@@ -69,9 +71,9 @@ pub fn run(args: Args) -> Result<()> {
 mod tests {
     use super::*;
     use client::{PtySpawnOpts, RemoteClient};
-    use protocol::{RemoteEvent, RemoteRequest, encode_request_line, parse_event_line};
-    use serve::{bind_control_socket, handle_client, handle_request_line};
-    use std::io::{BufRead, BufReader, Write};
+    use protocol::{RemoteEvent, RemoteRequest, read_frame, write_frame};
+    use serve::{bind_control_socket, handle_client, handle_request};
+    use std::io::{Cursor, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -80,28 +82,29 @@ mod tests {
     use crate::pty::TerminalSize;
 
     #[test]
-    fn in_process_request_line_spawn_list() {
+    fn in_process_request_spawn_list() {
         let mut reg = SessionRegistry::new(std::env::temp_dir());
-        let line = encode_request_line(&RemoteRequest::Spawn {
-            session_id: "t".into(),
-            argv: vec!["true".into()],
-            env: vec![],
-            cwd: None,
-            cols: 80,
-            rows: 24,
-            replay_scrollback: true,
-            role: None,
-            label: None,
-        })
+        let events = handle_request(
+            &mut reg,
+            RemoteRequest::Spawn {
+                session_id: "t".into(),
+                argv: vec!["true".into()],
+                env: vec![],
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                replay_scrollback: true,
+                role: None,
+                label: None,
+            },
+        )
         .unwrap();
-        let events = handle_request_line(&mut reg, &line).unwrap();
         assert!(
             events
                 .iter()
                 .any(|e| matches!(e, RemoteEvent::Ready { session_id } if session_id == "t"))
         );
-        let list_line = encode_request_line(&RemoteRequest::ListSessions).unwrap();
-        let list = handle_request_line(&mut reg, &list_line).unwrap();
+        let list = handle_request(&mut reg, RemoteRequest::ListSessions).unwrap();
         match &list[0] {
             RemoteEvent::SessionList { sessions } => {
                 assert_eq!(sessions.len(), 1);
@@ -131,40 +134,48 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
 
-        let spawn = encode_request_line(&RemoteRequest::Spawn {
-            session_id: "echo".into(),
-            argv: vec![
-                "sh".into(),
-                "-c".into(),
-                "printf 'from-helper\\n'; sleep 0.3".into(),
-            ],
-            env: vec![],
-            cwd: None,
-            cols: 80,
-            rows: 24,
-            replay_scrollback: true,
-            role: None,
-            label: None,
-        })
+        write_frame(
+            &mut stream,
+            &RemoteRequest::Spawn {
+                session_id: "echo".into(),
+                argv: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    "printf 'from-helper\\n'; sleep 0.3".into(),
+                ],
+                env: vec![],
+                cwd: None,
+                cols: 80,
+                rows: 24,
+                replay_scrollback: true,
+                role: None,
+                label: None,
+            },
+        )
         .unwrap();
-        writeln!(stream, "{spawn}").unwrap();
-
-        let attach = encode_request_line(&RemoteRequest::Attach {
-            session_id: "echo".into(),
-        })
+        write_frame(
+            &mut stream,
+            &RemoteRequest::Attach {
+                session_id: "echo".into(),
+            },
+        )
         .unwrap();
-        writeln!(stream, "{attach}").unwrap();
+        stream.flush().unwrap();
 
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut reader = stream.try_clone().unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
         let mut saw_ready = false;
         let mut saw_hello = false;
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline && !(saw_ready && saw_hello) {
-            let mut line = String::new();
-            match reader.read_line(&mut line) {
+            match reader.read(&mut tmp) {
                 Ok(0) => break,
-                Ok(_) => {
-                    if let Ok(Some(ev)) = parse_event_line(&line) {
+                Ok(n) => {
+                    buf.extend_from_slice(&tmp[..n]);
+                    while let Some(ev) =
+                        protocol::try_read_frame_from_buf::<RemoteEvent>(&mut buf).unwrap()
+                    {
                         match ev {
                             RemoteEvent::Ready { session_id } if session_id == "echo" => {
                                 saw_ready = true;
@@ -191,8 +202,7 @@ mod tests {
         assert!(saw_ready, "expected Ready");
         assert!(saw_hello, "expected Output/Replay with from-helper");
 
-        let shutdown = encode_request_line(&RemoteRequest::Shutdown).unwrap();
-        writeln!(stream, "{shutdown}").unwrap();
+        write_frame(&mut stream, &RemoteRequest::Shutdown).unwrap();
         drop(stream);
         server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
@@ -234,9 +244,21 @@ mod tests {
             )
             .unwrap();
         let bytes = writer.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let text = String::from_utf8_lossy(&bytes);
-        assert!(text.contains("spawn"), "requests={text}");
-        assert!(text.contains("attach"), "requests={text}");
+        // CBOR text strings for type tags still appear as ASCII in the payload.
+        assert!(
+            bytes.windows(5).any(|w| w == b"spawn"),
+            "requests={bytes:?}"
+        );
+        assert!(
+            bytes.windows(6).any(|w| w == b"attach"),
+            "requests={bytes:?}"
+        );
+        // Two length-prefixed frames (Spawn + Attach).
+        let mut cursor = Cursor::new(&bytes);
+        let first: RemoteRequest = read_frame(&mut cursor).unwrap().unwrap();
+        assert!(matches!(first, RemoteRequest::Spawn { .. }));
+        let second: RemoteRequest = read_frame(&mut cursor).unwrap().unwrap();
+        assert!(matches!(second, RemoteRequest::Attach { .. }));
         drop(pane);
         drop(client);
     }

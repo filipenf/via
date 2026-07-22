@@ -9,7 +9,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use super::protocol::{RemoteEvent, RemoteRequest, encode_event_line, parse_request_line};
+use super::protocol::{RemoteEvent, RemoteRequest, try_read_frame_from_buf, write_frame};
 use super::registry::SessionRegistry;
 
 /// Env set after daemon re-exec so nested `--remote-serve` stays foreground.
@@ -138,10 +138,8 @@ pub fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) 
             Ok(0) => break,
             Ok(n) => {
                 buf.extend_from_slice(&read_tmp[..n]);
-                while let Some(idx) = buf.iter().position(|&b| b == b'\n') {
-                    let line = String::from_utf8_lossy(&buf[..idx]).into_owned();
-                    buf.drain(..=idx);
-                    if !dispatch_line(&line, &registry, &mut writer)? {
+                while let Some(req) = try_read_frame_from_buf::<RemoteRequest>(&mut buf)? {
+                    if !dispatch_request(req, &registry, &mut writer)? {
                         detach_all(&registry);
                         return Ok(());
                     }
@@ -163,30 +161,18 @@ pub fn handle_client(stream: UnixStream, registry: Arc<Mutex<SessionRegistry>>) 
 }
 
 /// Returns `false` when the client requested Shutdown (connection should end).
-fn dispatch_line(
-    line: &str,
+fn dispatch_request(
+    req: RemoteRequest,
     registry: &Mutex<SessionRegistry>,
     writer: &mut UnixStream,
 ) -> Result<bool> {
-    match parse_request_line(line)? {
-        None => Ok(true),
-        Some(RemoteRequest::Shutdown) => {
-            let events = registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle(RemoteRequest::Shutdown)?;
-            write_events(writer, &events)?;
-            Ok(false)
-        }
-        Some(req) => {
-            let events = registry
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .handle(req)?;
-            write_events(writer, &events)?;
-            Ok(true)
-        }
-    }
+    let keep_going = !matches!(req, RemoteRequest::Shutdown);
+    let events = registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .handle(req)?;
+    write_events(writer, &events)?;
+    Ok(keep_going)
 }
 
 fn detach_all(registry: &Mutex<SessionRegistry>) {
@@ -204,19 +190,18 @@ fn flush_poll(registry: &Mutex<SessionRegistry>, writer: &mut UnixStream) -> Res
 
 fn write_events(writer: &mut impl Write, events: &[RemoteEvent]) -> Result<()> {
     for event in events {
-        let line = encode_event_line(event)?;
-        writeln!(writer, "{line}").context("write remote event")?;
+        write_frame(writer, event).context("write remote event")?;
     }
     writer.flush().context("flush remote events")?;
     Ok(())
 }
 
-/// Drive one request line against an in-memory registry (unit / in-process tests).
+/// Drive one request against an in-memory registry (unit / in-process tests).
 #[cfg(test)]
-pub fn handle_request_line(registry: &mut SessionRegistry, line: &str) -> Result<Vec<RemoteEvent>> {
-    let Some(req) = parse_request_line(line)? else {
-        return Ok(vec![]);
-    };
+pub fn handle_request(
+    registry: &mut SessionRegistry,
+    req: RemoteRequest,
+) -> Result<Vec<RemoteEvent>> {
     let mut events = registry.handle(req)?;
     events.extend(registry.poll_events());
     Ok(events)

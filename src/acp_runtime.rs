@@ -783,13 +783,13 @@ impl AcpRuntime {
                 options,
             } => {
                 let _ = ui_commands.try_send(UiCommand::AcpModalPrompt {
-                        agent_id,
-                        jsonrpc_id,
-                        title,
-                        message: prompt,
-                        options,
-                        kind: AcpModalKind::AskQuestion { question_id },
-                    });
+                    agent_id,
+                    jsonrpc_id,
+                    title,
+                    message: prompt,
+                    options,
+                    kind: AcpModalKind::AskQuestion { question_id },
+                });
             }
             AcpAgentEvent::SessionStatus { provider_error } => {
                 self.send_session_status(

@@ -92,10 +92,13 @@ pub struct Cli {
     pub remote_socket: Option<std::path::PathBuf>,
 
     /// Connect the local GUI to a remote SSH host (`local` / `VIA_REMOTE_SOCKET` for unix).
+    ///
+    /// One helper per host — no session picker. Ensures the remote helper is up, then
+    /// attaches. GUI quit Detaches (processes keep running). Alias: `via remote <HOST>`.
     #[arg(long = "remote", value_name = "HOST")]
     pub remote: Option<String>,
 
-    /// Remote working directory when using `--remote` (spike: `via --remote host --cwd /path`).
+    /// Remote working directory when using `--remote` / `via remote` (`via --remote host --cwd /path`).
     #[arg(long = "cwd", value_name = "DIR")]
     pub cwd: Option<std::path::PathBuf>,
 
@@ -104,6 +107,15 @@ pub struct Cli {
 }
 
 impl Cli {
+    /// Fold `via remote <host>` into the same fields as `via --remote <host>`.
+    pub fn apply_remote_subcommand_alias(&mut self) {
+        if let Some(Command::Remote { host }) = self.command.take() {
+            if self.remote.is_none() {
+                self.remote = Some(host);
+            }
+        }
+    }
+
     pub fn config_overrides(&self) -> crate::config::ConfigOverrides {
         let remote = self.remote.as_ref().map(|host| crate::config::RemoteMode {
             host: host.clone(),
@@ -164,6 +176,13 @@ pub enum Command {
         #[command(subcommand)]
         command: TaskCommand,
     },
+    /// Attach the local GUI to a remote host (alias for `via --remote <HOST>`).
+    ///
+    /// One remote helper per host; no session picker. Prefer `--remote` in scripts.
+    Remote {
+        /// SSH destination, or `local` / `unix` for the local control socket.
+        host: String,
+    },
 }
 
 pub async fn run(command: Command) -> Result<()> {
@@ -172,6 +191,9 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Agent { command } => agent::run(command),
         Command::Plugin { command } => plugin::run(command),
         Command::Task { command } => task::run(command),
+        Command::Remote { .. } => {
+            anyhow::bail!("via remote is a GUI attach alias; use `via --remote <host>`")
+        }
     }
 }
 
@@ -533,6 +555,28 @@ mod tests {
             remote.socket.as_deref(),
             Some(std::path::Path::new("/tmp/c.sock"))
         );
+    }
+
+    #[test]
+    fn remote_subcommand_aliases_to_remote_flag() {
+        let mut cli = Cli::try_parse_from(["via", "remote", "codespace"]).unwrap();
+        assert!(cli.remote.is_none());
+        assert!(matches!(cli.command, Some(Command::Remote { .. })));
+        cli.apply_remote_subcommand_alias();
+        assert_eq!(cli.remote.as_deref(), Some("codespace"));
+        assert!(cli.command.is_none());
+        assert_eq!(
+            cli.config_overrides()
+                .remote
+                .as_ref()
+                .map(|r| r.host.as_str()),
+            Some("codespace")
+        );
+
+        // Flag wins if both are present after parse + alias.
+        let mut both = Cli::try_parse_from(["via", "--remote", "a", "remote", "b"]).unwrap();
+        both.apply_remote_subcommand_alias();
+        assert_eq!(both.remote.as_deref(), Some("a"));
     }
 
     #[test]

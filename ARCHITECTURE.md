@@ -323,13 +323,20 @@ projects them into the detected agent family's skill roots.
 - `src/event.rs`: the enum of all cross-layer messages (EditorEvent, AgentEvent,
   UiCommand, etc.).
 - `src/remote/`: remote execution helper. Early-dispatch `via --remote-serve`
-  owns detachable PTYs (and ACP stdio processes) and speaks NDJSON on
-  `$XDG_DATA_HOME/via/remote/control.sock`; `via --remote-proxy` bridges stdio
-  to that socket (SSH pipe). Local GUI: `via --remote <host>` ensures the
-  daemon, opens an SSH proxy, and spawns nvim/shells/agents/ACP-TUI panes
-  through [`RemoteClient`]. Local `AcpClient` keeps ownership; agent stdio is
-  tunneled via `SpawnStdio`. Protocol: `RemoteRequest` / `RemoteEvent` in
-  `src/remote/protocol.rs`.
+  owns detachable PTYs (and ACP stdio processes) and speaks length-prefixed CBOR
+  on `$XDG_DATA_HOME/via/remote/control.sock`; `via --remote-proxy` bridges stdio
+  to that socket (SSH pipe). Local GUI: `via --remote <host>` (alias:
+  `via remote <host>`) ensures the daemon, opens an SSH proxy, and spawns
+  nvim/shells/agents/ACP-TUI panes through [`RemoteClient`]. Local `AcpClient`
+  keeps ownership; agent stdio is tunneled via `SpawnStdio`. Protocol:
+  `RemoteRequest` / `RemoteEvent` in `src/remote/protocol.rs`
+  (`[u32 BE len][cbor]`; native byte strings for I/O).
+
+  **UX (local attach):** one remote helper / one workspace per host — host
+  identity selects the session; there is no “which session?” picker. Connect
+  ensures the helper (`ssh … via --remote-serve` or local `--remote-serve`) when
+  the control socket is not live. `ListSessions` lists **panes inside that
+  helper**, not multiple workspaces.
 
   **Reconnect / detach (GUI quit ≠ kill):** Dropping the SSH proxy or closing
   the local window only **Detaches**; remote PTYs and ACP processes keep

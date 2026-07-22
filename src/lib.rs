@@ -37,7 +37,9 @@ use crate::ui::ghostty::GhosttyUi;
 /// Library entry point so that benches (and a thin binary) can link against `via`
 /// as a crate and reach internal modules via `pub(crate)` items.
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    // `via remote <host>` → same as `via --remote <host>` (GUI path, not headless).
+    cli.apply_remote_subcommand_alias();
 
     // ACP TUI is a TTY display surface hosted in a PTY pane. Dispatch before persist,
     // headless subcommands, detach, and winit GUI bootstrap so `via --acp-tui` never
