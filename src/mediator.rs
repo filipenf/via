@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::acp::PromptResource;
+use crate::acp_auto_approve::AutoApprovePolicy;
 use crate::acp_runtime::{AcpConnectCtx, AcpRuntime};
 use crate::agent_bus;
 use crate::agent_delivery::AgentDelivery;
@@ -98,6 +99,7 @@ pub struct MediatorHandle {
 
 impl Mediator {
     pub fn new(config: Config) -> Self {
+        let auto_approve = AutoApprovePolicy::from_config(&config.auto_approve);
         let (_events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
         let (ui_commands_tx, _ui_commands_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
@@ -109,7 +111,7 @@ impl Mediator {
             in_flight_symbol_open: None,
             lsp_handle: None,
             agent_output_buffer: String::new(),
-            acp_runtime: AcpRuntime::new(),
+            acp_runtime: AcpRuntime::new(auto_approve),
             agent_delivery: AgentDelivery::new(),
             event_sender: None,
         }
@@ -733,6 +735,7 @@ mod tests {
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: crate::config::default_agent_presets(),
+            auto_approve: crate::config::AutoApproveConfig::default(),
         }
     }
 

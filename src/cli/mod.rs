@@ -89,6 +89,7 @@ impl Cli {
             scroll_sensitivity: self.scroll_sensitivity,
             plugin_dir: self.plugin_dir.clone(),
             agent_presets: Default::default(),
+            auto_approve: Default::default(),
         }
     }
 

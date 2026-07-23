@@ -142,8 +142,20 @@ system browser without changing Neovim focus.
   arrive via `via agent send --to <id>` / Lua `agent.send` (or typed into the
   ACP TUI). The agent UI is a PTY pane running `via --acp-tui` (plain ratatui),
   glued to the mediator over a side Unix socket. Permission / ask-question
-  modals stay in-process. Tool permissions and results flow through the
-  mediator.
+  modals stay in-process unless **auto-approve** matches (see below). Tool
+  permissions and results flow through the mediator.
+
+**ACP permission auto-approve** (`src/acp_auto_approve.rs`, wired from
+`AcpRuntime::handle_agent_event`): when a spawned helper sends
+`session/request_permission`, via evaluates allow rules before opening the modal.
+Built-ins (always on): any shell command whose executable is `via`; ACP tool kinds
+`read` and `search`; read-only shell (`ls`, `pwd`, `cat`, `head`, `tail`, `rg`,
+`fd`, and `git status|diff|log|show`). User extensions in `via.conf`
+`[auto_approve]` add `commands` (base executable names) and `kinds` — they never
+disable built-ins. Kinds `edit`, `delete`, and `move` are never auto-approved.
+Miss → modal (never auto-deny). On match, via replies with JSON-RPC
+`allow-once` when available. Policy is global from config, not per-agent state.
+Contract: board task via:nce2.
 
 `AcpClient` is intentionally minimal (handshake, session create, prompt,
 tool result serialization). It is not a full agent SDK.

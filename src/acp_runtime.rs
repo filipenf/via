@@ -3,7 +3,7 @@
 //!
 //! Owns the per-agent session map, handshake/retry/connect tasks, the in-flight
 //! "expected" / "connecting" sets, launch-config bookkeeping for reconnect, and
-//! the tool-call title cache used to enrich permission modals. The mediator
+//! the tool-call title/kind caches used to enrich permission modals. The mediator
 //! delegates ACP-heavy `Event::Agent(Acp { .. })` and `EditorEvent::SpawnAgent`
 //! / `TerminateAgent` arms here; message routing (mailbox vs ACP prompt queue)
 //! lives in [`crate::agent_delivery`].
@@ -18,6 +18,9 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use crate::acp::AcpClient;
+use crate::acp_auto_approve::{
+    AutoApprovePolicy, PermissionContext, permission_result_for_option, pick_allow_option,
+};
 use crate::agent_bus;
 use crate::agent_delivery::PendingAcpPrompt;
 use crate::config::PRIMARY_PTY_AGENT_ID;
@@ -110,9 +113,7 @@ async fn establish_acp(
             let updated = client
                 .set_config_option(&session.session_id, "model", &resolved)
                 .await?;
-            model = updated
-                .selected_model()
-                .or_else(|| Some(resolved.clone()));
+            model = updated.selected_model().or_else(|| Some(resolved.clone()));
             tracing::info!(
                 agent_id,
                 session_id = %session.session_id,
@@ -376,16 +377,22 @@ pub struct AcpRuntime {
     /// (agent id, tool call id) → latest title from `session/update` (for permission UI).
     /// Keyed by agent id as well so concurrent ACP agents can't collide on tool_call_id.
     tool_titles: HashMap<(String, String), String>,
+    /// (agent id, tool call id) → latest ACP tool kind from `session/update`.
+    tool_kinds: HashMap<(String, String), String>,
+    /// Global auto-approve policy from config (not per-agent).
+    auto_approve: AutoApprovePolicy,
 }
 
 impl AcpRuntime {
-    pub fn new() -> Self {
+    pub fn new(auto_approve: AutoApprovePolicy) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             expected: Arc::new(Mutex::new(HashSet::new())),
             launch_configs: Arc::new(Mutex::new(HashMap::new())),
             connecting: Arc::new(Mutex::new(HashSet::new())),
             tool_titles: HashMap::new(),
+            tool_kinds: HashMap::new(),
+            auto_approve,
         }
     }
 
@@ -612,6 +619,7 @@ impl AcpRuntime {
         self.launch_configs.lock().await.remove(id);
         self.connecting.lock().await.remove(id);
         self.tool_titles.retain(|(agent_id, _), _| agent_id != id);
+        self.tool_kinds.retain(|(agent_id, _), _| agent_id != id);
         let _ = ui_commands.try_send(UiCommand::TerminateAgent { id: id.to_string() });
     }
 
@@ -668,6 +676,7 @@ impl AcpRuntime {
                         .insert((agent_id.clone(), id.clone()), label.clone());
                 } else if !active {
                     self.tool_titles.remove(&(agent_id.clone(), id.clone()));
+                    self.tool_kinds.remove(&(agent_id.clone(), id.clone()));
                 }
                 let _ = ui_commands.try_send(UiCommand::AcpProgress {
                     agent_id,
@@ -676,24 +685,71 @@ impl AcpRuntime {
                     active,
                 });
             }
+            AcpAgentEvent::ToolCallMeta {
+                tool_call_id,
+                title,
+                kind,
+            } => {
+                let key = (agent_id.clone(), tool_call_id);
+                if let Some(title) = title.filter(|title| !title.is_empty()) {
+                    self.tool_titles.insert(key.clone(), title);
+                }
+                if let Some(kind) = kind.filter(|kind| !kind.is_empty()) {
+                    self.tool_kinds.insert(key, kind);
+                }
+            }
             AcpAgentEvent::PermissionRequest {
                 jsonrpc_id,
                 session_id,
                 tool_call_id,
                 mut title,
                 options,
+                command,
+                command_cwd,
+                mut tool_kind,
             } => {
+                let cache_key = (agent_id.clone(), tool_call_id.clone());
                 if title == "Permission required" || title.trim().is_empty() {
-                    let title_key = (agent_id.clone(), tool_call_id.clone());
-                    if let Some(t) = self.tool_titles.get(&title_key) {
+                    if let Some(t) = self.tool_titles.get(&cache_key) {
                         title = t.clone();
                     }
+                }
+                if tool_kind.is_none() {
+                    tool_kind = self.tool_kinds.get(&cache_key).cloned();
+                }
+                let ctx = PermissionContext {
+                    command: command.as_deref(),
+                    tool_kind: tool_kind.as_deref(),
+                };
+                if self.auto_approve.allows(ctx)
+                    && let Some(option_id) = pick_allow_option(&options)
+                    && let Some(session) = self.session(&agent_id).await
+                {
+                    let result = permission_result_for_option(&option_id);
+                    let client = Arc::clone(&session.client);
+                    tokio::spawn(async move {
+                        let mut guard = client.lock().await;
+                        if let Err(err) = guard.send_jsonrpc_result(jsonrpc_id, result).await {
+                            warn!(%err, "failed to auto-approve ACP permission request");
+                        }
+                    });
+                    return;
+                }
+                let mut message = format!("Session `{session_id}`\nTool call `{tool_call_id}`");
+                if let Some(command) = &command {
+                    message.push_str(&format!("\nCommand `{command}`"));
+                    if let Some(cwd) = &command_cwd {
+                        message.push_str(&format!(" (cwd `{cwd}`)"));
+                    }
+                }
+                if let Some(kind) = &tool_kind {
+                    message.push_str(&format!("\nKind `{kind}`"));
                 }
                 let _ = ui_commands.try_send(UiCommand::AcpModalPrompt {
                     agent_id,
                     jsonrpc_id,
                     title,
-                    message: format!("Session `{session_id}`\nTool call `{tool_call_id}`"),
+                    message,
                     options,
                     kind: AcpModalKind::SessionPermission,
                 });
@@ -751,7 +807,7 @@ impl AcpRuntime {
 
 impl Default for AcpRuntime {
     fn default() -> Self {
-        Self::new()
+        Self::new(AutoApprovePolicy::default())
     }
 }
 
@@ -784,7 +840,7 @@ mod tests {
 
     #[test]
     fn runtime_starts_with_empty_maps() {
-        let rt = AcpRuntime::new();
+        let rt = AcpRuntime::default();
         assert!(rt.launch_configs_arc().try_lock().is_ok());
         assert!(rt.sessions_arc().try_lock().is_ok());
     }
@@ -992,7 +1048,7 @@ done
 
     #[tokio::test]
     async fn register_spawn_stores_model_in_launch_config() {
-        let rt = AcpRuntime::new();
+        let rt = AcpRuntime::default();
         let delivery = AgentDelivery::new();
         let agents_dir = temp_dir("launch-model");
         let (ui_tx, _ui_rx) = mpsc::channel::<UiCommand>(8);
@@ -1023,5 +1079,63 @@ done
         );
 
         std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn permission_request_denied_command_shows_modal() {
+        use crate::event::{AcpAgentEvent, AcpPermissionOption, UiCommand};
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(8);
+        let mut rt = AcpRuntime::default();
+        rt.handle_agent_event(
+            &ui_tx,
+            "coder".to_string(),
+            AcpAgentEvent::PermissionRequest {
+                jsonrpc_id: serde_json::json!(1),
+                session_id: "s1".to_string(),
+                tool_call_id: "c1".to_string(),
+                title: "Remove files".to_string(),
+                options: vec![AcpPermissionOption {
+                    option_id: "allow-once".to_string(),
+                    name: "Allow".to_string(),
+                }],
+                command: Some("rm -rf /".to_string()),
+                command_cwd: None,
+                tool_kind: None,
+            },
+        )
+        .await;
+
+        let cmd = ui_rx.try_recv().expect("modal prompt");
+        assert!(matches!(cmd, UiCommand::AcpModalPrompt { .. }));
+    }
+
+    #[tokio::test]
+    async fn permission_request_without_session_falls_back_to_modal() {
+        use crate::event::{AcpAgentEvent, AcpPermissionOption, UiCommand};
+
+        let (ui_tx, mut ui_rx) = mpsc::channel(8);
+        let mut rt = AcpRuntime::default();
+        rt.handle_agent_event(
+            &ui_tx,
+            "coder".to_string(),
+            AcpAgentEvent::PermissionRequest {
+                jsonrpc_id: serde_json::json!(2),
+                session_id: "s1".to_string(),
+                tool_call_id: "c2".to_string(),
+                title: "Via task".to_string(),
+                options: vec![AcpPermissionOption {
+                    option_id: "allow-once".to_string(),
+                    name: "Allow".to_string(),
+                }],
+                command: Some("via task list".to_string()),
+                command_cwd: None,
+                tool_kind: None,
+            },
+        )
+        .await;
+
+        let cmd = ui_rx.try_recv().expect("modal when no session to reply");
+        assert!(matches!(cmd, UiCommand::AcpModalPrompt { .. }));
     }
 }

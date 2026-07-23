@@ -215,6 +215,18 @@ pub enum AcpAgentEvent {
         tool_call_id: String,
         title: String,
         options: Vec<AcpPermissionOption>,
+        /// Shell command when the subject is `command` (ACP v2) or equivalent.
+        command: Option<String>,
+        /// Absolute working directory for command subjects.
+        command_cwd: Option<String>,
+        /// ACP tool kind (`read`, `search`, `execute`, …) when known from the request or cache.
+        tool_kind: Option<String>,
+    },
+    /// Cached metadata from `session/update` tool_call updates (not forwarded to UI).
+    ToolCallMeta {
+        tool_call_id: String,
+        title: Option<String>,
+        kind: Option<String>,
     },
     /// Agent ask-question blocking request (e.g. `cursor/ask_question`, `_zed/askQuestion`).
     AskQuestion {

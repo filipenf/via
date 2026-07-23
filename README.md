@@ -296,11 +296,32 @@ model = "gpt-5.3-codex-fast"
 
 [agents.coder]
 model = "composer-2.5"
+
+# Optional: extend ACP permission auto-approve (built-ins always on).
+[auto_approve]
+commands = ["echo"]
+kinds = ["fetch"]
 ```
 
 Per-agent presets (`role`, optional `command`, optional `model`) are documented
 in [Multi-agent orchestration](#multi-agent-orchestration) — including how to
 mix drivers, list model slugs, and override with `--model` at spawn time.
+
+### ACP permission auto-approve
+
+When spawned ACP helpers call `session/request_permission`, via can answer safe
+requests automatically so orchestration does not stall. Built-in allows (always
+on, not configurable):
+
+- Any shell command whose executable is `via` (all subcommands)
+- ACP tool kinds `read` and `search`
+- Read-only shell: `ls`, `pwd`, `cat`, `head`, `tail`, `rg`, `fd`, and `git`
+  with `status`, `diff`, `log`, or `show`
+
+Everything else still opens the permission modal (via never auto-denies). Extend
+allows with `[auto_approve]` in `via.conf` — extra `commands` (base executable
+names) and `kinds` only add to the built-in list. There are no CLI flags for
+auto-approve today; configure it in `via.conf` only.
 
 Equivalent CLI/env names:
 

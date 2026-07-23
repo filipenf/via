@@ -1,4 +1,5 @@
 mod acp;
+mod acp_auto_approve;
 mod acp_runtime;
 pub mod acp_tui;
 mod agent_bus;
