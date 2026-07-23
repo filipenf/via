@@ -193,7 +193,7 @@ via task update <id> --append $'### 2026-07-22 coder\n- Done: reproduced failure
 Post a manual update at least when you: finish a meaningful chunk, hit a blocker, change
 approach, or prepare a review handoff.
 
-### Add context when you create a task
+### Add context when you create or update a task
 
 A task on the board may be picked up by another agent or a human later - write it so it can be worked without you being
 present. Pass a `-m/--body` summary on **every** `via task create`. Keep the **title** short (one line); put the detail
@@ -232,6 +232,10 @@ When a live via instance is running, task transitions also deliver to agents:
   configured review surface (`review_backend = "nvim"` opens a Neovim diff of working-tree changes;
   `review_backend = "hunk"` opens the inline hunk pane). This is the task-level human gate - distinct from ACP
   `session/request_permission` tool modals.
+
+
+Prefer running board/CLI work through `via task` / `via agent` from spawned
+helpers; those calls are intended to flow without manual permission clicks.
 
 Spawned helpers also receive a compact board snapshot (active board, their assigned tasks,
 and the oldest unassigned queued items, up to 5) in their first prompt / mailbox note.

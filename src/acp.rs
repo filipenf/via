@@ -552,6 +552,51 @@ fn jsonrpc_id_matches(received: &serde_json::Value, expected: u64) -> bool {
         || received.as_str().and_then(|s| s.parse::<u64>().ok()) == Some(expected)
 }
 
+fn parse_permission_options(options: &serde_json::Value) -> Option<Vec<AcpPermissionOption>> {
+    let options_arr = options.as_array()?;
+    let mut parsed = Vec::new();
+    for item in options_arr {
+        let option_id = item.get("optionId").and_then(serde_json::Value::as_str)?;
+        let name = item
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(option_id)
+            .to_string();
+        parsed.push(AcpPermissionOption {
+            option_id: option_id.to_string(),
+            name,
+        });
+    }
+    if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn tool_call_update_fields(
+    tool_call: &serde_json::Value,
+    fallback_title: Option<&str>,
+) -> (String, String, Option<String>) {
+    let tool_call_id = tool_call
+        .get("toolCallId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let title = tool_call
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.is_empty())
+        .or(fallback_title)
+        .unwrap_or("Permission required")
+        .to_string();
+    let kind = tool_call
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    (tool_call_id, title, kind)
+}
+
 fn parse_permission_request(
     jsonrpc_id: serde_json::Value,
     params: serde_json::Value,
@@ -560,39 +605,71 @@ fn parse_permission_request(
         .get("sessionId")
         .and_then(serde_json::Value::as_str)?
         .to_string();
-    let tool_call = params.get("toolCall")?;
-    let tool_call_id = tool_call
-        .get("toolCallId")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    let title = tool_call
+    let options = parse_permission_options(params.get("options")?)?;
+    let top_title = params
         .get("title")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Permission required")
-        .to_string();
-    let options_arr = params.get("options")?.as_array()?;
-    let mut options = Vec::new();
-    for item in options_arr {
-        let option_id = item.get("optionId").and_then(serde_json::Value::as_str)?;
-        let name = item
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or(option_id)
-            .to_string();
-        options.push(AcpPermissionOption {
-            option_id: option_id.to_string(),
-            name,
-        });
-    }
-    if options.is_empty() {
-        return None;
-    }
+        .filter(|title| !title.is_empty());
+
+    let (tool_call_id, title, tool_kind, command, command_cwd) =
+        if let Some(subject) = params.get("subject") {
+            match subject.get("type").and_then(serde_json::Value::as_str) {
+                Some("command") => {
+                    let command = subject
+                        .get("command")
+                        .and_then(serde_json::Value::as_str)?
+                        .to_string();
+                    let command_cwd = subject
+                        .get("cwd")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    let tool_call_id = subject
+                        .get("toolCallId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let title = top_title.unwrap_or("Permission required").to_string();
+                    (tool_call_id, title, None, Some(command), command_cwd)
+                }
+                Some("tool_call") => {
+                    let tool_call = subject.get("toolCall")?;
+                    let (tool_call_id, title, tool_kind) =
+                        tool_call_update_fields(tool_call, top_title);
+                    (tool_call_id, title, tool_kind, None, None)
+                }
+                Some(other) => {
+                    tracing::debug!(subject_type = other, "unknown ACP permission subject type");
+                    let tool_call_id = subject
+                        .get("toolCallId")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let title = top_title.unwrap_or("Permission required").to_string();
+                    (tool_call_id, title, None, None, None)
+                }
+                None if subject.get("toolCall").is_some() => {
+                    let tool_call = subject.get("toolCall")?;
+                    let (tool_call_id, title, tool_kind) =
+                        tool_call_update_fields(tool_call, top_title);
+                    (tool_call_id, title, tool_kind, None, None)
+                }
+                None => return None,
+            }
+        } else {
+            let tool_call = params.get("toolCall")?;
+            let (tool_call_id, title, tool_kind) = tool_call_update_fields(tool_call, top_title);
+            (tool_call_id, title, tool_kind, None, None)
+        };
+
     Some(AcpAgentEvent::PermissionRequest {
         jsonrpc_id,
         session_id,
         tool_call_id,
         title,
         options,
+        command,
+        command_cwd,
+        tool_kind,
     })
 }
 
@@ -652,7 +729,7 @@ fn process_acp_line(line: &str, agent_id: &str) -> Vec<AgentEvent> {
 
     let events: Vec<AcpAgentEvent> = match message {
         JsonRpcMessage::Notification { method, params, .. } if method == "session/update" => {
-            process_session_update(params).into_iter().collect()
+            process_session_update(params)
         }
         JsonRpcMessage::Notification { method, .. } => {
             tracing::debug!(method, "ACP notification from agent");
@@ -718,20 +795,21 @@ fn process_acp_line(line: &str, agent_id: &str) -> Vec<AgentEvent> {
         .collect()
 }
 
-fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
+fn process_session_update(params: serde_json::Value) -> Vec<AcpAgentEvent> {
     let session_id = params
         .get("sessionId")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     let Some(update) = params.get("update") else {
         tracing::warn!(session_id, "ACP session/update missing update payload");
-        return None;
+        return Vec::new();
     };
     let kind = update
         .get("sessionUpdate")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
 
+    // Each arm may emit zero, one, or two events (e.g. tool_call → Progress + ToolCallMeta).
     match kind {
         "available_commands_update" => {
             let commands = update
@@ -750,7 +828,7 @@ fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
                 commands = %commands.join(", "),
                 "ACP available commands updated"
             );
-            None
+            Vec::new()
         }
         "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk" => {
             let text = update
@@ -759,15 +837,15 @@ fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
                 .unwrap_or_default();
             tracing::info!(session_id, kind, text = %text, "ACP message chunk");
             if text.is_empty() {
-                None
+                Vec::new()
             } else {
-                Some(AcpAgentEvent::TranscriptChunk {
+                vec![AcpAgentEvent::TranscriptChunk {
                     kind: kind.to_string(),
                     text: text.to_string(),
-                })
+                }]
             }
         }
-        "tool_call" => {
+        "tool_call" | "tool_call_update" => {
             let title = update
                 .get("title")
                 .and_then(serde_json::Value::as_str)
@@ -781,39 +859,31 @@ fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
                 .get("toolCallId")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("unknown");
-            tracing::info!(session_id, tool_call_id, title, status, "ACP tool call");
-            Some(AcpAgentEvent::Progress {
-                id: tool_call_id.to_string(),
-                label: title.to_string(),
-                active: status != "completed" && status != "failed" && status != "cancelled",
-            })
-        }
-        "tool_call_update" => {
-            let title = update
-                .get("title")
+            let tool_kind = update
+                .get("kind")
                 .and_then(serde_json::Value::as_str)
-                .filter(|title| !title.is_empty())
-                .unwrap_or("Working");
-            let status = update
-                .get("status")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
-            let tool_call_id = update
-                .get("toolCallId")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unknown");
+                .map(str::to_string);
             tracing::info!(
                 session_id,
                 tool_call_id,
                 title,
                 status,
+                ?tool_kind,
                 "ACP tool call updated"
             );
-            Some(AcpAgentEvent::Progress {
-                id: tool_call_id.to_string(),
-                label: title.to_string(),
-                active: status != "completed" && status != "failed" && status != "cancelled",
-            })
+            let active = status != "completed" && status != "failed" && status != "cancelled";
+            vec![
+                AcpAgentEvent::Progress {
+                    id: tool_call_id.to_string(),
+                    label: title.to_string(),
+                    active,
+                },
+                AcpAgentEvent::ToolCallMeta {
+                    tool_call_id: tool_call_id.to_string(),
+                    title: (title != "Working").then(|| title.to_string()),
+                    kind: tool_kind,
+                },
+            ]
         }
         "plan" => {
             let count = update
@@ -822,11 +892,11 @@ fn process_session_update(params: serde_json::Value) -> Option<AcpAgentEvent> {
                 .map(Vec::len)
                 .unwrap_or(0);
             tracing::info!(session_id, count, "ACP plan updated");
-            None
+            Vec::new()
         }
         other => {
             tracing::debug!(session_id, kind = other, "unhandled ACP session update");
-            None
+            Vec::new()
         }
     }
 }
@@ -1056,6 +1126,164 @@ done
         assert_eq!(updated.selected_model().as_deref(), Some("new-model"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_acp_line_parses_v1_permission_with_tool_kind() {
+        let line = r#"{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{"sessionId":"s1","toolCall":{"toolCallId":"call_1","title":"Read README","kind":"read"},"options":[{"optionId":"allow-once","name":"Allow once"}]}}"#;
+        let events = process_acp_line(line, "coder");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                agent_id,
+                event: AcpAgentEvent::PermissionRequest {
+                    session_id,
+                    tool_call_id,
+                    title,
+                    tool_kind,
+                    command,
+                    command_cwd,
+                    ..
+                }
+            } if agent_id == "coder"
+                && session_id == "s1"
+                && tool_call_id == "call_1"
+                && title == "Read README"
+                && tool_kind.as_deref() == Some("read")
+                && command.is_none()
+                && command_cwd.is_none()
+        ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_v2_command_permission_subject() {
+        let line = r#"{"jsonrpc":"2.0","id":10,"method":"session/request_permission","params":{"sessionId":"s1","title":"Run tests?","subject":{"type":"command","command":"via task list","cwd":"/home/user/project","toolCallId":"call_2"},"options":[{"optionId":"allow-once","name":"Allow once"}]}}"#;
+        let events = process_acp_line(line, "coder");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                event: AcpAgentEvent::PermissionRequest {
+                    title,
+                    tool_call_id,
+                    command,
+                    command_cwd,
+                    tool_kind,
+                    ..
+                },
+                ..
+            } if title == "Run tests?"
+                && tool_call_id == "call_2"
+                && command.as_deref() == Some("via task list")
+                && command_cwd.as_deref() == Some("/home/user/project")
+                && tool_kind.is_none()
+        ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_v2_tool_call_permission_subject() {
+        let line = r#"{"jsonrpc":"2.0","id":11,"method":"session/request_permission","params":{"sessionId":"s1","title":"Search workspace","subject":{"type":"tool_call","toolCall":{"toolCallId":"call_3","kind":"search"}},"options":[{"optionId":"allow-once","name":"Allow once"}]}}"#;
+        let events = process_acp_line(line, "coder");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                event: AcpAgentEvent::PermissionRequest {
+                    title,
+                    tool_call_id,
+                    tool_kind,
+                    command,
+                    ..
+                },
+                ..
+            } if title == "Search workspace"
+                && tool_call_id == "call_3"
+                && tool_kind.as_deref() == Some("search")
+                && command.is_none()
+        ));
+    }
+
+    #[test]
+    fn process_session_update_emits_tool_call_meta_with_kind() {
+        let params = serde_json::json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": "call_4",
+                "title": "Run shell",
+                "status": "in_progress",
+                "kind": "execute"
+            }
+        });
+        let events = process_session_update(params);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            AcpAgentEvent::Progress {
+                id,
+                label,
+                active: true,
+            } if id == "call_4" && label == "Run shell"
+        ));
+        assert!(matches!(
+            &events[1],
+            AcpAgentEvent::ToolCallMeta {
+                tool_call_id,
+                title,
+                kind,
+            } if tool_call_id == "call_4"
+                && title.as_deref() == Some("Run shell")
+                && kind.as_deref() == Some("execute")
+        ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_subject_with_tool_call_but_no_type() {
+        let line = r#"{"jsonrpc":"2.0","id":12,"method":"session/request_permission","params":{"sessionId":"s1","title":"Legacy subject","subject":{"toolCall":{"toolCallId":"call_5","kind":"read"}},"options":[{"optionId":"allow-once","name":"Allow once"}]}}"#;
+        let events = process_acp_line(line, "coder");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                event: AcpAgentEvent::PermissionRequest {
+                    title,
+                    tool_call_id,
+                    tool_kind,
+                    command,
+                    ..
+                },
+                ..
+            } if title == "Legacy subject"
+                && tool_call_id == "call_5"
+                && tool_kind.as_deref() == Some("read")
+                && command.is_none()
+        ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_unknown_permission_subject_type() {
+        let line = r#"{"jsonrpc":"2.0","id":13,"method":"session/request_permission","params":{"sessionId":"s1","title":"Future subject","subject":{"type":"future_thing","toolCallId":"call_6"},"options":[{"optionId":"allow-once","name":"Allow once"}]}}"#;
+        let events = process_acp_line(line, "coder");
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Acp {
+                event: AcpAgentEvent::PermissionRequest {
+                    title,
+                    tool_call_id,
+                    tool_kind,
+                    command,
+                    command_cwd,
+                    ..
+                },
+                ..
+            } if title == "Future subject"
+                && tool_call_id == "call_6"
+                && tool_kind.is_none()
+                && command.is_none()
+                && command_cwd.is_none()
+        ));
     }
 
     #[test]

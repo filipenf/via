@@ -85,6 +85,18 @@ pub struct SpawnPreset {
     pub model: Option<String>,
 }
 
+/// User extensions for ACP permission auto-approve (`via.conf` `[auto_approve]`).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoApproveConfig {
+    /// Extra shell command base names to auto-approve (built-ins always apply).
+    #[serde(default)]
+    pub commands: Vec<String>,
+    /// Extra ACP tool kinds to auto-approve (built-in `read`/`search` always apply).
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub nvim_command: String,
@@ -113,6 +125,8 @@ pub struct Config {
     pub plugin_dir: Option<PathBuf>,
     /// Spawn presets keyed by agent id (built-ins merged with `via.conf` `[agents.*]`).
     pub agent_presets: HashMap<String, AgentPreset>,
+    /// ACP permission auto-approve extensions (built-in allows always on).
+    pub auto_approve: AutoApproveConfig,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -126,6 +140,7 @@ pub struct ConfigOverrides {
     pub scroll_sensitivity: Option<f32>,
     pub plugin_dir: Option<String>,
     pub agent_presets: HashMap<String, AgentPreset>,
+    pub auto_approve: AutoApproveConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,6 +258,8 @@ struct FileConfig {
     plugin_dir: Option<String>,
     #[serde(default)]
     agents: HashMap<String, AgentPreset>,
+    #[serde(default)]
+    auto_approve: AutoApproveConfig,
 }
 
 impl From<FileConfig> for ConfigOverrides {
@@ -256,6 +273,7 @@ impl From<FileConfig> for ConfigOverrides {
             scroll_sensitivity: config.scroll_sensitivity,
             plugin_dir: config.plugin_dir,
             agent_presets: config.agents,
+            auto_approve: config.auto_approve,
         }
     }
 }
@@ -277,6 +295,7 @@ impl ConfigOverrides {
                 .and_then(|value| value.parse().ok()),
             plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         }
     }
 }
@@ -291,6 +310,7 @@ struct ResolvedUserConfig {
     scroll_sensitivity: f32,
     plugin_dir: Option<String>,
     agent_presets: HashMap<String, AgentPreset>,
+    auto_approve: AutoApproveConfig,
 }
 
 fn resolve_user_config_from_sources(
@@ -342,6 +362,7 @@ fn resolve_user_config_from_sources(
         scroll_sensitivity,
         plugin_dir,
         agent_presets: file.agent_presets,
+        auto_approve: file.auto_approve,
     }
 }
 
@@ -483,6 +504,7 @@ impl Config {
             working_directory,
             plugin_dir: user_config.plugin_dir.map(PathBuf::from),
             agent_presets: merge_agent_presets(user_config.agent_presets),
+            auto_approve: user_config.auto_approve,
         })
     }
 
@@ -828,6 +850,7 @@ mod tests {
             scroll_sensitivity: Some(0.5),
             plugin_dir: None,
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -838,6 +861,7 @@ mod tests {
             scroll_sensitivity: Some(0.75),
             plugin_dir: None,
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
@@ -848,6 +872,7 @@ mod tests {
             scroll_sensitivity: Some(2.0),
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -874,6 +899,7 @@ mod tests {
             scroll_sensitivity: Some(0.5),
             plugin_dir: None,
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -884,6 +910,7 @@ mod tests {
             scroll_sensitivity: Some(0.75),
             plugin_dir: None,
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -921,6 +948,7 @@ mod tests {
             scroll_sensitivity: 1.5,
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         });
 
         assert_eq!(
@@ -978,6 +1006,7 @@ scroll_sensitivity = 1.5
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1002,6 +1031,7 @@ scroll_sensitivity = 1.5
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1066,6 +1096,7 @@ scroll_sensitivity = 1.5
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             plugin_dir: None,
             agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
         };
         let orchestration = user
             .agent_command
@@ -1101,6 +1132,7 @@ scroll_sensitivity = 1.5
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
+            auto_approve: AutoApproveConfig::default(),
         };
         let launch = config.resolve_spawn_command(None);
         assert_eq!(launch.command, "opencode acp");
@@ -1115,6 +1147,49 @@ scroll_sensitivity = 1.5
                 .contains("primary agent must be a PTY command")
         );
         reject_acp_primary_agent("opencode").unwrap();
+    }
+
+    #[test]
+    fn file_auto_approve_reaches_resolved_config() {
+        let file = ConfigOverrides {
+            auto_approve: AutoApproveConfig {
+                commands: vec!["echo".to_string()],
+                kinds: vec!["fetch".to_string()],
+            },
+            ..ConfigOverrides::default()
+        };
+        let resolved = resolve_user_config_from_sources(
+            ConfigOverrides::default(),
+            ConfigOverrides::default(),
+            file,
+        );
+        assert_eq!(
+            resolved.auto_approve,
+            AutoApproveConfig {
+                commands: vec!["echo".to_string()],
+                kinds: vec!["fetch".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_auto_approve_from_file_config() {
+        let config: FileConfig = toml::from_str(
+            r#"
+[auto_approve]
+commands = ["echo", "wc"]
+kinds = ["fetch"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.auto_approve,
+            AutoApproveConfig {
+                commands: vec!["echo".to_string(), "wc".to_string()],
+                kinds: vec!["fetch".to_string()],
+            }
+        );
     }
 
     #[test]
@@ -1193,6 +1268,7 @@ model = "composer-2.5"
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: merge_agent_presets(file.agents),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1218,6 +1294,7 @@ model = "composer-2.5"
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let preset = config.apply_spawn_preset("reviewer", None, None, None);
@@ -1280,6 +1357,7 @@ model = "composer-2.5"
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: presets,
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1314,6 +1392,7 @@ model = "composer-2.5"
             working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: presets,
+            auto_approve: AutoApproveConfig::default(),
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, Some("from-cli".to_string()));
@@ -1340,6 +1419,7 @@ model = "composer-2.5"
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
             plugin_dir: None,
             agent_presets,
+            auto_approve: AutoApproveConfig::default(),
         });
 
         assert!(output.contains("[agents.coder]"));
