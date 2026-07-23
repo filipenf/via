@@ -93,13 +93,39 @@ pub struct NewSessionResult {
     config_options: Vec<ConfigOption>,
 }
 
+fn selected_config_value(options: &[ConfigOption], id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.id == id)
+        .and_then(|option| option.current_value.clone())
+}
+
 impl NewSessionResult {
     /// Selected model from `session/new` config options (e.g. `lemonade/Gemma-…`).
     pub fn selected_model(&self) -> Option<String> {
-        self.config_options
-            .iter()
-            .find(|option| option.id == "model")
-            .and_then(|option| option.current_value.clone())
+        selected_config_value(&self.config_options, "model")
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConfigOptionParams {
+    pub session_id: String,
+    pub config_id: String,
+    pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetConfigOptionResult {
+    #[serde(default)]
+    config_options: Vec<ConfigOption>,
+}
+
+impl SetConfigOptionResult {
+    /// Selected model from the updated config options.
+    pub fn selected_model(&self) -> Option<String> {
+        selected_config_value(&self.config_options, "model")
     }
 }
 
@@ -229,6 +255,26 @@ impl AcpClient {
             .await?;
 
         serde_json::from_value(response).context("failed to parse new_session result")
+    }
+
+    /// Set a session configuration option (e.g. `config_id = "model"`).
+    pub async fn set_config_option(
+        &mut self,
+        session_id: &str,
+        config_id: &str,
+        value: &str,
+    ) -> Result<SetConfigOptionResult> {
+        let params = SetConfigOptionParams {
+            session_id: session_id.to_string(),
+            config_id: config_id.to_string(),
+            value: value.to_string(),
+        };
+
+        let response = self
+            .send_request("session/set_config_option", serde_json::to_value(params)?)
+            .await?;
+
+        serde_json::from_value(response).context("failed to parse set_config_option result")
     }
 
     /// Spawn a background task that continuously reads JSON-RPC lines
@@ -819,6 +865,81 @@ mod tests {
             result.selected_model().as_deref(),
             Some("lemonade/Gemma-4-26B-A4B-it-GGUF")
         );
+    }
+
+    #[test]
+    fn set_config_option_params_serialize_to_acp_shape() {
+        let params = SetConfigOptionParams {
+            session_id: "sess_test".to_string(),
+            config_id: "model".to_string(),
+            value: "claude-sonnet".to_string(),
+        };
+        let json = serde_json::to_value(params).expect("serialize");
+        assert_eq!(json["sessionId"], "sess_test");
+        assert_eq!(json["configId"], "model");
+        assert_eq!(json["value"], "claude-sonnet");
+    }
+
+    #[test]
+    fn set_config_option_result_extracts_selected_model() {
+        let json = r#"{
+            "configOptions": [
+                {"id": "model", "currentValue": "claude-sonnet"}
+            ]
+        }"#;
+        let result: SetConfigOptionResult =
+            serde_json::from_str(json).expect("parse set_config_option");
+        assert_eq!(result.selected_model().as_deref(), Some("claude-sonnet"));
+    }
+
+    #[tokio::test]
+    async fn set_config_option_after_new_session() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("via-acp-mock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("mock_acp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_test","configOptions":[{"id":"model","currentValue":"old-model"}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","currentValue":"new-model"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let mut client = AcpClient::spawn("test", script.to_str().unwrap(), &[], &[])
+            .await
+            .expect("spawn mock agent");
+        client.initialize().await.expect("initialize");
+        let session = client
+            .new_session(Path::new("/tmp"))
+            .await
+            .expect("new_session");
+        assert_eq!(session.session_id, "sess_test");
+        assert_eq!(session.selected_model().as_deref(), Some("old-model"));
+
+        let updated = client
+            .set_config_option(&session.session_id, "model", "new-model")
+            .await
+            .expect("set_config_option");
+        assert_eq!(updated.selected_model().as_deref(), Some("new-model"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

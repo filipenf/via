@@ -214,8 +214,70 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Agent {
-                command: AgentCommand::Spawn { id, role, command: None },
+                command: AgentCommand::Spawn {
+                    id,
+                    role,
+                    command: None,
+                    model: None,
+                },
             }) if id == "reviewer" && role.as_deref() == Some("reviewer")
+        ));
+    }
+
+    #[test]
+    fn parses_agent_spawn_with_model() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "agent",
+            "spawn",
+            "--id",
+            "coder",
+            "--model",
+            "composer-2.5",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Spawn {
+                    id,
+                    model,
+                    role: None,
+                    command: None,
+                },
+            }) if id == "coder" && model.as_deref() == Some("composer-2.5")
+        ));
+    }
+
+    #[test]
+    fn parses_agent_assign_with_model() {
+        let cli = Cli::try_parse_from([
+            "via",
+            "agent",
+            "assign",
+            "--id",
+            "coder",
+            "--model",
+            "composer-2.5",
+            "-m",
+            "implement",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Assign {
+                    id,
+                    model,
+                    message,
+                    role: None,
+                    command: None,
+                    task: None,
+                    no_focus: false,
+                },
+            }) if id == "coder"
+                && model.as_deref() == Some("composer-2.5")
+                && message == "implement"
         ));
     }
 
@@ -268,6 +330,7 @@ mod tests {
                     id,
                     role,
                     command: None,
+                    model: None,
                     message,
                     task: Some(tid),
                     no_focus: false,
@@ -291,6 +354,7 @@ mod tests {
                     id,
                     role: None,
                     command: None,
+                    model: None,
                     message,
                     task: None,
                     no_focus: false,

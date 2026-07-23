@@ -65,19 +65,105 @@ PTY pane keeps the id `agent`; the coordinator is `orchestrator`.
 orchestrate themselves using skills and the `via agent` CLI; multi-agent
 workflows are not encoded in the mediator.
 
-Configure spawn defaults in `~/.config/via/via.conf`:
+### Per-agent models and drivers
+
+Spawned helpers are independent ACP panes. Each `[agents.<id>]` preset can set a
+**role**, an optional **model**, and an optional **command** — so you can mix
+drivers and models per role (e.g. a planning orchestrator on a strong model, a
+fast reviewer, a coding specialist on Composer).
+
+Configure defaults in `~/.config/via/via.conf`:
 
 ```toml
+# Primary PTY agent (interactive pane). Not an ACP process.
+agent = "agent"
+
+# Default ACP driver for spawned helpers when a preset omits `command`.
+# Used when `agent` is not in the built-in ACP table (opencode, agent, cursor-agent).
+# acp_agent = "cursor-agent acp"
+
+[agents.orchestrator]
+role = "orchestrator"
+model = "claude-opus-4-8-thinking-high"
+
 [agents.reviewer]
 role = "reviewer"
-# command = "cursor-agent acp"  # optional override
+model = "gpt-5.3-codex-fast"
 
 [agents.coder]
 role = "coder"
+model = "composer-2.5"
+# command = "opencode"   # optional; see “Command resolution” below
 ```
 
-Then `via agent spawn --id reviewer` picks up the preset role and resolves the
-launch command from your primary agent.
+**Command resolution** (you usually do **not** need `command = "… acp"`):
+
+| Preset `command` | Resolved spawn |
+| --- | --- |
+| *(omitted)* | Primary `agent` value, upgraded to ACP when known (`opencode` → `opencode acp`, `agent` → `agent acp`) |
+| `opencode` or `agent` | Same binary with `acp` appended automatically |
+| `opencode acp` | Used as-is (explicit is fine) |
+| `cursor-agent acp` | Used as-is — pick a **different** driver than the primary PTY agent |
+
+Built-in ACP upgrade covers `opencode`, `agent`, and `cursor-agent` only. For
+other primaries (e.g. `claude`, `crush`), set `acp_agent` globally or
+`command = "… acp"` on each helper preset.
+
+**Model resolution** (applied after `session/new` via ACP `session/set_config_option`):
+
+1. `via agent spawn --model …` / `via agent assign --model …` (one-shot override)
+2. `[agents.<id>] model = "…"` in `via.conf`
+3. Agent binary default
+
+The active model is shown in the helper pane header. Requires an ACP-capable
+spawn and an agent that exposes a `model` config option (support varies).
+
+**Listing model slugs** (via does not ship a model picker yet — ask the driver):
+
+```bash
+agent models      # cursor-agent slugs, e.g. composer-2.5
+opencode models   # opencode ids, e.g. opencode/claude-opus-4-8
+```
+
+Use the slug (left column / full id), not the display name, in `via.conf` or
+`--model`.
+
+**One-shot overrides** (orchestrator or any pane with `VIA_SESSION`):
+
+```bash
+via agent spawn --id coder --model composer-2.5
+via agent assign --id coder --model gpt-5.3-codex --task abc -m "implement fix"
+```
+
+`--model` on `assign` applies only when via **spawns** the pane; it does not
+retune an already-running helper. Terminate and respawn to change model.
+
+**Example: mixed setup in one session**
+
+```toml
+agent = "agent"   # you work in the PTY pane
+
+[agents.orchestrator]
+role = "orchestrator"
+model = "claude-opus-4-8-thinking-high"
+
+[agents.reviewer]
+role = "reviewer"
+model = "gpt-5.3-codex-fast"
+
+[agents.coder]
+role = "coder"
+model = "composer-2.5"
+command = "opencode"   # coder uses opencode ACP while primary stays cursor-agent
+```
+
+```bash
+via agent spawn --id orchestrator   # opus planner
+via agent spawn --id reviewer       # fast codex reviewer
+via agent spawn --id coder          # composer on opencode
+# or override just this coder:
+via agent spawn --id coder --model gpt-5.3-codex-high
+```
 
 **Navigation**
 
@@ -94,6 +180,7 @@ is injected into `~/.local/share/via/lua/` at startup). Example usage:
 ```lua
 local via = require('via')
 via.agent.spawn("reviewer", "reviewer")                 -- spawn a reviewer pane
+via.agent.spawn("coder", "coder", nil, "composer")      -- optional 4th arg: model slug
 via.agent.del("reviewer")                               -- terminate a sub-agent when done
 via.agent.send("reviewer", "please review this diff", false) -- send without stealing focus
 via.agent.send("orchestrator", "hello orchestrator")    -- send after spawning orchestrator
@@ -110,6 +197,8 @@ Each agent pane gets `VIA_AGENT_ID` and `VIA_AGENT_ROLE` in its environment.
 via agent whoami                                  # this agent's id/role/session
 via agent list                                    # agents running in this session
 via agent spawn --id reviewer --role reviewer     # ask via to open a reviewer pane
+via agent spawn --id coder --model composer       # override model for this spawn
+via agent assign --id coder --model composer --task abc -m "implement"
 via agent send --to reviewer -m "review this"     # queue a message + deliver it
 via agent inbox                                   # read (and clear) your mailbox
 ```
@@ -193,12 +282,25 @@ Example config:
 
 ```toml
 nvim = "nvim"
-agent = "opencode"          # PTY primary; ACP resolved only for spawned helpers
-acp_agent = "cursor-agent acp" # Use cursor instead of opencode for the acp agents
+agent = "agent"             # PTY primary; spawned helpers resolve to ACP separately
+# acp_agent = "cursor-agent acp"  # when primary is not ACP-capable (claude, crush, …)
 agent_pane_cols = "80:120"
 review_backend = "nvim"
 plugin_dir = "~/my-via-plugin"
+
+[agents.orchestrator]
+model = "claude-opus-4-8-thinking-high"
+
+[agents.reviewer]
+model = "gpt-5.3-codex-fast"
+
+[agents.coder]
+model = "composer-2.5"
 ```
+
+Per-agent presets (`role`, optional `command`, optional `model`) are documented
+in [Multi-agent orchestration](#multi-agent-orchestration) — including how to
+mix drivers, list model slugs, and override with `--model` at spawn time.
 
 Equivalent CLI/env names:
 

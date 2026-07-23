@@ -63,12 +63,14 @@ end
 -- id: unique identifier for the new agent
 -- role: optional role label (e.g. "architect", "implementer")
 -- command: optional shell command to run (falls back to configured agent)
-function M.agent.spawn(id, role, command)
+-- model: optional model slug for ACP sessions (overrides preset)
+function M.agent.spawn(id, role, command, model)
   notify({
     type = "spawn_agent",
     id = id,
     role = role,
     command = command,
+    model = model,
   })
 end
 

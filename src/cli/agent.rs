@@ -27,6 +27,9 @@ pub enum AgentCommand {
         /// Optional command to run (defaults to the configured agent).
         #[arg(long)]
         command: Option<String>,
+        /// Optional model slug for ACP sessions (overrides preset).
+        #[arg(long)]
+        model: Option<String>,
     },
     /// Close a sub-agent pane and tear down its session.
     Terminate {
@@ -63,6 +66,9 @@ pub enum AgentCommand {
         /// Optional command to run (used when spawning).
         #[arg(long)]
         command: Option<String>,
+        /// Optional model slug for ACP sessions (used when spawning; overrides preset).
+        #[arg(long)]
+        model: Option<String>,
         /// Message body to deliver.
         #[arg(long, short = 'm')]
         message: String,
@@ -94,7 +100,12 @@ pub enum AgentCommand {
 pub fn run(command: AgentCommand) -> Result<()> {
     match command {
         AgentCommand::List { json } => run_list(json),
-        AgentCommand::Spawn { id, role, command } => run_spawn(id, role, command),
+        AgentCommand::Spawn {
+            id,
+            role,
+            command,
+            model,
+        } => run_spawn(id, role, command, model),
         AgentCommand::Terminate { id } => run_terminate(id),
         AgentCommand::Send {
             to,
@@ -106,10 +117,11 @@ pub fn run(command: AgentCommand) -> Result<()> {
             id,
             role,
             command,
+            model,
             message,
             task,
             no_focus,
-        } => run_assign(id, role, command, message, task, !no_focus),
+        } => run_assign(id, role, command, model, message, task, !no_focus),
         AgentCommand::Inbox { json, peek, wait } => run_inbox(json, peek, wait),
         AgentCommand::Whoami { json } => run_whoami(json),
     }
@@ -144,7 +156,12 @@ fn run_list(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Result<()> {
+fn run_spawn(
+    id: String,
+    role: Option<String>,
+    command: Option<String>,
+    model: Option<String>,
+) -> Result<()> {
     let session = session::resolve_session()?;
     if !session.orchestration_enabled {
         bail!(
@@ -158,16 +175,8 @@ fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Resul
              not a spawnable pane; choose a different --id"
         );
     }
-    let mut payload = serde_json::json!({
-        "type": "spawn_agent",
-        "id": id,
-    });
-    if let Some(role) = &role {
-        payload["role"] = serde_json::Value::String(role.clone());
-    }
-    if let Some(command) = &command {
-        payload["command"] = serde_json::Value::String(command.clone());
-    }
+    let payload =
+        spawn_agent_notify_payload(&id, role.as_deref(), command.as_deref(), model.as_deref());
     agent_bus::notify_editor_socket(&session.editor_socket, &payload)
         .context("ask via to spawn the agent")?;
 
@@ -190,6 +199,28 @@ fn run_spawn(id: String, role: Option<String>, command: Option<String>) -> Resul
     );
     println!("requested spawn of agent '{id}' (unconfirmed)");
     Ok(())
+}
+
+fn spawn_agent_notify_payload(
+    id: &str,
+    role: Option<&str>,
+    command: Option<&str>,
+    model: Option<&str>,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
+        "type": "spawn_agent",
+        "id": id,
+    });
+    if let Some(role) = role {
+        payload["role"] = serde_json::Value::String(role.to_string());
+    }
+    if let Some(command) = command {
+        payload["command"] = serde_json::Value::String(command.to_string());
+    }
+    if let Some(model) = model {
+        payload["model"] = serde_json::Value::String(model.to_string());
+    }
+    payload
 }
 
 fn run_terminate(id: String) -> Result<()> {
@@ -238,6 +269,7 @@ fn run_assign(
     id: String,
     role: Option<String>,
     command: Option<String>,
+    model: Option<String>,
     message: String,
     task: Option<String>,
     focus: bool,
@@ -254,7 +286,7 @@ fn run_assign(
             .any(|record| record.id == id);
 
         if !already_registered {
-            run_spawn(id.clone(), role, command)?;
+            run_spawn(id.clone(), role, command, model)?;
         }
     }
 
@@ -389,6 +421,17 @@ mod tests {
     use crate::test_support::{temp_dir, write_session_manifest};
     use crate::workspace::resolve_tasks_context;
 
+    #[test]
+    fn spawn_notify_payload_includes_model() {
+        let payload =
+            spawn_agent_notify_payload("coder", Some("coder"), None, Some("composer-2.5"));
+        assert_eq!(payload["type"], "spawn_agent");
+        assert_eq!(payload["id"], "coder");
+        assert_eq!(payload["role"], "coder");
+        assert_eq!(payload["model"], "composer-2.5");
+        assert!(payload.get("command").is_none());
+    }
+
     /// `via agent assign --id human -m "..."` enqueues a message to the primary
     /// agent's mailbox (not an ACP prompt) and does not try to spawn a pane.
     #[tokio::test]
@@ -420,6 +463,7 @@ mod tests {
 
         let result = run_assign(
             "human".to_string(),
+            None,
             None,
             None,
             "your turn to review".to_string(),
@@ -489,6 +533,7 @@ mod tests {
 
         let result = run_assign(
             "human".to_string(),
+            None,
             None,
             None,
             "please review".to_string(),

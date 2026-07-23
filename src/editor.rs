@@ -138,6 +138,8 @@ enum WireEditorEvent {
         role: Option<String>,
         #[serde(default)]
         command: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
     },
     TerminateAgent {
         id: String,
@@ -305,9 +307,17 @@ pub fn parse_editor_event(input: &str, working_directory: &Path) -> Result<Edito
             content,
             focus,
         },
-        WireEditorEvent::SpawnAgent { id, role, command } => {
-            EditorEvent::SpawnAgent { id, role, command }
-        }
+        WireEditorEvent::SpawnAgent {
+            id,
+            role,
+            command,
+            model,
+        } => EditorEvent::SpawnAgent {
+            id,
+            role,
+            command,
+            model,
+        },
         WireEditorEvent::TerminateAgent { id } => EditorEvent::TerminateAgent { id },
         WireEditorEvent::ReviewRequested { task_id, title } => {
             EditorEvent::ReviewGateOpened { task_id, title }
@@ -416,6 +426,24 @@ mod tests {
                 id: "reviewer".to_string(),
                 role: Some("reviewer".to_string()),
                 command: Some("opencode acp".to_string()),
+                model: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_spawn_agent_event_with_model() {
+        assert_eq!(
+            parse_editor_event(
+                r#"{"type":"spawn_agent","id":"coder","model":"composer-2.5"}"#,
+                Path::new("/repo")
+            )
+            .unwrap(),
+            EditorEvent::SpawnAgent {
+                id: "coder".to_string(),
+                role: None,
+                command: None,
+                model: Some("composer-2.5".to_string()),
             }
         );
     }

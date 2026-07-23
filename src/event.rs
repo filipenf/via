@@ -158,6 +158,7 @@ pub enum EditorEvent {
         id: String,
         role: Option<String>,
         command: Option<String>,
+        model: Option<String>,
     },
     TerminateAgent {
         id: String,

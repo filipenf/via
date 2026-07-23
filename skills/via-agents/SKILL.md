@@ -54,10 +54,32 @@ Spawn an ACP orchestrator, then helpers. Built-in presets supply default roles f
 Override presets in `~/.config/via/via.conf`:
 
 ```toml
+[agents.orchestrator]
+role = "orchestrator"
+model = "opus"
+
 [agents.reviewer]
 role = "reviewer"
 # command = "cursor-agent acp"  # optional
+
+[agents.coder]
+role = "coder"
+model = "composer"
 ```
+
+Optional `model` sets the ACP session model during the spawn handshake
+(`session/set_config_option` after `session/new`). Requires an ACP spawn driver and
+an agent that exposes a `model` config option — not every binary supports this.
+
+Per-spawn override without editing the config:
+
+```bash
+via agent spawn --id coder --model composer-2.5
+via agent assign --id coder --model composer-2.5 --task abc -m "implement fix"
+```
+
+`--model` on `assign` applies only when via spawns the helper; it does not retune
+an already-connected pane.
 
 ```bash
 via agent spawn --id orchestrator
@@ -222,7 +244,7 @@ When picking up a task, read `via task show <id>` first — prior **Status updat
 | ------------------------------------------------------------- | -------------------------------------------------------------- |
 | `via agent whoami`                                            | Show this agent's id, role, and session                        |
 | `via agent list [--json]`                                     | List agents in this session                                    |
-| `via agent spawn --id ID [--role R] [--command CMD]`          | Open pane; preset fills missing role/command                   |
+| `via agent spawn --id ID [--role R] [--command CMD] [--model M]` | Open pane; preset fills missing role/command/model |
 | `via agent terminate --id ID`                                 | Close a sub-agent (not the primary `agent` pane)               |
 | `via agent send [--to ID] -m TEXT [--no-focus] [--no-notify]` | Deliver to a registered agent (errors if missing)              |
 | `via agent inbox [--json] [--peek] [--wait SECONDS]`          | Read your mailbox (optionally block for new mail)              |

@@ -10,8 +10,8 @@ use crate::acp::PromptResource;
 use crate::acp_runtime::{AcpConnectCtx, AcpRuntime};
 use crate::agent_bus;
 use crate::agent_delivery::AgentDelivery;
-use crate::config::Config;
 use crate::config::ReviewBackend;
+use crate::config::{Config, SpawnPreset};
 use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
@@ -414,7 +414,12 @@ impl Mediator {
                     );
                 }
             }
-            EditorEvent::SpawnAgent { id, role, command } => {
+            EditorEvent::SpawnAgent {
+                id,
+                role,
+                command,
+                model,
+            } => {
                 if !self.config.orchestration_enabled {
                     warn!(
                         %id,
@@ -427,16 +432,29 @@ impl Mediator {
                     );
                 } else {
                     info!(%id, role = ?role, command = ?command, "spawn agent requested");
-                    let (role, command) =
-                        self.config
-                            .apply_spawn_preset(id.as_str(), role.clone(), command.clone());
+                    let SpawnPreset {
+                        role,
+                        command,
+                        model,
+                    } = self.config.apply_spawn_preset(
+                        id.as_str(),
+                        role.clone(),
+                        command.clone(),
+                        model.clone(),
+                    );
                     let launch = self.config.resolve_spawn_command(command.as_deref());
                     let resolved = launch.command;
 
                     if launch.acp {
                         let ctx = self.connect_ctx();
                         self.acp_runtime
-                            .register_spawn(id.clone(), role.clone(), resolved.clone(), ctx)
+                            .register_spawn(
+                                id.clone(),
+                                role.clone(),
+                                resolved.clone(),
+                                model.clone(),
+                                ctx,
+                            )
                             .await;
                     }
 
@@ -789,6 +807,7 @@ mod tests {
                 id: "reviewer".to_string(),
                 role: None,
                 command: None,
+                model: None,
             })
             .await;
 
@@ -819,6 +838,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_explicit_model_reaches_launch_config() {
+        let agents_dir = temp_dir("spawn-explicit-model");
+        let mut presets = crate::config::default_agent_presets();
+        presets.insert(
+            "coder".to_string(),
+            crate::config::AgentPreset {
+                role: Some("coder".to_string()),
+                command: None,
+                model: Some("from-preset".to_string()),
+            },
+        );
+        let config = Config {
+            agent_command: Some("unknown-agent".to_string()),
+            acp_agent: Some("false acp".to_string()),
+            orchestration_enabled: true,
+            agents_dir: agents_dir.clone(),
+            agent_presets: presets,
+            ..test_config()
+        };
+        let (mut mediator, _ui_rx) = mediator_with_ui_receiver(config);
+
+        mediator
+            .apply_editor_event(EditorEvent::SpawnAgent {
+                id: "coder".to_string(),
+                role: None,
+                command: None,
+                model: Some("from-spawn".to_string()),
+            })
+            .await;
+
+        assert_eq!(
+            mediator
+                .acp_runtime
+                .launch_configs_arc()
+                .lock()
+                .await
+                .get("coder")
+                .and_then(|launch| launch.model.clone()),
+            Some("from-spawn".to_string())
+        );
+        std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn spawn_agent_uses_preset_model_when_event_omits_model() {
+        let agents_dir = temp_dir("spawn-preset-model");
+        let mut presets = crate::config::default_agent_presets();
+        presets.insert(
+            "coder".to_string(),
+            crate::config::AgentPreset {
+                role: Some("coder".to_string()),
+                command: None,
+                model: Some("composer-2.5".to_string()),
+            },
+        );
+        let config = Config {
+            agent_command: Some("unknown-agent".to_string()),
+            acp_agent: Some("false acp".to_string()),
+            orchestration_enabled: true,
+            agents_dir: agents_dir.clone(),
+            agent_presets: presets,
+            ..test_config()
+        };
+        let (mut mediator, _ui_rx) = mediator_with_ui_receiver(config);
+
+        mediator
+            .apply_editor_event(EditorEvent::SpawnAgent {
+                id: "coder".to_string(),
+                role: None,
+                command: None,
+                model: None,
+            })
+            .await;
+
+        assert_eq!(
+            mediator
+                .acp_runtime
+                .launch_configs_arc()
+                .lock()
+                .await
+                .get("coder")
+                .and_then(|launch| launch.model.clone()),
+            Some("composer-2.5".to_string())
+        );
+        std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
     async fn spawn_agent_rejects_human_reserved_id() {
         let agents_dir = temp_dir("spawn-human-rejected");
         let config = Config {
@@ -834,6 +941,7 @@ mod tests {
                 id: "human".to_string(),
                 role: None,
                 command: None,
+                model: None,
             })
             .await;
 

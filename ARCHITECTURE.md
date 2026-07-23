@@ -238,7 +238,12 @@ must be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects
 whether spawned helpers can resolve to ACP (known-agent table or `acp_agent`
 override). Spawn presets (`[agents.orchestrator]`, `[agents.reviewer]`,
 `[agents.coder]` in `via.conf`, plus built-in defaults) fill missing `role` /
-`command` when opening helper panes.
+`command` / `model` when opening helper panes. Each preset may include an optional
+`model` slug; on ACP connect, `establish_acp` calls `session/set_config_option`
+after `session/new` and pushes the result to the pane header via
+`UiCommand::AcpSessionStatus`. Explicit `--model` on `via agent spawn` or
+`assign` overrides the preset for that spawn. Requires ACP orchestration and
+agent support for the `model` config option.
 
 `SessionGuard` writes (and removes on drop) a per-instance manifest under
 `instances/<pid>/` so that `via session ...` subcommands and agents running
@@ -341,12 +346,14 @@ and are mitigated by the native + GPU nature of the stack.
 - A "via-editor" skill is auto-installed for ACP agents so they can pull
   diagnostics without hallucinating file state.
 - Multi-agent spawning: the orchestrator (primary agent) or Neovim Lua
-  (`require('via').agent.spawn(...)`) can request additional agent panes at
-  runtime. A spawned agent whose command ends in `acp` (see
+  (`require('via').agent.spawn(id, role, command, model)`) can request additional
+  agent panes at runtime. A spawned agent whose command ends in `acp` (see
   `config::is_acp_command`) gets an ACP transcript pane and a mediator-owned
-  session; anything else gets a `PaneRole::AgentTerminal { id, label, command }`
-  PTY pane. Spawned helpers join the registry and are reachable via Alt+1..9 but
-  do not steal focus or reshape the active layout.
+  session; optional per-id `model` in `[agents.*]` or `--model` on spawn/assign
+  is applied during the ACP handshake. Anything else gets a
+  `PaneRole::AgentTerminal { id, label, command }` PTY pane. Spawned helpers
+  join the registry and are reachable via Alt+1..9 but do not steal focus or
+  reshape the active layout.
 - Coordination is two-mode: PTY agents are interactive (manual
   `via agent inbox`), ACP agents are orchestrated (bus sends and pane prompts
   both go through `client.prompt()`, so a sub's turn starts automatically).
@@ -356,7 +363,8 @@ and are mitigated by the native + GPU nature of the stack.
   builds heavy (Zig + git).
 
 See [acp.md](acp.md) for more on the ACP direction and open questions (prompt
-editing, model selection, tool rendering, styling).
+editing, tool rendering, styling). Per-agent model selection via `[agents.*].model`
+and `--model` is implemented for ACP spawns; UI model picker is not.
 
 ## Testing philosophy
 

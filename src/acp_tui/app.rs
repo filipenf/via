@@ -427,6 +427,17 @@ mod tests {
     }
 
     #[test]
+    fn session_status_updates_header_model() {
+        let mut app = App::new("coder".into(), "coder".into(), false);
+        app.apply_host(HostToTui::SessionStatus {
+            model: Some("composer-2.5".into()),
+            provider_error: None,
+            clear_provider_error: true,
+        });
+        assert_eq!(app.model.as_deref(), Some("composer-2.5"));
+    }
+
+    #[test]
     fn agent_transcript_clears_sticky_turn_progress() {
         let mut app = App::new("a".into(), "a".into(), true);
         app.apply_host(HostToTui::Progress {

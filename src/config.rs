@@ -72,6 +72,17 @@ pub struct AgentPreset {
     /// Optional launch command override; otherwise resolved from the session primary agent.
     #[serde(default)]
     pub command: Option<String>,
+    /// Optional default model slug for ACP sessions (e.g. `composer-2.5`).
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// Resolved spawn fields after applying `[agents.<id>]` presets.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SpawnPreset {
+    pub role: Option<String>,
+    pub command: Option<String>,
+    pub model: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -391,6 +402,9 @@ fn render_user_config(config: &ResolvedUserConfig) -> String {
         if let Some(command) = &preset.command {
             output.push_str(&format!("command = \"{}\"\n", toml_escape_string(command)));
         }
+        if let Some(model) = &preset.model {
+            output.push_str(&format!("model = \"{}\"\n", toml_escape_string(model)));
+        }
     }
     output
 }
@@ -478,11 +492,14 @@ impl Config {
         id: &str,
         role: Option<String>,
         command: Option<String>,
-    ) -> (Option<String>, Option<String>) {
+        model: Option<String>,
+    ) -> SpawnPreset {
         let preset = self.agent_presets.get(id);
-        let role = role.or_else(|| preset.and_then(|p| p.role.clone()));
-        let command = command.or_else(|| preset.and_then(|p| p.command.clone()));
-        (role, command)
+        SpawnPreset {
+            role: role.or_else(|| preset.and_then(|p| p.role.clone())),
+            command: command.or_else(|| preset.and_then(|p| p.command.clone())),
+            model: model.or_else(|| preset.and_then(|p| p.model.clone())),
+        }
     }
 
     /// Column bounds for the agent pane in vertical split mode.
@@ -545,6 +562,7 @@ pub fn default_agent_presets() -> HashMap<String, AgentPreset> {
         AgentPreset {
             role: Some(role.to_string()),
             command: None,
+            model: None,
         }
     }
     HashMap::from([
@@ -563,6 +581,9 @@ fn merge_agent_presets(file: HashMap<String, AgentPreset>) -> HashMap<String, Ag
         }
         if preset.command.is_some() {
             entry.command = preset.command;
+        }
+        if preset.model.is_some() {
+            entry.model = preset.model;
         }
     }
     merged
@@ -1106,6 +1127,7 @@ command = "cursor-agent acp"
 
 [agents.coder]
 role = "implementer"
+model = "composer-2.5"
 "#,
         )
         .unwrap();
@@ -1115,6 +1137,7 @@ role = "implementer"
             Some(&AgentPreset {
                 role: Some("reviewer".to_string()),
                 command: Some("cursor-agent acp".to_string()),
+                model: None,
             })
         );
         assert_eq!(
@@ -1122,8 +1145,58 @@ role = "implementer"
             Some(&AgentPreset {
                 role: Some("implementer".to_string()),
                 command: None,
+                model: Some("composer-2.5".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn merge_agent_presets_file_model_merges_with_builtin_role() {
+        let mut file = HashMap::new();
+        file.insert(
+            "coder".to_string(),
+            AgentPreset {
+                role: None,
+                command: None,
+                model: Some("composer-2.5".to_string()),
+            },
+        );
+        let merged = merge_agent_presets(file);
+        let coder = merged.get("coder").expect("coder preset");
+        assert_eq!(coder.role.as_deref(), Some("coder"));
+        assert_eq!(coder.model.as_deref(), Some("composer-2.5"));
+    }
+
+    #[test]
+    fn file_config_model_reaches_apply_spawn_preset() {
+        let file: FileConfig = toml::from_str(
+            r#"
+[agents.coder]
+model = "composer-2.5"
+"#,
+        )
+        .unwrap();
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            orchestration_enabled: true,
+            agent_pane_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
+            agent_presets: merge_agent_presets(file.agents),
+        };
+
+        let preset = config.apply_spawn_preset("coder", None, None, None);
+        assert_eq!(preset.model.as_deref(), Some("composer-2.5"));
     }
 
     #[test]
@@ -1147,11 +1220,12 @@ role = "implementer"
             agent_presets: default_agent_presets(),
         };
 
-        let (role, command) = config.apply_spawn_preset("reviewer", None, None);
-        assert_eq!(role.as_deref(), Some("reviewer"));
-        assert_eq!(command, None);
+        let preset = config.apply_spawn_preset("reviewer", None, None, None);
+        assert_eq!(preset.role.as_deref(), Some("reviewer"));
+        assert_eq!(preset.command, None);
+        assert_eq!(preset.model, None);
 
-        let launch = config.resolve_spawn_command(command.as_deref());
+        let launch = config.resolve_spawn_command(preset.command.as_deref());
         assert_eq!(launch.command, "opencode acp");
         assert!(launch.acp);
     }
@@ -1164,6 +1238,7 @@ role = "implementer"
             AgentPreset {
                 role: None,
                 command: Some("claude-code-acp".to_string()),
+                model: Some("claude-sonnet".to_string()),
             },
         );
         let presets = merge_agent_presets(file);
@@ -1172,8 +1247,103 @@ role = "implementer"
             Some(&AgentPreset {
                 role: Some("reviewer".to_string()),
                 command: Some("claude-code-acp".to_string()),
+                model: Some("claude-sonnet".to_string()),
             })
         );
+    }
+
+    #[test]
+    fn apply_spawn_preset_includes_model_from_preset() {
+        let mut presets = default_agent_presets();
+        presets.insert(
+            "coder".to_string(),
+            AgentPreset {
+                role: Some("coder".to_string()),
+                command: None,
+                model: Some("composer-2.5".to_string()),
+            },
+        );
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            orchestration_enabled: true,
+            agent_pane_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
+            agent_presets: presets,
+        };
+
+        let preset = config.apply_spawn_preset("coder", None, None, None);
+        assert_eq!(preset.model.as_deref(), Some("composer-2.5"));
+    }
+
+    #[test]
+    fn apply_spawn_preset_explicit_model_overrides_preset() {
+        let mut presets = default_agent_presets();
+        presets.insert(
+            "coder".to_string(),
+            AgentPreset {
+                role: Some("coder".to_string()),
+                command: None,
+                model: Some("from-preset".to_string()),
+            },
+        );
+        let config = Config {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            orchestration_enabled: true,
+            agent_pane_cols: None,
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            working_directory: PathBuf::from("/tmp"),
+            plugin_dir: None,
+            agent_presets: presets,
+        };
+
+        let preset = config.apply_spawn_preset("coder", None, None, Some("from-cli".to_string()));
+        assert_eq!(preset.model.as_deref(), Some("from-cli"));
+    }
+
+    #[test]
+    fn renders_agent_preset_model_in_user_config() {
+        let mut agent_presets = HashMap::new();
+        agent_presets.insert(
+            "coder".to_string(),
+            AgentPreset {
+                role: Some("coder".to_string()),
+                command: None,
+                model: Some("composer-2.5".to_string()),
+            },
+        );
+        let output = render_user_config(&ResolvedUserConfig {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("opencode".to_string()),
+            acp_agent: None,
+            agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            plugin_dir: None,
+            agent_presets,
+        });
+
+        assert!(output.contains("[agents.coder]"));
+        assert!(output.contains("model = \"composer-2.5\""));
     }
 
     #[test]

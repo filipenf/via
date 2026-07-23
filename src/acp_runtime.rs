@@ -42,6 +42,7 @@ pub struct AcpSession {
 pub struct AcpLaunchConfig {
     pub role: Option<String>,
     pub command: String,
+    pub model: Option<String>,
 }
 
 /// External context a [`AcpRuntime::connect`] task needs from the mediator: the
@@ -65,6 +66,7 @@ async fn establish_acp(
     command: &str,
     args: &[&str],
     cwd: &Path,
+    preset_model: Option<&str>,
 ) -> Result<AcpSession> {
     let handshake = async {
         let mut client = AcpClient::spawn(
@@ -97,8 +99,24 @@ async fn establish_acp(
         );
 
         let session = client.new_session(cwd).await?;
-        let model = session.selected_model();
-        tracing::info!(agent_id, session_id = %session.session_id, ?model, "ACP session created");
+        let mut model = session.selected_model();
+        if let Some(desired) = preset_model {
+            let updated = client
+                .set_config_option(&session.session_id, "model", desired)
+                .await?;
+            model = updated
+                .selected_model()
+                .or_else(|| Some(desired.to_string()));
+            tracing::info!(
+                agent_id,
+                session_id = %session.session_id,
+                ?model,
+                desired,
+                "ACP model set from preset"
+            );
+        } else {
+            tracing::info!(agent_id, session_id = %session.session_id, ?model, "ACP session created");
+        }
 
         Ok::<AcpSession, anyhow::Error>(AcpSession {
             client: Arc::new(Mutex::new(client)),
@@ -200,10 +218,11 @@ async fn establish_acp_with_retries(
     program: &str,
     args: &[&str],
     cwd: &Path,
+    preset_model: Option<&str>,
 ) -> Result<AcpSession> {
     let mut last_err = None;
     for attempt in 1..=ACP_HANDSHAKE_MAX_ATTEMPTS {
-        match establish_acp(agent_id, role, program, args, cwd).await {
+        match establish_acp(agent_id, role, program, args, cwd, preset_model).await {
             Ok(session) => return Ok(session),
             Err(err) => {
                 if attempt < ACP_HANDSHAKE_MAX_ATTEMPTS {
@@ -415,6 +434,7 @@ impl AcpRuntime {
         id: String,
         role: Option<String>,
         command: String,
+        model: Option<String>,
         ctx: AcpConnectCtx,
     ) {
         self.expected.lock().await.insert(id.clone());
@@ -423,6 +443,7 @@ impl AcpRuntime {
             AcpLaunchConfig {
                 role: role.clone(),
                 command: command.clone(),
+                model: model.clone(),
             },
         );
         self.connect(id, role, command, ctx);
@@ -434,6 +455,7 @@ impl AcpRuntime {
         let sessions = Arc::clone(&self.sessions);
         let expected = Arc::clone(&self.expected);
         let connecting = Arc::clone(&self.connecting);
+        let launch_configs = Arc::clone(&self.launch_configs);
         let event_sender = ctx.event_sender.clone();
         let ui_commands = ctx.ui_commands.clone();
         let agents_dir = ctx.agents_dir.clone();
@@ -455,7 +477,21 @@ impl AcpRuntime {
                 expected.lock().await.remove(&id);
                 return;
             };
-            match establish_acp_with_retries(&id, &role, program, args, &cwd).await {
+            let preset_model = launch_configs
+                .lock()
+                .await
+                .get(&id)
+                .and_then(|config| config.model.clone());
+            match establish_acp_with_retries(
+                &id,
+                &role,
+                program,
+                args,
+                &cwd,
+                preset_model.as_deref(),
+            )
+            .await
+            {
                 Ok(session) => {
                     // Serialize with `TerminateAgent`, which removes `id` from `expected`
                     // and `acp_sessions` while holding the `acp_sessions` lock. If the user
@@ -849,6 +885,135 @@ mod tests {
         )
         .unwrap();
         assert!(!recipient_is_acp_via_expected(&expected, &agents_dir, "agent").await,);
+
+        std::fs::remove_dir_all(&agents_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn establish_acp_applies_preset_model() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("via-acp-establish-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("mock_acp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_test","configOptions":[{"id":"model","currentValue":"default-model"}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","currentValue":"composer-2.5"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let session = establish_acp(
+            "coder",
+            "coder",
+            script.to_str().unwrap(),
+            &[],
+            Path::new("/tmp"),
+            Some("composer-2.5"),
+        )
+        .await
+        .expect("establish with preset model");
+
+        assert_eq!(session.session_id, "sess_test");
+        assert_eq!(session.model.as_deref(), Some("composer-2.5"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn establish_acp_without_preset_keeps_new_session_model() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "via-acp-establish-default-model-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("mock_acp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_test","configOptions":[{"id":"model","currentValue":"agent-default"}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let session = establish_acp(
+            "coder",
+            "coder",
+            script.to_str().unwrap(),
+            &[],
+            Path::new("/tmp"),
+            None,
+        )
+        .await
+        .expect("establish without preset model");
+
+        assert_eq!(session.model.as_deref(), Some("agent-default"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn register_spawn_stores_model_in_launch_config() {
+        let rt = AcpRuntime::new();
+        let delivery = AgentDelivery::new();
+        let agents_dir = temp_dir("launch-model");
+        let (ui_tx, _ui_rx) = mpsc::channel::<UiCommand>(8);
+        let ctx = AcpConnectCtx {
+            pending: delivery.pending_arc(),
+            agents_dir: agents_dir.clone(),
+            cwd: PathBuf::from("/tmp"),
+            event_sender: None,
+            ui_commands: ui_tx,
+        };
+
+        rt.register_spawn(
+            "coder".to_string(),
+            Some("coder".to_string()),
+            "false acp".to_string(),
+            Some("composer-2.5".to_string()),
+            ctx,
+        )
+        .await;
+
+        assert_eq!(
+            rt.launch_configs_arc()
+                .lock()
+                .await
+                .get("coder")
+                .map(|launch| launch.model.clone()),
+            Some(Some("composer-2.5".to_string()))
+        );
 
         std::fs::remove_dir_all(&agents_dir).ok();
     }
