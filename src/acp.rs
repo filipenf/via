@@ -83,6 +83,16 @@ struct ConfigOption {
     id: String,
     #[serde(default)]
     current_value: Option<String>,
+    #[serde(default)]
+    options: Vec<ConfigOptionChoice>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConfigOptionChoice {
+    value: String,
+    #[serde(default)]
+    name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +115,69 @@ impl NewSessionResult {
     pub fn selected_model(&self) -> Option<String> {
         selected_config_value(&self.config_options, "model")
     }
+
+    /// Map a user-facing model slug (e.g. `composer-2.5` from `agent models`) to the
+    /// ACP `session/set_config_option` value when the agent exposes a select list.
+    pub fn resolve_model_value(&self, desired: &str) -> Option<String> {
+        resolve_model_config_value(&self.config_options, desired)
+    }
+}
+
+fn model_option_base(value: &str) -> &str {
+    value.split('[').next().unwrap_or(value)
+}
+
+/// Resolve a preset slug against `session/new` model options.
+fn resolve_model_config_value(options: &[ConfigOption], desired: &str) -> Option<String> {
+    let model_option = options.iter().find(|option| option.id == "model")?;
+    let choices = &model_option.options;
+    if choices.is_empty() {
+        return Some(desired.to_string());
+    }
+
+    if choices.iter().any(|choice| choice.value == desired) {
+        return Some(desired.to_string());
+    }
+
+    if let Some(choice) = choices
+        .iter()
+        .find(|choice| choice.name.as_deref() == Some(desired))
+    {
+        return Some(choice.value.clone());
+    }
+
+    if let Some(choice) = choices
+        .iter()
+        .find(|choice| model_option_base(&choice.value) == desired)
+    {
+        return Some(choice.value.clone());
+    }
+
+    let desired_lower = desired.to_ascii_lowercase();
+    if let Some(choice) = choices.iter().find(|choice| {
+        choice
+            .name
+            .as_ref()
+            .is_some_and(|name| name.to_ascii_lowercase() == desired_lower)
+    }) {
+        return Some(choice.value.clone());
+    }
+
+    if let Some(base) = desired.strip_suffix("-fast") {
+        if let Some(choice) = choices.iter().find(|choice| {
+            model_option_base(&choice.value) == base && choice.value.contains("fast=true")
+        }) {
+            return Some(choice.value.clone());
+        }
+        if let Some(choice) = choices
+            .iter()
+            .find(|choice| model_option_base(&choice.value) == base)
+        {
+            return Some(choice.value.clone());
+        }
+    }
+
+    None
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -864,6 +937,49 @@ mod tests {
         assert_eq!(
             result.selected_model().as_deref(),
             Some("lemonade/Gemma-4-26B-A4B-it-GGUF")
+        );
+    }
+
+    #[test]
+    fn resolve_model_value_maps_cli_slug_to_agent_acp_id() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "composer-2.5[fast=true]",
+                "options": [
+                    {"value": "default[]", "name": "Auto"},
+                    {"value": "composer-2.5[fast=true]", "name": "composer-2.5"},
+                    {"value": "gpt-5.3-codex[reasoning=medium,fast=false]", "name": "gpt-5.3-codex"}
+                ]
+            }]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+        assert_eq!(
+            result.resolve_model_value("composer-2.5").as_deref(),
+            Some("composer-2.5[fast=true]")
+        );
+        assert_eq!(
+            result.resolve_model_value("gpt-5.3-codex").as_deref(),
+            Some("gpt-5.3-codex[reasoning=medium,fast=false]")
+        );
+        assert_eq!(result.resolve_model_value("unknown-model"), None);
+    }
+
+    #[test]
+    fn resolve_model_value_passes_through_when_no_options() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [
+                {"id": "model", "currentValue": "opencode/deepseek-v4-flash-free"}
+            ]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+        assert_eq!(
+            result
+                .resolve_model_value("opencode/deepseek-v4-flash-free")
+                .as_deref(),
+            Some("opencode/deepseek-v4-flash-free")
         );
     }
 

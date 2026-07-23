@@ -101,17 +101,24 @@ async fn establish_acp(
         let session = client.new_session(cwd).await?;
         let mut model = session.selected_model();
         if let Some(desired) = preset_model {
+            let resolved = session.resolve_model_value(desired).ok_or_else(|| {
+                anyhow!(
+                    "model preset '{desired}' is not available from this ACP agent; \
+                     check the agent's model list or use an exact session/new option value"
+                )
+            })?;
             let updated = client
-                .set_config_option(&session.session_id, "model", desired)
+                .set_config_option(&session.session_id, "model", &resolved)
                 .await?;
             model = updated
                 .selected_model()
-                .or_else(|| Some(desired.to_string()));
+                .or_else(|| Some(resolved.clone()));
             tracing::info!(
                 agent_id,
                 session_id = %session.session_id,
                 ?model,
                 desired,
+                resolved,
                 "ACP model set from preset"
             );
         } else {
