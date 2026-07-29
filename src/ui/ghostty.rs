@@ -39,7 +39,7 @@ mod pane;
 mod pane_controller;
 mod render;
 
-use acp_modal::{AcpModalState, render_acp_modal_buffer};
+use acp_modal::{AcpModalQueue, AcpModalState, render_acp_modal_buffer};
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers};
@@ -134,7 +134,7 @@ struct WinitGhosttyApp {
     panes: Vec<AppPane>,
     review_pane: Option<TerminalPaneController>,
     review_active: bool,
-    acp_modal: Option<AcpModalState>,
+    acp_modal: AcpModalQueue,
     /// Control-plane bridges for PTY-hosted `via --acp-tui` panes (keyed by agent id).
     acp_tui_bridges: HashMap<String, AcpTuiBridge>,
     active_pane: usize,
@@ -400,7 +400,7 @@ impl WinitGhosttyApp {
             panes: Vec::new(),
             review_pane: None,
             review_active: false,
-            acp_modal: None,
+            acp_modal: AcpModalQueue::new(),
             acp_tui_bridges: HashMap::new(),
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
@@ -665,13 +665,7 @@ impl WinitGhosttyApp {
             index,
             self.panes.len(),
         );
-        if self
-            .acp_modal
-            .as_ref()
-            .is_some_and(|modal| modal.agent_id == id)
-        {
-            self.acp_modal = None;
-        }
+        self.acp_modal.remove_agent(id);
 
         self.relayout();
         self.write_agent_registry();
@@ -942,29 +936,42 @@ impl WinitGhosttyApp {
     }
 
     fn send_acp_handshake_action(&mut self, agent_id: String, action: AcpHandshakeAction) {
-        self.acp_modal = None;
+        self.acp_modal.resolve();
         self.events
             .try_send(Event::Ui(UiEvent::AcpHandshakeAction { agent_id, action }));
     }
 
     fn handle_acp_modal_winit_key(&mut self, event: &KeyEvent) -> bool {
-        let Some(modal) = &mut self.acp_modal else {
+        if self.acp_modal.is_empty() {
             return false;
-        };
+        }
         if self.modifiers.ctrl || self.modifiers.super_key {
             return false;
         }
         let PhysicalKey::Code(code) = event.physical_key else {
             return false;
         };
-        if modal.kind == AcpModalKind::HandshakeRetry {
+        if code == KeyCode::Tab {
+            if self.modifiers.shift {
+                self.acp_modal.prev();
+            } else {
+                self.acp_modal.next();
+            }
+            return true;
+        }
+        let kind = self.acp_modal.active().map(|m| m.kind.clone());
+        let Some(kind) = kind else {
+            return false;
+        };
+        if kind == AcpModalKind::HandshakeRetry {
             match code {
                 KeyCode::Escape => {
-                    let agent_id = modal.agent_id.clone();
+                    let agent_id = self.acp_modal.active().unwrap().agent_id.clone();
                     self.send_acp_handshake_action(agent_id, AcpHandshakeAction::Dismiss);
                     true
                 }
                 KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let modal = self.acp_modal.active().unwrap();
                     let agent_id = modal.agent_id.clone();
                     let option_id = modal
                         .options
@@ -979,11 +986,11 @@ impl WinitGhosttyApp {
                     true
                 }
                 KeyCode::ArrowUp => {
-                    modal.move_focus(-1);
+                    self.acp_modal.active_mut().unwrap().move_focus(-1);
                     true
                 }
                 KeyCode::ArrowDown => {
-                    modal.move_focus(1);
+                    self.acp_modal.active_mut().unwrap().move_focus(1);
                     true
                 }
                 KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_handshake_select_digit(0),
@@ -993,10 +1000,11 @@ impl WinitGhosttyApp {
         } else {
             match code {
                 KeyCode::Escape => {
+                    let modal = self.acp_modal.active().unwrap();
                     let agent_id = modal.agent_id.clone();
                     let id = modal.jsonrpc_id.clone();
                     let result = modal.result_cancelled();
-                    self.acp_modal = None;
+                    self.acp_modal.resolve();
                     self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
                         agent_id,
                         id,
@@ -1005,10 +1013,12 @@ impl WinitGhosttyApp {
                     true
                 }
                 KeyCode::Enter | KeyCode::NumpadEnter => {
+                    let modal = self.acp_modal.active().unwrap();
                     let agent_id = modal.agent_id.clone();
                     let id = modal.jsonrpc_id.clone();
-                    let result = modal.result_for_selection(modal.focused);
-                    self.acp_modal = None;
+                    let focused = modal.focused;
+                    let result = modal.result_for_selection(focused);
+                    self.acp_modal.resolve();
                     self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
                         agent_id,
                         id,
@@ -1017,11 +1027,11 @@ impl WinitGhosttyApp {
                     true
                 }
                 KeyCode::ArrowUp => {
-                    modal.move_focus(-1);
+                    self.acp_modal.active_mut().unwrap().move_focus(-1);
                     true
                 }
                 KeyCode::ArrowDown => {
-                    modal.move_focus(1);
+                    self.acp_modal.active_mut().unwrap().move_focus(1);
                     true
                 }
                 KeyCode::Digit1 | KeyCode::Numpad1 => self.acp_modal_select_digit(0),
@@ -1039,7 +1049,7 @@ impl WinitGhosttyApp {
     }
 
     fn acp_handshake_select_digit(&mut self, index: usize) -> bool {
-        let Some(modal) = &self.acp_modal else {
+        let Some(modal) = self.acp_modal.active() else {
             return false;
         };
         if modal.kind != AcpModalKind::HandshakeRetry {
@@ -1058,7 +1068,7 @@ impl WinitGhosttyApp {
     }
 
     fn acp_modal_select_digit(&mut self, index: usize) -> bool {
-        let Some(modal) = &mut self.acp_modal else {
+        let Some(modal) = self.acp_modal.active() else {
             return false;
         };
         if index >= modal.options.len() {
@@ -1067,7 +1077,7 @@ impl WinitGhosttyApp {
         let agent_id = modal.agent_id.clone();
         let id = modal.jsonrpc_id.clone();
         let result = modal.result_for_selection(index);
-        self.acp_modal = None;
+        self.acp_modal.resolve();
         self.events.try_send(Event::Ui(UiEvent::AcpJsonRpcResult {
             agent_id,
             id,
@@ -1077,7 +1087,7 @@ impl WinitGhosttyApp {
     }
 
     fn handle_key_event(&mut self, event: KeyEvent) -> Result<()> {
-        if self.acp_modal.is_some()
+        if !self.acp_modal.is_empty()
             && event.state == ElementState::Pressed
             && self.handle_acp_modal_winit_key(&event)
         {
@@ -1242,7 +1252,7 @@ impl WinitGhosttyApp {
     }
 
     fn handle_text_commit(&mut self, text: &str) -> Result<()> {
-        if self.acp_modal.is_some() {
+        if !self.acp_modal.is_empty() {
             return Ok(());
         }
         if self.panes.is_empty() {
@@ -1571,7 +1581,7 @@ impl WinitGhosttyApp {
             }
         }
 
-        if let Some(ref modal) = self.acp_modal {
+        if let Some(modal) = self.acp_modal.active() {
             let m = self.terminal_config.metrics;
             let cols = (self.width / m.cell_width).min(u16::MAX as usize) as u16;
             let rows = (self.height / m.cell_height).min(u16::MAX as usize) as u16;
@@ -1581,6 +1591,7 @@ impl WinitGhosttyApp {
                     cols,
                     rows,
                     self.terminal_config.theme.background,
+                    self.acp_modal.pending_count(),
                 );
                 redrawn |= draw_ratatui_buffer(
                     &mb,
@@ -1777,7 +1788,7 @@ impl WinitGhosttyApp {
                     options,
                     kind,
                 } => {
-                    self.acp_modal = Some(AcpModalState::new(
+                    self.acp_modal.push(AcpModalState::new(
                         agent_id, jsonrpc_id, title, message, options, kind,
                     ));
                 }
