@@ -266,6 +266,67 @@ Key invariants the tests and benches protect:
 If you're touching layout math or the main reference scanner, please add or
 update a benchmark.
 
+## Manual testing: mock ACP agent
+
+The `mock_acp_agent` cargo example is a controllable fake ACP agent for
+exercising the permission modal queue UX (pending badge, Tab/Shift+Tab
+navigation, FIFO drain, terminate-with-pending) without a real backend.
+
+Build the runnable example binary (the test target has a hashed filename):
+
+```sh
+cargo build --example mock_acp_agent
+```
+
+Spawn it as an ACP pane (use an absolute path; the trailing `acp` token is
+required so via classifies the pane as ACP, not PTY):
+
+```sh
+via agent spawn --id mock1 --command "$(pwd)/target/debug/examples/mock_acp_agent acp"
+```
+
+After handshake, the mock prints an interactive menu in the ACP pane transcript.
+Type commands directly in the ACP TUI pane, or send the same text with
+`via agent send --to mock1 -m '<command>'` (both arrive as `session/prompt` once
+the spawn command is ACP-classified).
+
+Commands:
+
+- `1` or `burst [N] [delay_ms]` — fire N permission modals concurrently; the
+  prompt stays pending until all complete.
+- `2` or `drip [N] [delay_ms]` — one modal at a time; the next starts only after
+  the previous fake command finishes (reproduces a modal arriving while another
+  is on screen).
+- `help` — show the menu again.
+
+Omitted `N` and `delay_ms` use clap defaults (`--requests`, default 3;
+`--delay-ms`, default 0). Unknown or malformed input prints a concise
+help/error transcript and ends the turn without firing requests.
+
+Each fake command emits a full tool-call lifecycle: `tool_call` pending →
+`session/request_permission` → (after the user answers) `in_progress` →
+`completed` or a terminal failure — nothing is executed on the host.
+Fake commands use `demo-command-<n> --not-auto-approved` in tool metadata so
+via's auto-approve policy does not skip the modal. Each resolution is echoed as
+an `agent_message_chunk` transcript line
+(`mock: request <toolCallId> resolved -> <optionId|cancelled>`). Tool-call and
+message IDs increase monotonically across repeated prompts; a second drip is
+rejected while one is active. `session/cancel` cancels in-flight fake tool calls
+and completes the prompt with `stopReason=cancelled`.
+
+**UX checklist** when testing manually:
+
+1. `burst` or `burst 3`: modal shows `(+2 pending)` badge; Tab/Shift+Tab
+   cycles without answering; answering drains FIFO and echoes resolve lines;
+   prompt stays pending until all N complete.
+2. `drip 3`: first modal visible; after answering (and fake tool completion), the
+   next appears (exercises queue push while UI is active).
+3. Retrigger `burst` after a burst: new modals get fresh monotonic tool-call IDs.
+4. Start `drip` while a drip is active: transcript shows rejection, no new modals.
+5. Cancel (`session/cancel` / pane cancel): in-flight fake tool calls terminalize;
+   prompt completes with `stopReason=cancelled`.
+6. Terminate the pane with pending modals: queue clears without hanging.
+
 ## Submitting a pull request
 
 1. Fork the repo and create a topic branch.

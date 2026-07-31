@@ -242,6 +242,9 @@ pub enum AcpAgentEvent {
     },
 }
 
+// This is a low-frequency event envelope; boxing the ACP payload would add
+// indirection at every routing site for a lint-only size improvement.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
     OutputChunk(String),

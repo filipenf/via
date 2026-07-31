@@ -11,8 +11,14 @@ human-facing README.
 ```bash
 bash scripts/test-nvim.sh   # headless Neovim Lua tests
 cargo test                  # Rust unit tests
+cargo test --examples       # mock ACP agent example tests
 mise fmt-fix
 ```
+
+For manual ACP modal queue UX testing, run `cargo build --example
+mock_acp_agent` first, then build and spawn
+`examples/mock_acp_agent acp` (typed SDK agent; trailing `acp` required for ACP
+classification) — see CONTRIBUTING.md "Manual testing: mock ACP agent".
 
 ### Stress-test parallel-sensitive Rust tests
 
