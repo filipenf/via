@@ -2,9 +2,6 @@
 name = "via"
 version = "0.12.0"
 edition = "2024"
-# MSRV build floor, set by libghostty-vt (requires 1.93); other deps need >= 1.86.
-# Note: clippy.toml's msrv deliberately lags (see its comment) — it governs lint
-# behavior, not buildability.
 rust-version = "1.93"
 
 [dependencies]

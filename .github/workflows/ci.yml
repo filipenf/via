@@ -119,6 +119,78 @@ jobs:
       - name: cargo test --locked
         run: cargo test --locked
 
+  msrv:
+    name: msrv (Rust 1.93)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.93
+        uses: dtolnay/rust-toolchain@1.93
+
+      - name: Install Zig
+        uses: jdx/mise-action@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo check --locked
+        run: cargo check --locked
+
+  macos:
+    name: macOS (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Zig
+        uses: jdx/mise-action@v2
+
+      # Git is preinstalled on GitHub-hosted macOS runners. Both Git and the
+      # pinned Zig version are required by libghostty-vt's build.
+      - name: Verify build dependencies
+        run: |
+          test "$(zig version)" = "0.15.2"
+          git --version
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo test --locked
+        run: cargo test --locked
+
+      - name: cargo build --locked --release
+        run: cargo build --locked --release
+
   # Optional heavyweight compile check (release) so PRs catch build breaks
   # even if they don't touch the expensive ghostty bits in normal test/clippy.
   # This job is allowed to be slow; it does not block if you prefer to drop it.
