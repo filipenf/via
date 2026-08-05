@@ -74,19 +74,7 @@ pub struct Cli {
     #[arg(long = "socket")]
     pub socket: Option<std::path::PathBuf>,
 
-    /// Run the remote helper daemon (detachable PTY session authority). Does not start the GUI.
-    #[arg(long = "remote-serve")]
-    pub remote_serve: bool,
-
-    /// Bridge stdio to the remote helper control socket (SSH pipe target). Does not start the GUI.
-    #[arg(long = "remote-proxy")]
-    pub remote_proxy: bool,
-
-    /// Keep `--remote-serve` in the foreground (no double-fork daemonize).
-    #[arg(long = "remote-foreground")]
-    pub remote_foreground: bool,
-
-    /// Control socket for `--remote-serve` / `--remote-proxy`
+    /// Control socket the GUI attaches to with `--remote`.
     /// (default: `$XDG_DATA_HOME/via/remote/control.sock`).
     #[arg(long = "remote-socket")]
     pub remote_socket: Option<std::path::PathBuf>,
@@ -108,20 +96,20 @@ pub struct Cli {
 
 impl Cli {
     /// Fold `via remote <host>` into the same fields as `via --remote <host>`.
+    ///
+    /// Only clears `command` when it is `Remote`. Using `take()` inside `if let` would
+    /// discard every other subcommand (`task`, `agent`, …) and fall through to the GUI.
     pub fn apply_remote_subcommand_alias(&mut self) {
-        if let Some(Command::Remote { host }) = self.command.take() {
-            if self.remote.is_none() {
-                self.remote = Some(host);
-            }
+        let Some(Command::Remote { host }) = &self.command else {
+            return;
+        };
+        if self.remote.is_none() {
+            self.remote = Some(host.clone());
         }
+        self.command = None;
     }
 
     pub fn config_overrides(&self) -> crate::config::ConfigOverrides {
-        let remote = self.remote.as_ref().map(|host| crate::config::RemoteMode {
-            host: host.clone(),
-            cwd: self.cwd.clone(),
-            socket: self.remote_socket.clone(),
-        });
         crate::config::ConfigOverrides {
             nvim: self.nvim.clone(),
             agent: self.agent.clone(),
@@ -132,7 +120,18 @@ impl Cli {
             plugin_dir: self.plugin_dir.clone(),
             agent_presets: Default::default(),
             auto_approve: Default::default(),
-            remote,
+        }
+    }
+
+    /// Local vs remote attach mode for this process launch.
+    pub fn attach_mode(&self) -> crate::config::AttachMode {
+        match &self.remote {
+            Some(host) => crate::config::AttachMode::Remote {
+                host: host.clone(),
+                cwd: self.cwd.clone(),
+                socket: self.remote_socket.clone(),
+            },
+            None => crate::config::AttachMode::Local,
         }
     }
 
@@ -144,16 +143,6 @@ impl Cli {
             demo: self.demo,
             no_input: self.no_input,
             socket: self.socket.clone(),
-        }
-    }
-
-    /// Options for [`crate::remote::run`] when `--remote-serve` / `--remote-proxy` is set.
-    pub fn remote_args(&self) -> crate::remote::Args {
-        crate::remote::Args {
-            serve: self.remote_serve,
-            proxy: self.remote_proxy,
-            foreground: self.remote_foreground,
-            socket: self.remote_socket.clone(),
         }
     }
 }
@@ -191,6 +180,8 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Agent { command } => agent::run(command),
         Command::Plugin { command } => plugin::run(command),
         Command::Task { command } => task::run(command),
+        // Defensive — `via remote <host>` is normally rewritten to `--remote` by
+        // `apply_remote_subcommand_alias` before headless dispatch in `lib.rs`.
         Command::Remote { .. } => {
             anyhow::bail!("via remote is a GUI attach alias; use `via --remote <host>`")
         }
@@ -503,37 +494,12 @@ mod tests {
 
     #[test]
     fn parses_remote_helper_flags() {
-        let cli = Cli::try_parse_from([
-            "via",
-            "--remote-serve",
-            "--remote-foreground",
-            "--remote-socket",
-            "/tmp/via-remote.sock",
-        ])
-        .unwrap();
-        assert!(cli.remote_serve);
-        assert!(cli.remote_foreground);
-        assert_eq!(
-            cli.remote_socket.as_deref(),
-            Some(std::path::Path::new("/tmp/via-remote.sock"))
-        );
-        let args = cli.remote_args();
-        assert!(args.serve);
-        assert!(args.foreground);
-        assert!(args.wants_early_dispatch());
-
-        let proxy = Cli::try_parse_from(["via", "--remote-proxy"]).unwrap();
-        assert!(proxy.remote_proxy);
-        assert!(proxy.remote_args().wants_early_dispatch());
-
-        let host = Cli::try_parse_from(["via", "--remote", "codespace"]).unwrap();
-        assert_eq!(host.remote.as_deref(), Some("codespace"));
-        assert!(!host.remote_args().wants_early_dispatch());
-        let overrides = host.config_overrides();
-        assert_eq!(
-            overrides.remote.as_ref().map(|r| r.host.as_str()),
-            Some("codespace")
-        );
+        let host = Cli::try_parse_from(["via", "--remote", "devbox"]).unwrap();
+        assert_eq!(host.remote.as_deref(), Some("devbox"));
+        assert!(matches!(
+            host.attach_mode(),
+            crate::config::AttachMode::Remote { ref host, .. } if host == "devbox"
+        ));
 
         let with_cwd = Cli::try_parse_from([
             "via",
@@ -545,38 +511,64 @@ mod tests {
             "/tmp/c.sock",
         ])
         .unwrap();
-        let remote = with_cwd.config_overrides().remote.unwrap();
-        assert_eq!(remote.host, "local");
-        assert_eq!(
-            remote.cwd.as_deref(),
-            Some(std::path::Path::new("/tmp/proj"))
-        );
-        assert_eq!(
-            remote.socket.as_deref(),
-            Some(std::path::Path::new("/tmp/c.sock"))
-        );
+        match with_cwd.attach_mode() {
+            crate::config::AttachMode::Remote { host, cwd, socket } => {
+                assert_eq!(host, "local");
+                assert_eq!(cwd.as_deref(), Some(std::path::Path::new("/tmp/proj")));
+                assert_eq!(socket.as_deref(), Some(std::path::Path::new("/tmp/c.sock")));
+            }
+            crate::config::AttachMode::Local => panic!("expected remote attach"),
+        }
     }
 
     #[test]
     fn remote_subcommand_aliases_to_remote_flag() {
-        let mut cli = Cli::try_parse_from(["via", "remote", "codespace"]).unwrap();
+        let mut cli = Cli::try_parse_from(["via", "remote", "devbox"]).unwrap();
         assert!(cli.remote.is_none());
         assert!(matches!(cli.command, Some(Command::Remote { .. })));
         cli.apply_remote_subcommand_alias();
-        assert_eq!(cli.remote.as_deref(), Some("codespace"));
+        assert_eq!(cli.remote.as_deref(), Some("devbox"));
         assert!(cli.command.is_none());
-        assert_eq!(
-            cli.config_overrides()
-                .remote
-                .as_ref()
-                .map(|r| r.host.as_str()),
-            Some("codespace")
-        );
+        assert!(matches!(
+            cli.attach_mode(),
+            crate::config::AttachMode::Remote { ref host, .. } if host == "devbox"
+        ));
 
         // Flag wins if both are present after parse + alias.
         let mut both = Cli::try_parse_from(["via", "--remote", "a", "remote", "b"]).unwrap();
         both.apply_remote_subcommand_alias();
         assert_eq!(both.remote.as_deref(), Some("a"));
+        assert!(matches!(
+            both.attach_mode(),
+            crate::config::AttachMode::Remote { ref host, .. } if host == "a"
+        ));
+    }
+
+    #[test]
+    fn remote_alias_preserves_other_subcommands() {
+        // Regression: `command.take()` inside `if let Some(Remote)` discarded `task` /
+        // `agent` / … and made `<leader>at` / `via task list` open a new GUI window.
+        let mut task = Cli::try_parse_from(["via", "task", "list", "--json"]).unwrap();
+        task.apply_remote_subcommand_alias();
+        assert!(matches!(
+            task.command,
+            Some(Command::Task {
+                command: TaskCommand::List {
+                    json: true,
+                    status: None,
+                    assignee: None,
+                },
+            })
+        ));
+
+        let mut agent = Cli::try_parse_from(["via", "agent", "whoami"]).unwrap();
+        agent.apply_remote_subcommand_alias();
+        assert!(matches!(
+            agent.command,
+            Some(Command::Agent {
+                command: AgentCommand::Whoami { json: false },
+            })
+        ));
     }
 
     #[test]

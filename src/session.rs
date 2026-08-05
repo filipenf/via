@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{self, Config};
+use crate::config::{self, AppContext};
 
 const MANIFEST_BASENAME: &str = "session.json";
 const INSTANCES_DIR: &str = "instances";
@@ -39,18 +39,18 @@ pub struct SessionManifest {
 }
 
 impl SessionManifest {
-    fn from_config(config: &Config) -> Self {
-        let workspace = crate::workspace::workspace_for_cwd(&config.working_directory).ok();
+    fn from_app(app: &AppContext) -> Self {
+        let workspace = crate::workspace::workspace_for_cwd(&app.launch.working_directory).ok();
         let board_id = workspace
             .as_ref()
             .and_then(|ws| crate::workspace::ensure_active_board(ws).ok());
         Self {
             pid: std::process::id(),
-            cwd: config.working_directory.clone(),
-            nvim_socket: config.nvim_socket_path.clone(),
-            editor_socket: config.editor_socket_path.clone(),
-            agents_dir: config.agents_dir.clone(),
-            orchestration_enabled: config.orchestration_enabled,
+            cwd: app.launch.working_directory.clone(),
+            nvim_socket: app.paths.nvim_socket_path.clone(),
+            editor_socket: app.paths.editor_socket_path.clone(),
+            agents_dir: app.paths.agents_dir.clone(),
+            orchestration_enabled: app.launch.orchestration_enabled,
             workspace_id: workspace.map(|ws| ws.id),
             board_id,
             started_at_unix: crate::util::unix_seconds_now(),
@@ -67,8 +67,8 @@ pub struct SessionGuard {
 }
 
 impl SessionGuard {
-    pub fn create(config: &Config) -> Result<Self> {
-        let manifest = SessionManifest::from_config(config);
+    pub fn create(app: &AppContext) -> Result<Self> {
+        let manifest = SessionManifest::from_app(app);
         let instance_dir = config::instance_dir(std::process::id());
         fs::create_dir_all(&instance_dir)
             .with_context(|| format!("create instance directory {}", instance_dir.display()))?;

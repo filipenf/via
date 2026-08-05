@@ -97,29 +97,19 @@ pub struct AutoApproveConfig {
     pub kinds: Vec<String>,
 }
 
+/// Durable / preference surface (`via.conf` + CLI/env preference overrides).
 #[derive(Debug, Clone)]
-pub struct Config {
+pub struct UserConfig {
     pub nvim_command: String,
     /// Primary interactive agent (always launched as a PTY pane; must not end with `acp`).
     pub agent_command: Option<String>,
     /// Explicit ACP launch override for unknown agents (e.g. `claude-code-acp`).
     pub acp_agent: Option<String>,
-    /// True when the configured agent can be launched in ACP form for spawned helpers
-    /// (known-agent table or `acp_agent` override). Does not upgrade the primary pane.
-    pub orchestration_enabled: bool,
     /// Agent pane width bounds in terminal columns (vertical split only).
-    pub agent_pane_cols: Option<AgentPaneCols>,
+    pub agent_pane_cols: AgentPaneCols,
     pub review_backend: ReviewBackend,
     /// Mouse wheel sensitivity multiplier; higher scrolls faster, lower slower.
     pub scroll_sensitivity: f32,
-    pub nvim_socket_path: PathBuf,
-    pub editor_socket_path: PathBuf,
-    /// Per-process directory holding the agent registry and per-agent mailboxes.
-    pub agents_dir: PathBuf,
-    pub nvim_context_bridge_path: PathBuf,
-    pub nvim_via_module_path: PathBuf,
-    pub lsp_bridge_socket_path: PathBuf,
-    pub working_directory: PathBuf,
     /// Optional local directory holding a user plugin (extra skills/agents/workflows),
     /// overlaid on top of the embedded base skills at install time.
     pub plugin_dir: Option<PathBuf>,
@@ -127,18 +117,60 @@ pub struct Config {
     pub agent_presets: HashMap<String, AgentPreset>,
     /// ACP permission auto-approve extensions (built-in allows always on).
     pub auto_approve: AutoApproveConfig,
-    /// When set, pane PTYs are owned by a remote helper (`via --remote <host>`).
-    pub remote: Option<RemoteMode>,
 }
 
-/// Local GUI attached to a remote helper session.
+/// Per-instance wiring (env/`VIA_*` or defaults under the runtime root).
+#[derive(Debug, Clone)]
+pub struct RuntimePaths {
+    pub nvim_socket_path: PathBuf,
+    pub editor_socket_path: PathBuf,
+    /// Per-process directory holding the agent registry and per-agent mailboxes.
+    pub agents_dir: PathBuf,
+    pub nvim_context_bridge_path: PathBuf,
+    pub nvim_via_module_path: PathBuf,
+    pub lsp_bridge_socket_path: PathBuf,
+}
+
+/// How this process was started (not persisted to `via.conf`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteMode {
-    pub host: String,
-    /// Working directory on the remote host for spawned panes.
-    pub cwd: Option<PathBuf>,
-    /// Optional control socket override (also used for `host=local` / `VIA_REMOTE_SOCKET`).
-    pub socket: Option<PathBuf>,
+pub enum AttachMode {
+    Local,
+    /// Local GUI attached to a remote helper (`via --remote <host>` / `via remote <host>`).
+    Remote {
+        host: String,
+        /// Working directory on the remote host for spawned panes.
+        cwd: Option<PathBuf>,
+        /// Optional control socket override (also used for `host=local` / `VIA_REMOTE_SOCKET`).
+        socket: Option<PathBuf>,
+    },
+}
+
+impl AttachMode {
+    /// Remote helper cwd when attaching; `None` for local or when `--cwd` was omitted.
+    pub fn cwd(&self) -> Option<&PathBuf> {
+        match self {
+            Self::Remote { cwd, .. } => cwd.as_ref(),
+            Self::Local => None,
+        }
+    }
+}
+
+/// Session launch context: cwd, attach mode, and derived orchestration capability.
+#[derive(Debug, Clone)]
+pub struct LaunchContext {
+    pub working_directory: PathBuf,
+    pub attach: AttachMode,
+    /// True when the configured agent can be launched in ACP form for spawned helpers
+    /// (known-agent table or `acp_agent` override). Does not upgrade the primary pane.
+    pub orchestration_enabled: bool,
+}
+
+/// Bundle of user prefs, runtime paths, and launch context for subsystem boundaries.
+#[derive(Debug, Clone)]
+pub struct AppContext {
+    pub user: UserConfig,
+    pub paths: RuntimePaths,
+    pub launch: LaunchContext,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -153,7 +185,6 @@ pub struct ConfigOverrides {
     pub plugin_dir: Option<String>,
     pub agent_presets: HashMap<String, AgentPreset>,
     pub auto_approve: AutoApproveConfig,
-    pub remote: Option<RemoteMode>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,7 +318,6 @@ impl From<FileConfig> for ConfigOverrides {
             plugin_dir: config.plugin_dir,
             agent_presets: config.agents,
             auto_approve: config.auto_approve,
-            remote: None,
         }
     }
 }
@@ -310,13 +340,13 @@ impl ConfigOverrides {
             plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         }
     }
 }
 
+/// Intermediate prefs after CLI/env/file merge (plugin_dir still a string for persist).
 #[derive(Debug, Clone, PartialEq)]
-struct ResolvedUserConfig {
+struct ResolvedPrefs {
     nvim_command: String,
     agent_command: Option<String>,
     acp_agent: Option<String>,
@@ -326,14 +356,13 @@ struct ResolvedUserConfig {
     plugin_dir: Option<String>,
     agent_presets: HashMap<String, AgentPreset>,
     auto_approve: AutoApproveConfig,
-    remote: Option<RemoteMode>,
 }
 
 fn resolve_user_config_from_sources(
     cli: ConfigOverrides,
     env: ConfigOverrides,
     file: ConfigOverrides,
-) -> ResolvedUserConfig {
+) -> ResolvedPrefs {
     let nvim_command = cli
         .nvim
         .or(env.nvim)
@@ -365,9 +394,8 @@ fn resolve_user_config_from_sources(
         .or(env.plugin_dir)
         .or(file.plugin_dir)
         .filter(|s| !s.is_empty());
-    let remote = cli.remote.or(env.remote);
 
-    ResolvedUserConfig {
+    ResolvedPrefs {
         nvim_command,
         agent_command,
         acp_agent,
@@ -380,11 +408,10 @@ fn resolve_user_config_from_sources(
         plugin_dir,
         agent_presets: file.agent_presets,
         auto_approve: file.auto_approve,
-        remote,
     }
 }
 
-fn resolve_user_config(cli: ConfigOverrides) -> AnyResult<ResolvedUserConfig> {
+fn resolve_user_config(cli: ConfigOverrides) -> AnyResult<ResolvedPrefs> {
     let file = config_file_overrides()?;
     let env = ConfigOverrides::from_env();
     Ok(resolve_user_config_from_sources(cli, env, file))
@@ -406,7 +433,7 @@ pub fn persist_resolved(cli: ConfigOverrides) -> AnyResult<PathBuf> {
     Ok(path)
 }
 
-fn render_user_config(config: &ResolvedUserConfig) -> String {
+fn render_user_config(config: &ResolvedPrefs) -> String {
     let mut output = String::new();
     output.push_str(&format!(
         "nvim = \"{}\"\n",
@@ -474,65 +501,71 @@ pub fn reject_acp_primary_agent(agent: &str) -> AnyResult<()> {
     Ok(())
 }
 
-impl Config {
-    pub fn load(cli: ConfigOverrides) -> AnyResult<Self> {
-        let user_config = resolve_user_config(cli)?;
-        let agent_command = user_config.agent_command.clone();
+impl RuntimePaths {
+    fn from_env_or_defaults() -> Self {
+        Self {
+            nvim_socket_path: env::var_os("VIA_NVIM_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_nvim_socket_path),
+            editor_socket_path: env::var_os("VIA_EDITOR_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_editor_socket_path),
+            agents_dir: env::var_os("VIA_AGENTS_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_agents_dir),
+            nvim_context_bridge_path: env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_nvim_context_bridge_path),
+            nvim_via_module_path: env::var_os("VIA_NVIM_VIA_MODULE")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_nvim_via_module_path),
+            lsp_bridge_socket_path: env::var_os("VIA_LSP_BRIDGE_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(default_lsp_bridge_socket_path),
+        }
+    }
+}
+
+impl AppContext {
+    pub fn load(cli: ConfigOverrides, attach: AttachMode) -> AnyResult<Self> {
+        let prefs = resolve_user_config(cli)?;
+        let agent_command = prefs.agent_command.clone();
         if let Some(agent) = agent_command.as_deref() {
             reject_acp_primary_agent(agent)?;
         }
         let orchestration_enabled = agent_command
             .as_deref()
-            .map(|agent| resolve_agent_launch(agent, user_config.acp_agent.as_deref()).acp)
+            .map(|agent| resolve_agent_launch(agent, prefs.acp_agent.as_deref()).acp)
             .unwrap_or(false);
-        let nvim_socket_path = env::var_os("VIA_NVIM_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_nvim_socket_path);
-        let editor_socket_path = env::var_os("VIA_EDITOR_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_editor_socket_path);
-        let agents_dir = env::var_os("VIA_AGENTS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_agents_dir);
-        let nvim_context_bridge_path = env::var_os("VIA_NVIM_CONTEXT_BRIDGE")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_nvim_context_bridge_path);
-        let nvim_via_module_path = env::var_os("VIA_NVIM_VIA_MODULE")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_nvim_via_module_path);
-        let lsp_bridge_socket_path = env::var_os("VIA_LSP_BRIDGE_SOCKET")
-            .map(PathBuf::from)
-            .unwrap_or_else(default_lsp_bridge_socket_path);
-        let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        // Prefer remote cwd for workspace semantics when attached to a helper.
-        let working_directory = user_config
-            .remote
-            .as_ref()
-            .and_then(|r| r.cwd.clone())
-            .unwrap_or(working_directory);
+
+        let local_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let working_directory = attach.cwd().cloned().unwrap_or(local_cwd);
+
+        let user = UserConfig {
+            nvim_command: prefs.nvim_command,
+            agent_command,
+            acp_agent: prefs.acp_agent,
+            agent_pane_cols: prefs.agent_pane_cols,
+            review_backend: prefs.review_backend,
+            scroll_sensitivity: prefs.scroll_sensitivity,
+            plugin_dir: prefs.plugin_dir.map(PathBuf::from),
+            agent_presets: merge_agent_presets(prefs.agent_presets),
+            auto_approve: prefs.auto_approve,
+        };
 
         Ok(Self {
-            nvim_command: user_config.nvim_command,
-            agent_command,
-            acp_agent: user_config.acp_agent,
-            orchestration_enabled,
-            agent_pane_cols: Some(user_config.agent_pane_cols),
-            review_backend: user_config.review_backend,
-            scroll_sensitivity: user_config.scroll_sensitivity,
-            nvim_socket_path,
-            editor_socket_path,
-            agents_dir,
-            nvim_context_bridge_path,
-            nvim_via_module_path,
-            lsp_bridge_socket_path,
-            working_directory,
-            plugin_dir: user_config.plugin_dir.map(PathBuf::from),
-            agent_presets: merge_agent_presets(user_config.agent_presets),
-            auto_approve: user_config.auto_approve,
-            remote: user_config.remote,
+            user,
+            paths: RuntimePaths::from_env_or_defaults(),
+            launch: LaunchContext {
+                working_directory,
+                attach,
+                orchestration_enabled,
+            },
         })
     }
+}
 
+impl UserConfig {
     /// Fill missing spawn `role` / `command` from `[agents.<id>]` presets.
     pub fn apply_spawn_preset(
         &self,
@@ -552,12 +585,7 @@ impl Config {
     /// Column bounds for the agent pane in vertical split mode.
     pub fn agent_pane_col_limits(&self) -> Option<(u16, u16)> {
         self.agent_command.as_ref()?;
-
-        let cols = self.agent_pane_cols.unwrap_or(AgentPaneCols {
-            min: DEFAULT_AGENT_PANE_MIN_COLS,
-            max: DEFAULT_AGENT_PANE_MAX_COLS,
-        });
-        Some((cols.min, cols.max))
+        Some((self.agent_pane_cols.min, self.agent_pane_cols.max))
     }
 
     /// Resolve a spawn command: explicit override, else ACP form of the configured agent.
@@ -777,6 +805,7 @@ fn default_lsp_bridge_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn default_socket_path_is_process_scoped() {
@@ -876,7 +905,6 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -888,7 +916,6 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
         let cli = ConfigOverrides {
             nvim: Some("cli-nvim".to_string()),
@@ -900,7 +927,6 @@ mod tests {
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let config = resolve_user_config_from_sources(cli, env, file);
@@ -928,7 +954,6 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
         let env = ConfigOverrides {
             nvim: Some("env-nvim".to_string()),
@@ -940,7 +965,6 @@ mod tests {
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let config = resolve_user_config_from_sources(ConfigOverrides::default(), env, file);
@@ -969,7 +993,7 @@ mod tests {
 
     #[test]
     fn renders_resolved_user_config() {
-        let output = render_user_config(&ResolvedUserConfig {
+        let output = render_user_config(&ResolvedPrefs {
             nvim_command: "nvim-nightly".to_string(),
             agent_command: Some("opencode acp".to_string()),
             acp_agent: None,
@@ -979,7 +1003,6 @@ mod tests {
             plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         });
 
         assert_eq!(
@@ -1020,25 +1043,19 @@ scroll_sensitivity = 1.5
 
     #[test]
     fn agent_pane_col_limits_default_to_eighty_and_one_hundred() {
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
             acp_agent: None,
-            orchestration_enabled: false,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1046,25 +1063,16 @@ scroll_sensitivity = 1.5
 
     #[test]
     fn agent_pane_col_limits_normalizes_bounds() {
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("agent".to_string()),
             acp_agent: None,
-            orchestration_enabled: false,
-            agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
+            agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         assert_eq!(config.agent_pane_col_limits(), Some((80, 100)));
@@ -1120,7 +1128,7 @@ scroll_sensitivity = 1.5
 
     #[test]
     fn orchestration_available_for_known_agent_without_upgrading_primary() {
-        let user = ResolvedUserConfig {
+        let user = ResolvedPrefs {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
@@ -1130,7 +1138,6 @@ scroll_sensitivity = 1.5
             plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
         let orchestration = user
             .agent_command
@@ -1149,25 +1156,19 @@ scroll_sensitivity = 1.5
 
     #[test]
     fn resolve_spawn_command_defaults_to_acp_for_known_agent() {
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
-            orchestration_enabled: true,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
         let launch = config.resolve_spawn_command(None);
         assert_eq!(launch.command, "opencode acp");
@@ -1286,25 +1287,19 @@ model = "composer-2.5"
 "#,
         )
         .unwrap();
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
-            orchestration_enabled: true,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: merge_agent_presets(file.agents),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1313,25 +1308,19 @@ model = "composer-2.5"
 
     #[test]
     fn apply_spawn_preset_fills_builtin_role() {
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
-            orchestration_enabled: true,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let preset = config.apply_spawn_preset("reviewer", None, None, None);
@@ -1377,25 +1366,19 @@ model = "composer-2.5"
                 model: Some("composer-2.5".to_string()),
             },
         );
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
-            orchestration_enabled: true,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, None);
@@ -1413,25 +1396,19 @@ model = "composer-2.5"
                 model: Some("from-preset".to_string()),
             },
         );
-        let config = Config {
+        let config = UserConfig {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
-            orchestration_enabled: true,
-            agent_pane_cols: None,
+            agent_pane_cols: AgentPaneCols {
+                min: DEFAULT_AGENT_PANE_MIN_COLS,
+                max: DEFAULT_AGENT_PANE_MAX_COLS,
+            },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
             plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         };
 
         let preset = config.apply_spawn_preset("coder", None, None, Some("from-cli".to_string()));
@@ -1449,7 +1426,7 @@ model = "composer-2.5"
                 model: Some("composer-2.5".to_string()),
             },
         );
-        let output = render_user_config(&ResolvedUserConfig {
+        let output = render_user_config(&ResolvedPrefs {
             nvim_command: "nvim".to_string(),
             agent_command: Some("opencode".to_string()),
             acp_agent: None,
@@ -1459,7 +1436,6 @@ model = "composer-2.5"
             plugin_dir: None,
             agent_presets,
             auto_approve: AutoApproveConfig::default(),
-            remote: None,
         });
 
         assert!(output.contains("[agents.coder]"));
@@ -1468,14 +1444,57 @@ model = "composer-2.5"
 
     #[test]
     fn load_rejects_acp_primary_agent() {
-        let err = Config::load(ConfigOverrides {
-            agent: Some("opencode acp".to_string()),
-            ..ConfigOverrides::default()
-        })
+        let err = AppContext::load(
+            ConfigOverrides {
+                agent: Some("opencode acp".to_string()),
+                ..ConfigOverrides::default()
+            },
+            AttachMode::Local,
+        )
         .unwrap_err();
         assert!(
             err.to_string()
                 .contains("primary agent must be a PTY command")
         );
+    }
+
+    #[test]
+    fn load_uses_remote_cwd_for_working_directory() {
+        let app = AppContext::load(
+            ConfigOverrides::default(),
+            AttachMode::Remote {
+                host: "devbox".to_string(),
+                cwd: Some(PathBuf::from("/repo-r")),
+                socket: Some(PathBuf::from("/tmp/c.sock")),
+            },
+        )
+        .expect("load");
+
+        assert_eq!(app.launch.working_directory, PathBuf::from("/repo-r"));
+        match &app.launch.attach {
+            AttachMode::Remote { host, cwd, socket } => {
+                assert_eq!(host, "devbox");
+                assert_eq!(cwd.as_deref(), Some(Path::new("/repo-r")));
+                assert_eq!(socket.as_deref(), Some(Path::new("/tmp/c.sock")));
+            }
+            AttachMode::Local => panic!("expected remote attach"),
+        }
+    }
+
+    #[test]
+    fn load_remote_without_cwd_keeps_local_working_directory() {
+        let local = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let app = AppContext::load(
+            ConfigOverrides::default(),
+            AttachMode::Remote {
+                host: "local".to_string(),
+                cwd: None,
+                socket: None,
+            },
+        )
+        .expect("load");
+
+        assert_eq!(app.launch.working_directory, local);
+        assert!(matches!(app.launch.attach, AttachMode::Remote { .. }));
     }
 }

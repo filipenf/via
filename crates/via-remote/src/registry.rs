@@ -342,8 +342,11 @@ impl SessionRegistry {
         if argv.is_empty() {
             bail!("argv must be non-empty");
         }
-        // Idempotent: host reconnect / spawn_or_attach may re-Spawn an existing id.
+        // Idempotent reconnect: host may re-Spawn an existing id. Still apply the
+        // client's current size so a reattached nvim/agent PTY matches the local VT
+        // (stale cols/rows cause classic alt-screen corruption on scroll).
         if self.panes.contains_key(&session_id) {
+            let _ = self.resize(&session_id, cols, rows);
             return Ok(vec![RemoteEvent::Ready { session_id }]);
         }
 
@@ -799,6 +802,51 @@ mod tests {
             bytes: b"hi\n".to_vec(),
         })
         .unwrap();
+        reg.handle(RemoteRequest::Shutdown).unwrap();
+    }
+
+    #[test]
+    fn idempotent_spawn_resizes_existing_pty() {
+        let mut reg = SessionRegistry::with_scrollback_cap(std::env::temp_dir(), 64 * 1024);
+        reg.handle(RemoteRequest::Spawn {
+            session_id: "nvim".into(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 2".into()],
+            env: vec![],
+            cwd: None,
+            cols: 40,
+            rows: 10,
+            replay_scrollback: false,
+            role: Some("editor".into()),
+            label: Some("nvim".into()),
+        })
+        .unwrap();
+
+        // Reconnect with a different view size — must update stored geometry.
+        reg.handle(RemoteRequest::Spawn {
+            session_id: "nvim".into(),
+            argv: vec!["sh".into(), "-c".into(), "sleep 2".into()],
+            env: vec![],
+            cwd: None,
+            cols: 120,
+            rows: 40,
+            replay_scrollback: false,
+            role: Some("editor".into()),
+            label: Some("nvim".into()),
+        })
+        .unwrap();
+
+        let info = reg
+            .handle(RemoteRequest::ListSessions)
+            .unwrap()
+            .into_iter()
+            .find_map(|ev| match ev {
+                RemoteEvent::SessionList { sessions } => Some(sessions),
+                _ => None,
+            })
+            .expect("session list");
+        let nvim = info.iter().find(|s| s.session_id == "nvim").unwrap();
+        assert_eq!(nvim.cols, 120);
+        assert_eq!(nvim.rows, 40);
         reg.handle(RemoteRequest::Shutdown).unwrap();
     }
 

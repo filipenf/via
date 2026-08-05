@@ -70,3 +70,51 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tgz dist/*.sha256 --clobber
+
+  package-remote:
+    # Static musl artifact so it is more portable
+    # Host `cargo build -p via-remote` remains fine for local same-glibc smoke tests.
+    name: Package via-remote ${{ matrix.asset }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset: linux-x86_64-musl
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Zig (musl linker via cargo-zigbuild)
+        uses: jdx/mise-action@v2
+
+      - name: Install Rust musl target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild --locked
+
+      - name: Build via-remote (static musl)
+        # Dependency-light helper: no libghostty/winit. Zig provides the musl sysroot.
+        run: cargo zigbuild --locked --release --target ${{ matrix.target }} -p via-remote
+
+      - name: Create package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="via-remote-${{ github.event.release.tag_name }}-${{ matrix.asset }}"
+          mkdir -p "dist/${package}"
+          install -m 0755 "target/${{ matrix.target }}/release/via-remote" "dist/${package}/via-remote"
+          tar -C dist -czf "dist/${package}.tgz" "${package}"
+          sha256sum "dist/${package}.tgz" > "dist/${package}.tgz.sha256"
+          # Sanity: musl release must be static (no GLIBC_* versioned deps).
+          file "dist/${package}/via-remote" | tee /dev/stderr | grep -qi 'statically linked'
+          ldd_out="$(ldd "dist/${package}/via-remote" 2>&1 || true)"
+          printf '%s\n' "$ldd_out" | tee /dev/stderr | grep -qi 'not a dynamic executable'
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tgz dist/*.sha256 --clobber

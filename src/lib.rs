@@ -14,7 +14,6 @@ mod lsp_bridge;
 mod mediator;
 mod nvim;
 mod plugin;
-mod pty;
 mod reference_index;
 mod remote;
 mod session;
@@ -46,12 +45,6 @@ pub fn run() -> Result<()> {
     // opens a window.
     if cli.acp_tui {
         return acp_tui::run(cli.acp_tui_args());
-    }
-
-    // Remote helper / SSH pipe proxy — same early-dispatch rule as `--acp-tui`.
-    let remote_args = cli.remote_args();
-    if remote_args.wants_early_dispatch() {
-        return remote::run(remote_args);
     }
 
     if cli.persist {
@@ -91,14 +84,14 @@ async fn async_main(cli: Cli) -> Result<()> {
     logging::init();
     config::ensure_runtime_dir()?;
 
-    let config = config::Config::load(cli.config_overrides())?;
-    info!(?config, "starting via");
+    let app = config::AppContext::load(cli.config_overrides(), cli.attach_mode())?;
+    info!(?app, "starting via");
 
-    let _session_guard = session::SessionGuard::create(&config)?;
+    let _session_guard = session::SessionGuard::create(&app)?;
 
-    if let Some(agent_command) = &config.agent_command {
+    if let Some(agent_command) = &app.user.agent_command {
         let family = plugin::detect_agent_family(agent_command);
-        match plugin::install(family, config.plugin_dir.as_deref()) {
+        match plugin::install(family, app.user.plugin_dir.as_deref()) {
             Ok(paths) if !paths.is_empty() => {
                 info!(
                     agent = %agent_command,
@@ -117,31 +110,32 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
-    let remote_client = if let Some(remote) = &config.remote {
-        let opts = crate::remote::ConnectOptions::from_host(&remote.host, remote.socket.clone());
-        let client = crate::remote::connect(opts)
-            .with_context(|| format!("connect remote helper at {}", remote.host))?;
-        info!(host = %remote.host, "connected to remote helper");
-        Some(client)
-    } else {
-        None
+    let remote_client = match &app.launch.attach {
+        config::AttachMode::Remote { host, socket, .. } => {
+            let opts = crate::remote::ConnectOptions::from_host(host, socket.clone());
+            let client = crate::remote::connect(opts)
+                .with_context(|| format!("connect remote helper at {host}"))?;
+            info!(%host, "connected to remote helper");
+            Some(client)
+        }
+        config::AttachMode::Local => None,
     };
 
-    let mut mediator = Mediator::new(config.clone());
+    let mut mediator = Mediator::new(app.clone());
     if let Some(client) = remote_client.clone() {
         mediator = mediator.with_remote_client(client);
     }
 
-    if let Some(cmd) = &config.agent_command {
+    if let Some(cmd) = &app.user.agent_command {
         info!(agent = %cmd, "primary PTY agent");
-        if config.orchestration_enabled {
+        if app.launch.orchestration_enabled {
             info!("ACP orchestration available; spawn orchestrator/reviewer/coder panes as needed");
         }
     }
 
     let mut handle = mediator.spawn();
     let ui = GhosttyUi::new(
-        config.clone(),
+        app,
         handle.events(),
         handle.take_ui_commands(),
         remote_client,

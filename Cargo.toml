@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/via-remote"]
+resolver = "2"
+
 [package]
 name = "via"
 version = "0.10.0"
@@ -9,6 +13,7 @@ rust-version = "1.93"
 
 [dependencies]
 anyhow = "1.0.100"
+via-remote = { path = "crates/via-remote" }
 clap = { version = "4.5", features = ["derive"] }
 # `wayland-data-control`: on Linux Wayland, the default X11 clipboard path often sees an empty
 # clipboard when copying from native Wayland apps; this enables the wl-clipboard protocol instead.
@@ -24,7 +29,6 @@ libghostty-vt = { git = "https://github.com/uzaaft/libghostty-rs", rev = "5ac47e
   "link-static",
 ] }
 nvim-rs = { version = "0.9.2", features = ["use_tokio"] }
-portable-pty = "0.9.0"
 crossterm = "0.28"
 ratatui = { version = "0.30.0", default-features = false, features = [
   "std",
@@ -32,8 +36,6 @@ ratatui = { version = "0.30.0", default-features = false, features = [
 ] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-serde_bytes = "0.11"
-ciborium = "0.2.2"
 serde_yaml = "0.9.34"
 toml = "0.9"
 softbuffer = "0.4"

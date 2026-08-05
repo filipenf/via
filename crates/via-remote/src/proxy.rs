@@ -1,4 +1,4 @@
-//! Foreground stdio ↔ remote helper control socket bridge (`via --remote-proxy`).
+//! Foreground stdio ↔ remote helper control socket bridge (`via-remote proxy`).
 
 use std::io::{self, Read, Write};
 use std::os::unix::net::UnixStream;

@@ -160,9 +160,8 @@ pub fn write_frame<W: Write, T: Serialize>(writer: &mut W, msg: &T) -> Result<()
 /// any length bytes. Partial frames after a length prefix are errors.
 pub fn read_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<Option<T>> {
     let mut len_buf = [0u8; 4];
-    match read_exact_or_eof(reader, &mut len_buf)? {
-        false => return Ok(None),
-        true => {}
+    if !read_exact_or_eof(reader, &mut len_buf)? {
+        return Ok(None);
     }
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME_LEN {

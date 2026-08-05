@@ -223,8 +223,8 @@ has some rough edges. Some things I have planned:
 Run panes on a remote host while the GUI stays local:
 
 ```sh
-# on the remote (once; or let connect ensure it)
-via --remote-serve
+# on the remote (once; or let connect ensure it) — standalone helper binary
+via-remote serve
 
 # on the laptop — one helper per host, no session picker
 via --remote <ssh-host>
@@ -235,12 +235,29 @@ via remote <ssh-host>
 via --remote local
 ```
 
+`via-remote` is a small standalone binary released separately from via, so
+headless hosts never need the GUI build deps. `via` starts it automatically on
+connect (override the binary with `$VIA_REMOTE_BIN`).
+
+Release / portable builds are **static musl** (`linux-x86_64-musl`) so they run
+on remote workspaces and other hosts with an older glibc than your laptop. A
+plain `cargo build -p via-remote` on Arch/Ubuntu-24+ still links the host glibc
+and will fail on older remotes (`GLIBC_2.39 not found`). For a local portable
+build:
+
+```sh
+mise run build-via-remote-musl
+# → target/x86_64-unknown-linux-musl/release/via-remote
+```
+
+(Requires Zig + `cargo install cargo-zigbuild`.)
+
 Closing the GUI **Detaches**; remote PTYs keep running. Reopen with the same
 `--remote <host>` to reattach. Explicit teardown stops the helper (`Shutdown` /
 killing the daemon), not a normal window close.
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) (`src/remote/`) for framing and reconnect
-policy.
+See [ARCHITECTURE.md](ARCHITECTURE.md) (`crates/via-remote/` + `src/remote/`) for
+framing and reconnect policy.
 
 ## Runtime requirements
 

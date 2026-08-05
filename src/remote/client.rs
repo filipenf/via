@@ -12,9 +12,8 @@ use anyhow::{Context, Result, bail};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use tracing::{debug, warn};
 
-use crate::pty::{OutputNotifier, TerminalSize};
-
-use super::protocol::{RemoteEvent, RemoteRequest, read_frame, write_frame};
+use via_remote::protocol::{RemoteEvent, RemoteRequest, read_frame, write_frame};
+use via_remote::pty::{OutputNotifier, TerminalSize};
 
 struct SessionChannels {
     output_tx: Sender<Vec<u8>>,
@@ -70,7 +69,7 @@ pub struct RemoteClient {
     reader: Mutex<Option<JoinHandle<()>>>,
     wake: Arc<AtomicBool>,
     notifier: Mutex<Option<Box<dyn OutputNotifier>>>,
-    pending_list: Mutex<Option<crossbeam_channel::Sender<Vec<crate::remote::SessionInfo>>>>,
+    pending_list: Mutex<Option<crossbeam_channel::Sender<Vec<via_remote::protocol::SessionInfo>>>>,
 }
 
 /// One remote-backed PTY pane handle (I/O goes through [`RemoteClient`]).
@@ -117,7 +116,7 @@ impl PtySpawnOpts {
 }
 
 impl RemoteClient {
-    /// Wrap an already-connected stdio pair (e.g. `ssh … via --remote-proxy`).
+    /// Wrap an already-connected stdio pair (e.g. `ssh … via-remote proxy`).
     pub fn from_stdio(
         stdin: ChildStdin,
         stdout: ChildStdout,
@@ -315,6 +314,10 @@ impl RemoteClient {
         self.send(&RemoteRequest::Attach {
             session_id: session_id.clone(),
         })?;
+        // Always push the client's view size after attach. Idempotent Spawn keeps the
+        // daemon's prior cols/rows; Attach's nvim nudge also uses that stale size. Without
+        // this, the local Ghostty VT and remote PTY diverge (nvim scroll garbage).
+        self.resize(&session_id, size)?;
 
         Ok(RemotePane {
             session_id,
@@ -361,7 +364,7 @@ impl RemoteClient {
     }
 
     /// Blocking ListSessions (used on GUI reconnect to inspect the remote roster).
-    pub fn list_sessions(&self) -> Result<Vec<crate::remote::SessionInfo>> {
+    pub fn list_sessions(&self) -> Result<Vec<via_remote::protocol::SessionInfo>> {
         let (tx, rx) = crossbeam_channel::bounded(1);
         {
             let mut pending = self.pending_list.lock().unwrap_or_else(|e| e.into_inner());
@@ -481,5 +484,67 @@ impl Drop for RemotePane {
                 let _ = self.client.kill(&self.session_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn remote_client_writes_spawn_to_buffer() {
+        // No live helper: ensure spawn_or_attach encodes requests without deadlocking Drop.
+        let writer = Arc::new(Mutex::new(Vec::<u8>::new()));
+        struct SharedWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for SharedWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let client = RemoteClient::from_rw(
+            Box::new(SharedWriter(Arc::clone(&writer))),
+            Box::new(std::io::empty()),
+            None,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let pane = client
+            .spawn_or_attach(
+                "t",
+                vec!["true".into()],
+                vec![],
+                None,
+                TerminalSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+                PtySpawnOpts::primary_screen("t"),
+            )
+            .unwrap();
+        let bytes = writer.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        // CBOR text strings for type tags still appear as ASCII in the payload.
+        assert!(
+            bytes.windows(5).any(|w| w == b"spawn"),
+            "requests={bytes:?}"
+        );
+        assert!(
+            bytes.windows(6).any(|w| w == b"attach"),
+            "requests={bytes:?}"
+        );
+        // Two length-prefixed frames (Spawn + Attach).
+        let mut cursor = Cursor::new(&bytes);
+        let first: RemoteRequest = read_frame(&mut cursor).unwrap().unwrap();
+        assert!(matches!(first, RemoteRequest::Spawn { .. }));
+        let second: RemoteRequest = read_frame(&mut cursor).unwrap().unwrap();
+        assert!(matches!(second, RemoteRequest::Attach { .. }));
+        drop(pane);
+        drop(client);
     }
 }

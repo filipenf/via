@@ -3777,7 +3777,6 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "arboard",
- "ciborium",
  "clap",
  "cosmic-text",
  "criterion",
@@ -3786,10 +3785,8 @@ dependencies = [
  "libc",
  "libghostty-vt",
  "nvim-rs",
- "portable-pty",
  "ratatui",
  "serde",
- "serde_bytes",
  "serde_json",
  "serde_yaml",
  "softbuffer",
@@ -3798,7 +3795,22 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "via-remote",
  "winit",
+]
+
+[[package]]
+name = "via-remote"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "ciborium",
+ "crossbeam-channel",
+ "libc",
+ "portable-pty",
+ "serde",
+ "serde_bytes",
+ "tracing",
 ]
 
 [[package]]

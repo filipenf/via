@@ -67,7 +67,7 @@ helpers use ACP when the configured driver supports it.
 
 The central async coordinator. It owns:
 
-- A `Config`.
+- An `AppContext` (user prefs, runtime paths, and launch/attach context).
 - `EditorState` (current buffer, diagnostics per path, visual selection, LSP
   client summaries).
 - Optional `AcpClient` (when `VIA_AGENT` ends with `acp`).
@@ -244,17 +244,27 @@ conversation handles inside an instance, not file-backed storage.
 
 ### Config, instances, and CLI (src/config.rs, src/session.rs, src/cli/\*)
 
-Config resolution is strict precedence: CLI > env (`VIA_*`) >
-`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command
-must be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects
-whether spawned helpers can resolve to ACP (known-agent table or `acp_agent`
-override). Spawn presets (`[agents.orchestrator]`, `[agents.reviewer]`,
-`[agents.coder]` in `via.conf`, plus built-in defaults) fill missing `role` /
-`command` / `model` when opening helper panes. Each preset may include an optional
-`model` slug; on ACP connect, `establish_acp` calls `session/set_config_option`
-after `session/new` and pushes the result to the pane header via
-`UiCommand::AcpSessionStatus`. Explicit `--model` on `via agent spawn` or
-`assign` overrides the preset for that spawn. Requires ACP orchestration and
+Startup wiring is split into three ownership-aligned pieces bundled as
+`AppContext`:
+
+- **`UserConfig`** — durable preferences from CLI > env (`VIA_*`) >
+  `~/.config/via/via.conf` (TOML) > built-in defaults (`nvim`, `agent`, scroll,
+  `auto_approve`, spawn presets, …).
+- **`RuntimePaths`** — per-instance sockets, agents dir, and bridge module paths
+  (env overrides or defaults under the runtime root).
+- **`LaunchContext`** — how this process was started: working directory, local vs
+  remote `AttachMode` (`via --remote` / `via remote`), and derived
+  `orchestration_enabled`. Remote attach is CLI-only (not stored in `via.conf`).
+
+The primary `agent` command must be a PTY launch (not ending with `acp`).
+`orchestration_enabled` reflects whether spawned helpers can resolve to ACP
+(known-agent table or `acp_agent` override). Spawn presets (`[agents.orchestrator]`,
+`[agents.reviewer]`, `[agents.coder]` in `via.conf`, plus built-in defaults) fill
+missing `role` / `command` / `model` when opening helper panes. Each preset may
+include an optional `model` slug; on ACP connect, `establish_acp` calls
+`session/set_config_option` after `session/new` and pushes the result to the pane
+header via `UiCommand::AcpSessionStatus`. Explicit `--model` on `via agent spawn`
+or `assign` overrides the preset for that spawn. Requires ACP orchestration and
 agent support for the `model` config option.
 
 `SessionGuard` writes (and removes on drop) a per-instance manifest under
@@ -322,20 +332,21 @@ projects them into the detected agent family's skill roots.
 - `src/editor.rs`: the in-memory `EditorState` updated by the Lua bridge events.
 - `src/event.rs`: the enum of all cross-layer messages (EditorEvent, AgentEvent,
   UiCommand, etc.).
-- `src/remote/`: remote execution helper. Early-dispatch `via --remote-serve`
-  owns detachable PTYs (and ACP stdio processes) and speaks length-prefixed CBOR
-  on `$XDG_DATA_HOME/via/remote/control.sock`; `via --remote-proxy` bridges stdio
-  to that socket (SSH pipe). Local GUI: `via --remote <host>` (alias:
-  `via remote <host>`) ensures the daemon, opens an SSH proxy, and spawns
-  nvim/shells/agents/ACP-TUI panes through [`RemoteClient`]. Local `AcpClient`
-  keeps ownership; agent stdio is tunneled via `SpawnStdio`. Protocol:
-  `RemoteRequest` / `RemoteEvent` in `src/remote/protocol.rs`
-  (`[u32 BE len][cbor]`; native byte strings for I/O).
+- `src/remote/`: remote execution **client** side. Local GUI `via --remote <host>`
+  (alias: `via remote <host>`) ensures the helper, opens an SSH proxy (or a local
+  Unix socket for `via --remote local`), and spawns nvim/shells/agents/ACP-TUI
+  panes through [`RemoteClient`]. Local `AcpClient` keeps ownership; agent stdio
+  is tunneled via `SpawnStdio`. The helper itself ships as a standalone
+  `via-remote` binary (see `crates/via-remote/`); connect starts it with
+  `via-remote serve` / `via-remote proxy` (override with `$VIA_REMOTE_BIN`).
+  Protocol: `RemoteRequest` / `RemoteEvent` in
+  `crates/via-remote/src/protocol.rs` (`[u32 BE len][cbor]`; native byte strings
+  for I/O).
 
   **UX (local attach):** one remote helper / one workspace per host — host
   identity selects the session; there is no “which session?” picker. Connect
-  ensures the helper (`ssh … via --remote-serve` or local `--remote-serve`) when
-  the control socket is not live. `ListSessions` lists **panes inside that
+  ensures the helper (`ssh … via-remote serve` or local `via-remote serve`)
+  when the control socket is not live. `ListSessions` lists **panes inside that
   helper**, not multiple workspaces.
 
   **Reconnect / detach (GUI quit ≠ kill):** Dropping the SSH proxy or closing
@@ -347,6 +358,18 @@ projects them into the detected agent family's skill roots.
   best-effort layout; perfect chrome restore is not promised. Explicit
   teardown is `Shutdown` / stopping the daemon — not implied by GUI quit.
   Nvim RPC / ACP-TUI Unix socket mux is still a follow-up.
+- `crates/via-remote/`: the **standalone helper** (`via-remote` binary + lib),
+  released on its own cadence. Contains the server half of the remote protocol:
+  `protocol` (shared CBOR framing + `RemoteRequest`/`RemoteEvent`), `pty`
+  (portable-pty session + notifiers), `registry` (detachable PTY/stdio session
+  table), `scrollback` (replay ring), `serve` (control-socket daemon + daemonize
+  re-exec), and `proxy` (stdio ↔ socket bridge for SSH pipes). `via` depends on
+  `via-remote` (path dep) for the protocol + pty types. Splitting it out keeps
+  libghostty-vt / winit / softbuffer off headless hosts (helper deps ≈
+  portable-pty + serde + tokio-free std threads). Release packaging builds
+  `via-remote` as **static musl** (`x86_64-unknown-linux-musl` via
+  `cargo-zigbuild` + Zig) so remote workspaces / older glibc hosts do not need
+  a matching libc; see `mise run build-via-remote-musl`.
 - `build.rs`: currently a no-op (just rerun-if-changed). The real compile-time
   work happens inside the `libghostty-vt` crate's build script.
 

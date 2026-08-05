@@ -14,8 +14,8 @@ use libghostty_vt::{Terminal, TerminalOptions, key as vt_key, mouse};
 
 use tracing::{debug, warn};
 
-use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 use crate::remote::{PtySpawnOpts, RemoteClient, RemotePane};
+use via_remote::pty::{OutputNotifier, PtySession, TerminalSize};
 
 use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;

@@ -1,10 +1,14 @@
 //! Connect the local GUI to a remote helper (SSH ensure + proxy, or local Unix socket).
 //!
 //! **Ensure-on-connect:** if the control socket is not accepting connections, start
-//! `via --remote-serve` (locally or via `ssh <host> -- via --remote-serve`) before
+//! `via-remote serve` (locally or via `ssh <host> -- via-remote serve`) before
 //! opening the proxy. One helper per host — callers never pick among multiple
 //! remote sessions.
+//!
+//! The helper binary is `$VIA_REMOTE_BIN` when set, otherwise `via-remote` (so
+//! dev builds can point at `target/debug/via-remote`).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -50,6 +54,11 @@ impl ConnectOptions {
     }
 }
 
+/// The helper binary path: `$VIA_REMOTE_BIN`, defaulting to `via-remote`.
+fn remote_bin() -> OsString {
+    std::env::var_os("VIA_REMOTE_BIN").unwrap_or_else(|| OsString::from("via-remote"))
+}
+
 /// Ensure the helper is up and return a live [`RemoteClient`].
 pub fn connect(opts: ConnectOptions) -> Result<Arc<RemoteClient>> {
     let wake = Arc::new(AtomicBool::new(false));
@@ -74,15 +83,15 @@ fn ensure_local_helper(socket: &Path) -> Result<()> {
         }
         let _ = std::fs::remove_file(socket);
     }
-    let exe = std::env::current_exe().context("current_exe for local remote-serve")?;
-    let status = Command::new(&exe)
-        .arg("--remote-serve")
-        .arg("--remote-socket")
+    let bin = remote_bin();
+    let status = Command::new(&bin)
+        .arg("serve")
+        .arg("--socket")
         .arg(socket)
         .status()
-        .context("start local via --remote-serve")?;
+        .with_context(|| format!("start local {bin:?} serve"))?;
     if !status.success() {
-        bail!("via --remote-serve failed with {status}");
+        bail!("{bin:?} serve failed with {status}");
     }
     // Daemonize path prints and exits parent immediately; wait for socket.
     wait_connect_unix(socket, 50, Duration::from_millis(100))?;
@@ -101,7 +110,7 @@ fn connect_ssh(
         .stderr(Stdio::inherit());
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("ssh {host} via --remote-proxy"))?;
+        .with_context(|| format!("ssh {host} via-remote proxy"))?;
     let stdin = child.stdin.take().context("ssh proxy stdin")?;
     let stdout = child.stdout.take().context("ssh proxy stdout")?;
     info!(%host, "connected to remote helper via SSH proxy");
@@ -116,10 +125,10 @@ fn ssh_proxy_command(host: &str, socket: Option<&Path>) -> Command {
         .arg("ConnectTimeout=10")
         .arg(host)
         .arg("--")
-        .arg("via")
-        .arg("--remote-proxy");
+        .arg(remote_bin())
+        .arg("proxy");
     if let Some(socket) = socket {
-        cmd.arg("--remote-socket").arg(socket);
+        cmd.arg("--socket").arg(socket);
     }
     cmd
 }
@@ -130,6 +139,7 @@ fn ensure_remote_helper(host: &str, socket: Option<&Path>) -> Result<()> {
         info!(%host, "remote helper already running");
         return Ok(());
     }
+    let bin = remote_bin();
     let mut cmd = Command::new("ssh");
     cmd.arg("-o")
         .arg("BatchMode=yes")
@@ -137,16 +147,16 @@ fn ensure_remote_helper(host: &str, socket: Option<&Path>) -> Result<()> {
         .arg("ConnectTimeout=10")
         .arg(host)
         .arg("--")
-        .arg("via")
-        .arg("--remote-serve");
+        .arg(&bin)
+        .arg("serve");
     if let Some(socket) = socket {
-        cmd.arg("--remote-socket").arg(socket);
+        cmd.arg("--socket").arg(socket);
     }
     let status = cmd
         .status()
-        .with_context(|| format!("ssh {host} via --remote-serve"))?;
+        .with_context(|| format!("ssh {host} {bin:?} serve"))?;
     if !status.success() {
-        bail!("remote via --remote-serve via ssh failed with {status}");
+        bail!("remote {bin:?} serve via ssh failed with {status}");
     }
     // Parent of daemonize exits 0 immediately; give the re-exec a moment, then probe.
     for _ in 0..50 {
@@ -155,10 +165,10 @@ fn ensure_remote_helper(host: &str, socket: Option<&Path>) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    bail!("remote helper did not become reachable after via --remote-serve on {host}");
+    bail!("remote helper did not become reachable after {bin:?} serve on {host}");
 }
 
-/// Probe by opening a short-lived SSH → `--remote-proxy` with stdin closed.
+/// Probe by opening a short-lived SSH → `via-remote proxy` with stdin closed.
 /// Proxy exits 0 after connect+EOF when the daemon is listening; connect failure → non-zero.
 fn remote_helper_alive(host: &str, socket: Option<&Path>) -> bool {
     let mut cmd = ssh_proxy_command(host, socket);

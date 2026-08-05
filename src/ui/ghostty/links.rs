@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use crate::nvim::FileTarget;
-use crate::pty::TerminalSize;
 use crate::reference_index::ReferenceIndex;
+use via_remote::pty::TerminalSize;
 
 /// Working directory + optional file index for cue scan / click resolution.
 #[derive(Debug, Clone, Copy)]
