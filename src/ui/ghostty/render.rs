@@ -3,7 +3,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use libghostty_vt::Terminal;
-use libghostty_vt::render::{CellIteration, CellIterator, Dirty, RenderState, RowIterator};
+use libghostty_vt::render::{
+    CellIteration, CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator,
+};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::RgbColor;
 use ratatui::buffer::Buffer;
@@ -270,33 +272,29 @@ pub(super) fn draw_screen(
     if snapshot.cursor_visible().unwrap_or(false) {
         if let Ok(Some(cursor)) = snapshot.cursor_viewport() {
             let cursor_x = origin_x + cursor.x as usize * metrics.cell_width;
-            let cursor_y =
-                origin_y + cursor.y as usize * metrics.cell_height + metrics.cell_height - 2;
+            let cursor_y = origin_y + cursor.y as usize * metrics.cell_height;
             let cursor_color = snapshot
                 .cursor_color()
                 .ok()
                 .flatten()
                 .map(rgb_color)
                 .unwrap_or(font_renderer.theme.cursor);
+            // Neovim (and most apps) set DECSCUSR; honor it instead of a fixed underline.
+            let style = snapshot
+                .cursor_visual_style()
+                .unwrap_or(CursorVisualStyle::Block);
 
-            draw_rect(
+            draw_cursor(
                 buffer,
                 width,
                 height,
                 cursor_x,
                 cursor_y,
                 metrics.cell_width,
-                2,
+                metrics.cell_height,
                 cursor_color,
-            );
-            push_damage(
+                style,
                 damage,
-                cursor_x,
-                cursor_y,
-                metrics.cell_width,
-                2,
-                width,
-                height,
             );
         }
     }
@@ -1023,6 +1021,121 @@ fn draw_shade(
     }
 }
 
+/// Draw the terminal cursor according to the VT visual style (DECSCUSR).
+///
+/// Block inverts the cell so the glyph stays readable without a second text pass.
+fn draw_cursor(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    cell_width: usize,
+    cell_height: usize,
+    color: u32,
+    style: CursorVisualStyle,
+    damage: &mut Vec<DamageRect>,
+) {
+    match style {
+        CursorVisualStyle::Block => {
+            invert_rect(buffer, width, height, x, y, cell_width, cell_height);
+            push_damage(damage, x, y, cell_width, cell_height, width, height);
+        }
+        CursorVisualStyle::BlockHollow => {
+            draw_rect_outline(buffer, width, height, x, y, cell_width, cell_height, color);
+            push_damage(damage, x, y, cell_width, cell_height, width, height);
+        }
+        CursorVisualStyle::Underline => {
+            let thickness = cursor_underline_thickness(cell_height);
+            let bar_y = y + cell_height.saturating_sub(thickness);
+            draw_rect(
+                buffer, width, height, x, bar_y, cell_width, thickness, color,
+            );
+            push_damage(damage, x, bar_y, cell_width, thickness, width, height);
+        }
+        CursorVisualStyle::Bar => {
+            let thickness = cursor_bar_thickness(cell_width);
+            draw_rect(buffer, width, height, x, y, thickness, cell_height, color);
+            push_damage(damage, x, y, thickness, cell_height, width, height);
+        }
+        _ => {
+            // libghostty marks the enum non-exhaustive; treat unknown styles as block.
+            invert_rect(buffer, width, height, x, y, cell_width, cell_height);
+            push_damage(damage, x, y, cell_width, cell_height, width, height);
+        }
+    }
+}
+
+fn cursor_underline_thickness(cell_height: usize) -> usize {
+    (cell_height / 8).max(2)
+}
+
+fn cursor_bar_thickness(cell_width: usize) -> usize {
+    (cell_width / 8).max(1)
+}
+
+fn invert_rect(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+) {
+    let max_y = (y + rect_height).min(height);
+    let max_x = (x + rect_width).min(width);
+
+    if x >= max_x {
+        return;
+    }
+
+    for row in y..max_y {
+        let row_start = row * width;
+        for pixel in &mut buffer[row_start + x..row_start + max_x] {
+            *pixel ^= 0x00ff_ffff;
+        }
+    }
+}
+
+fn draw_rect_outline(
+    buffer: &mut [u32],
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    rect_width: usize,
+    rect_height: usize,
+    color: u32,
+) {
+    if rect_width == 0 || rect_height == 0 {
+        return;
+    }
+
+    draw_rect(buffer, width, height, x, y, rect_width, 1, color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        x,
+        y + rect_height - 1,
+        rect_width,
+        1,
+        color,
+    );
+    draw_rect(buffer, width, height, x, y, 1, rect_height, color);
+    draw_rect(
+        buffer,
+        width,
+        height,
+        x + rect_width - 1,
+        y,
+        1,
+        rect_height,
+        color,
+    );
+}
+
 fn draw_rect(
     buffer: &mut [u32],
     width: usize,
@@ -1151,6 +1264,73 @@ mod tests {
         let dist_to_fg = color_distance(inactive, theme.foreground);
 
         assert!(dist_to_bg < dist_to_fg);
+    }
+
+    #[test]
+    fn cursor_thickness_scales_with_cell_size() {
+        assert_eq!(cursor_underline_thickness(16), 2);
+        assert_eq!(cursor_underline_thickness(32), 4);
+        assert_eq!(cursor_bar_thickness(8), 1);
+        assert_eq!(cursor_bar_thickness(16), 2);
+    }
+
+    #[test]
+    fn invert_rect_flips_rgb_in_place() {
+        let width = 4;
+        let height = 2;
+        let mut buffer = vec![0x0011_2233; width * height];
+        invert_rect(&mut buffer, width, height, 1, 0, 2, 1);
+        assert_eq!(buffer[0], 0x0011_2233);
+        assert_eq!(buffer[1], 0x00ee_ddcc);
+        assert_eq!(buffer[2], 0x00ee_ddcc);
+        assert_eq!(buffer[3], 0x0011_2233);
+        assert_eq!(buffer[4], 0x0011_2233);
+    }
+
+    #[test]
+    fn draw_cursor_block_damages_full_cell() {
+        let mut buffer = vec![0u32; 8 * 8];
+        let mut damage = Vec::new();
+        draw_cursor(
+            &mut buffer,
+            8,
+            8,
+            2,
+            1,
+            3,
+            4,
+            0x00ff_0000,
+            CursorVisualStyle::Block,
+            &mut damage,
+        );
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].x, 2);
+        assert_eq!(damage[0].y, 1);
+        assert_eq!(damage[0].width, 3);
+        assert_eq!(damage[0].height, 4);
+    }
+
+    #[test]
+    fn draw_cursor_bar_damages_left_strip() {
+        let mut buffer = vec![0u32; 16 * 16];
+        let mut damage = Vec::new();
+        draw_cursor(
+            &mut buffer,
+            16,
+            16,
+            4,
+            2,
+            8,
+            10,
+            0x00ff_0000,
+            CursorVisualStyle::Bar,
+            &mut damage,
+        );
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].width, cursor_bar_thickness(8));
+        assert_eq!(damage[0].height, 10);
+        assert_eq!(buffer[2 * 16 + 4], 0x00ff_0000);
+        assert_eq!(buffer[2 * 16 + 5], 0);
     }
 
     fn color_luminance(color: u32) -> u32 {
