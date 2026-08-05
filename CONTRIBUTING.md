@@ -43,13 +43,13 @@ sudo apt-get install -y \
 
 ### Zig + tools via mise (recommended)
 
-The project pins Zig (and rust-analyzer) in `.mise.toml`:
+The project pins Rust 1.93 (MSRV), Zig, and rust-analyzer in `mise.toml`:
 
 ```sh
 mise install
 ```
 
-The `.mise.toml` also defines handy tasks (run with `mise <task>` or
+The `mise.toml` also defines handy tasks (run with `mise <task>` or
 `mise run <task>`):
 
 ```sh
@@ -62,10 +62,12 @@ mise build
 mise clean
 ```
 
-List available tasks with `mise tasks`. These activate the pinned tools (Zig,
-etc.) for you.
+List available tasks with `mise tasks`. These activate the pinned tools (Rust,
+Zig, etc.) for you — so `mise build` uses the project toolchain even if your
+default `rustup` toolchain is older.
 
-Otherwise, install Zig 0.15.2 manually and ensure it is on `PATH`.
+Otherwise, install Rust ≥ 1.93 and Zig 0.15.2 manually and ensure they are on
+`PATH`.
 
 ## Building
 

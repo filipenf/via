@@ -233,7 +233,7 @@ prerequisites and platform notes.
   build.
 - `git` (used by the `libghostty-vt-sys` build script to fetch ghostty sources).
 
-If you use [mise](https://mise.jdx.dev/), the project's `.mise.toml` pins the
+If you use [mise](https://mise.jdx.dev/), the project's `mise.toml` pins the
 correct Zig version automatically:
 
 ```sh
