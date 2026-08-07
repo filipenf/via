@@ -70,6 +70,10 @@ pub struct Cli {
     #[arg(long = "socket")]
     pub socket: Option<std::path::PathBuf>,
 
+    /// ACP TUI: start with light appearance (Ghostty light background).
+    #[arg(long)]
+    pub light: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -96,6 +100,7 @@ impl Cli {
             demo: self.demo,
             no_input: self.no_input,
             socket: self.socket.clone(),
+            light: self.light,
         }
     }
 }

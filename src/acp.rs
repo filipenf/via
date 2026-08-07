@@ -95,6 +95,31 @@ struct ConfigOptionChoice {
     name: Option<String>,
 }
 
+/// One selectable model from ACP `session/new` / `session/set_config_option`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    pub value: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+fn model_choices_from_options(options: &[ConfigOption]) -> Vec<ModelChoice> {
+    options
+        .iter()
+        .find(|option| option.id == "model")
+        .map(|option| {
+            option
+                .options
+                .iter()
+                .map(|choice| ModelChoice {
+                    value: choice.value.clone(),
+                    name: choice.name.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionResult {
@@ -114,6 +139,11 @@ impl NewSessionResult {
     /// Selected model from `session/new` config options (e.g. `lemonade/Gemma-…`).
     pub fn selected_model(&self) -> Option<String> {
         selected_config_value(&self.config_options, "model")
+    }
+
+    /// Selectable model values from the agent's `model` config option.
+    pub fn model_choices(&self) -> Vec<ModelChoice> {
+        model_choices_from_options(&self.config_options)
     }
 
     /// Map a user-facing model slug (e.g. `composer-2.5` from `agent models`) to the
@@ -199,6 +229,11 @@ impl SetConfigOptionResult {
     /// Selected model from the updated config options.
     pub fn selected_model(&self) -> Option<String> {
         selected_config_value(&self.config_options, "model")
+    }
+
+    /// Selectable model values after the config update.
+    pub fn model_choices(&self) -> Vec<ModelChoice> {
+        model_choices_from_options(&self.config_options)
     }
 }
 

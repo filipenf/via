@@ -1,9 +1,10 @@
-//! Plain-ratatui ACP agent TUI (PTY-hosted display + input surface).
+//! PTY-hosted ACP agent TUI (display + input surface).
 //!
-//! The mediator owns [`crate::acp::AcpClient`]; this module only renders transcript /
-//! progress and emits submit events over a narrow IPC contract (Unix socket, or
-//! stdin JSON lines when stdin is not a TTY). Invoked as `via --acp-tui`.
-//! See Obsidian `Spike — ACP TUI binary`.
+//! The mediator owns [`crate::acp::AcpClient`]; this module renders transcript /
+//! progress (markdown via `xai-grok-markdown`, prompt via `xai-ratatui-textarea`)
+//! and emits submit events over a narrow IPC contract (Unix socket, or stdin JSON
+//! lines when stdin is not a TTY). Invoked as `via --acp-tui`.
+//! See Obsidian `Spike — ACP TUI binary` / `Spike — ACP TUI grok UI crates (PTY path)`.
 
 mod app;
 mod host;
@@ -25,7 +26,7 @@ pub use host::{
     AcpTuiBridge, VIA_ACP_TUI_BIN_ENV, resolve_acp_tui_bin, socket_path_for_agent,
     spawn_env_and_args,
 };
-pub use protocol::{HostToTui, TranscriptKind, TuiToHost, parse_host_line};
+pub use protocol::{HostToTui, ModelChoice, TranscriptKind, TuiToHost, parse_host_line};
 
 /// Environment variable: path to the per-agent control-plane Unix socket.
 pub const VIA_ACP_UI_SOCKET_ENV: &str = "VIA_ACP_UI_SOCKET";
@@ -43,6 +44,8 @@ pub struct Args {
     pub no_input: bool,
     /// Control-plane Unix socket (defaults to `$VIA_ACP_UI_SOCKET`).
     pub socket: Option<PathBuf>,
+    /// Start with light appearance (host also pushes [`HostToTui::Appearance`]).
+    pub light: bool,
 }
 
 /// Entry point for `via --acp-tui` (TTY display surface; no winit).
@@ -84,7 +87,7 @@ pub fn run(args: Args) -> Result<()> {
         ipc_connected = true;
     }
 
-    let mut app = App::new(agent_id.clone(), role, !args.no_input);
+    let mut app = App::new(agent_id.clone(), role, !args.no_input, args.light);
     if args.demo {
         app.seed_demo();
     } else if !ipc_connected {
@@ -134,6 +137,9 @@ fn event_loop(
                     }
                     InputEvent::Submit(text) => {
                         outbound.send(&TuiToHost::Submit { text })?;
+                    }
+                    InputEvent::SetModel(value) => {
+                        outbound.send(&TuiToHost::SetModel { value })?;
                     }
                 },
                 Event::Resize(_, _) => {}

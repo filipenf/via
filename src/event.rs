@@ -25,6 +25,12 @@ pub enum UiEvent {
         /// Which ACP agent the prompt was typed into (None = primary/orchestrator).
         agent_id: Option<String>,
     },
+    /// User picked a model in the ACP TUI; mediator applies `session/set_config_option`.
+    AgentModelSelected {
+        agent_id: String,
+        /// Exact ACP config option value (not necessarily a CLI slug).
+        value: String,
+    },
     /// JSON-RPC response written to the ACP agent stdin (`id` + `result` only).
     AcpJsonRpcResult {
         /// ACP agent whose session this result belongs to.
@@ -94,6 +100,8 @@ pub enum UiCommand {
     AcpSessionStatus {
         agent_id: String,
         model: Option<String>,
+        /// When `Some`, replace the in-pane model picker list (`None` = leave unchanged).
+        models: Option<Vec<crate::acp::ModelChoice>>,
         provider_error: Option<String>,
         clear_provider_error: bool,
     },

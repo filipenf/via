@@ -604,7 +604,8 @@ impl WinitGhosttyApp {
             .to_str()
             .with_context(|| format!("via binary path is not UTF-8: {}", bin.display()))?
             .to_string();
-        let (env, args) = spawn_env_and_args(id, role_label, &socket_str);
+        let light = self.terminal_config.theme.is_light();
+        let (env, args) = spawn_env_and_args(id, role_label, &socket_str, light);
 
         let title: &'static str = Box::leak(label.to_string().into_boxed_str());
         let mut pane = TerminalPane::new(
@@ -768,6 +769,10 @@ impl WinitGhosttyApp {
                 match msg {
                     TuiToHost::Ready { agent_id: ready_id } => {
                         debug!(%ready_id, "ACP TUI ready");
+                        let light = self.terminal_config.theme.is_light();
+                        if let Err(err) = bridge.send(HostToTui::Appearance { light }) {
+                            warn!(%agent_id, %err, "failed to send ACP TUI appearance");
+                        }
                     }
                     TuiToHost::Submit { text } => {
                         changed = true;
@@ -776,6 +781,13 @@ impl WinitGhosttyApp {
                                 text,
                                 agent_id: Some(agent_id.clone()),
                             }));
+                    }
+                    TuiToHost::SetModel { value } => {
+                        changed = true;
+                        self.events.try_send(Event::Ui(UiEvent::AgentModelSelected {
+                            agent_id: agent_id.clone(),
+                            value,
+                        }));
                     }
                     TuiToHost::ShutdownAck => {
                         debug!(%agent_id, "ACP TUI shutdown ack");
@@ -1496,9 +1508,19 @@ impl WinitGhosttyApp {
             review_pane.apply_theme(&self.terminal_config.theme);
             review_pane.write_all(&self.terminal_config.theme.color_scheme_notification())?;
         }
+        self.broadcast_acp_tui_appearance();
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
         Ok(true)
+    }
+
+    fn broadcast_acp_tui_appearance(&mut self) {
+        let light = self.terminal_config.theme.is_light();
+        let msg = HostToTui::Appearance { light };
+        let agent_ids: Vec<String> = self.acp_tui_bridges.keys().cloned().collect();
+        for agent_id in agent_ids {
+            let _ = self.send_acp_tui(&agent_id, msg.clone());
+        }
     }
 
     fn set_active_pane(&mut self, pane_index: usize) {
@@ -1758,6 +1780,7 @@ impl WinitGhosttyApp {
                 UiCommand::AcpSessionStatus {
                     agent_id,
                     model,
+                    models,
                     provider_error,
                     clear_provider_error,
                 } => {
@@ -1765,6 +1788,15 @@ impl WinitGhosttyApp {
                         &agent_id,
                         HostToTui::SessionStatus {
                             model: model.clone(),
+                            models: models.as_ref().map(|choices| {
+                                choices
+                                    .iter()
+                                    .map(|c| crate::acp_tui::ModelChoice {
+                                        value: c.value.clone(),
+                                        name: c.name.clone(),
+                                    })
+                                    .collect()
+                            }),
                             provider_error: provider_error.clone(),
                             clear_provider_error,
                         },

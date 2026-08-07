@@ -291,13 +291,14 @@ pub fn spawn_env_and_args<'a>(
     agent_id: &'a str,
     role: &'a str,
     socket: &'a str,
+    light: bool,
 ) -> (Vec<(&'a str, &'a str)>, Vec<&'a str>) {
     let env = vec![
         (crate::agent_bus::VIA_AGENT_ID_ENV, agent_id),
         (crate::agent_bus::VIA_AGENT_ROLE_ENV, role),
         (VIA_ACP_UI_SOCKET_ENV, socket),
     ];
-    let args = vec![
+    let mut args = vec![
         "--acp-tui",
         "--agent-id",
         agent_id,
@@ -306,6 +307,10 @@ pub fn spawn_env_and_args<'a>(
         "--socket",
         socket,
     ];
+    // Seed polarity before the Ready↔Appearance IPC round-trip.
+    if light {
+        args.push("--light");
+    }
     (env, args)
 }
 

@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::acp::AcpClient;
+use crate::acp::{AcpClient, ModelChoice};
 use crate::acp_auto_approve::{
     AutoApprovePolicy, PermissionContext, permission_result_for_option, pick_allow_option,
 };
@@ -39,6 +39,8 @@ pub struct AcpSession {
     pub client: Arc<Mutex<AcpClient>>,
     pub session_id: String,
     pub model: Option<String>,
+    /// Choices from the agent's `model` config option (for the ACP TUI picker).
+    pub models: Vec<ModelChoice>,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,7 @@ async fn establish_acp(
 
         let session = client.new_session(cwd).await?;
         let mut model = session.selected_model();
+        let mut models = session.model_choices();
         if let Some(desired) = preset_model {
             let resolved = session.resolve_model_value(desired).ok_or_else(|| {
                 anyhow!(
@@ -114,6 +117,10 @@ async fn establish_acp(
                 .set_config_option(&session.session_id, "model", &resolved)
                 .await?;
             model = updated.selected_model().or_else(|| Some(resolved.clone()));
+            let updated_choices = updated.model_choices();
+            if !updated_choices.is_empty() {
+                models = updated_choices;
+            }
             tracing::info!(
                 agent_id,
                 session_id = %session.session_id,
@@ -130,6 +137,7 @@ async fn establish_acp(
             client: Arc::new(Mutex::new(client)),
             session_id: session.session_id,
             model,
+            models,
         })
     };
 
@@ -213,6 +221,7 @@ fn notify_acp_handshake_failed(
     let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
         agent_id: agent_id.to_string(),
         model: None,
+        models: None,
         provider_error: Some(truncate_acp_status_error(&format!(
             "Connection failed: {err_msg}"
         ))),
@@ -528,11 +537,13 @@ impl AcpRuntime {
                     }
                     let client = Arc::clone(&session.client);
                     let model = session.model.clone();
+                    let models = session.models.clone();
                     sessions_guard.insert(id.clone(), session);
                     drop(sessions_guard);
                     let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
                         agent_id: id.clone(),
                         model,
+                        models: Some(models),
                         provider_error: None,
                         clear_provider_error: true,
                     });
@@ -581,7 +592,7 @@ impl AcpRuntime {
     ) {
         match action {
             AcpHandshakeAction::Retry => {
-                self.send_session_status(&ctx.ui_commands, agent_id, None, None, true);
+                self.send_session_status(&ctx.ui_commands, agent_id, None, None, None, true);
                 self.retry_connect_if_needed(agent_id, ctx).await;
             }
             AcpHandshakeAction::DiscardQueued => {
@@ -598,7 +609,7 @@ impl AcpRuntime {
                         text: format!("via: discarded {} queued message(s)", removed.len()),
                     });
                 }
-                self.send_session_status(&ctx.ui_commands, agent_id, None, None, true);
+                self.send_session_status(&ctx.ui_commands, agent_id, None, None, None, true);
             }
             AcpHandshakeAction::Dismiss => {}
         }
@@ -638,6 +649,7 @@ impl AcpRuntime {
                 let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
                     agent_id: agent_id.clone(),
                     model: session.model.clone(),
+                    models: Some(session.models.clone()),
                     provider_error: None,
                     clear_provider_error: false,
                 });
@@ -662,7 +674,7 @@ impl AcpRuntime {
         match event {
             AcpAgentEvent::TranscriptChunk { kind, text } => {
                 if kind == "agent_message_chunk" && !text.is_empty() {
-                    self.send_session_status(ui_commands, &agent_id, None, None, true);
+                    self.send_session_status(ui_commands, &agent_id, None, None, None, true);
                 }
                 let _ = ui_commands.try_send(UiCommand::AcpTranscriptChunk {
                     agent_id,
@@ -775,10 +787,76 @@ impl AcpRuntime {
                     ui_commands,
                     &agent_id,
                     None,
+                    None,
                     provider_error.as_deref(),
                     false,
                 );
             }
+        }
+    }
+
+    /// Apply a user-selected model via `session/set_config_option` and refresh the pane header.
+    pub async fn set_session_model(
+        &self,
+        ui_commands: &mpsc::Sender<UiCommand>,
+        agent_id: &str,
+        desired: &str,
+    ) -> Result<()> {
+        let Some(session) = self.session(agent_id).await else {
+            return Err(anyhow!("no ACP session for agent '{agent_id}'"));
+        };
+        let client = Arc::clone(&session.client);
+        let session_id = session.session_id.clone();
+        let mut guard = client.lock().await;
+        let updated = guard
+            .set_config_option(&session_id, "model", desired)
+            .await?;
+        drop(guard);
+
+        let model = updated
+            .selected_model()
+            .or_else(|| Some(desired.to_string()));
+        let models = {
+            let choices = updated.model_choices();
+            if choices.is_empty() {
+                session.models.clone()
+            } else {
+                choices
+            }
+        };
+
+        if let Some(slot) = self.sessions.lock().await.get_mut(agent_id) {
+            slot.model = model.clone();
+            slot.models = models.clone();
+        }
+
+        self.send_session_status(
+            ui_commands,
+            agent_id,
+            model.as_deref(),
+            Some(models),
+            None,
+            true,
+        );
+        info!(%agent_id, ?model, "ACP model updated from TUI picker");
+        Ok(())
+    }
+
+    /// Re-broadcast the stored session model to the TUI (e.g. after a failed model change).
+    pub async fn resync_session_status(
+        &self,
+        ui_commands: &mpsc::Sender<UiCommand>,
+        agent_id: &str,
+    ) {
+        if let Some(session) = self.session(agent_id).await {
+            self.send_session_status(
+                ui_commands,
+                agent_id,
+                session.model.as_deref(),
+                None,
+                None,
+                false,
+            );
         }
     }
 
@@ -788,12 +866,14 @@ impl AcpRuntime {
         ui_commands: &mpsc::Sender<UiCommand>,
         agent_id: &str,
         model: Option<&str>,
+        models: Option<Vec<ModelChoice>>,
         provider_error: Option<&str>,
         clear_provider_error: bool,
     ) {
         let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
             agent_id: agent_id.to_string(),
             model: model.map(str::to_string),
+            models,
             provider_error: provider_error.map(str::to_string),
             clear_provider_error,
         });

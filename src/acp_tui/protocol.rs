@@ -33,6 +33,14 @@ impl TranscriptKind {
     }
 }
 
+/// One model choice for the in-pane picker (mirrors ACP config option entries).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelChoice {
+    pub value: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// Messages the host (or a stub pipe) sends into the TUI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -49,10 +57,20 @@ pub enum HostToTui {
     SessionStatus {
         #[serde(default)]
         model: Option<String>,
+        /// When present, replace the picker list (`null`/absent = leave unchanged).
+        #[serde(default)]
+        models: Option<Vec<ModelChoice>>,
         #[serde(default)]
         provider_error: Option<String>,
         #[serde(default)]
         clear_provider_error: bool,
+    },
+    /// Light/dark polarity from Ghostty background luminance.
+    ///
+    /// Swaps baked syntect themes + simple chrome today. A later revision can
+    /// carry a Ghostty palette snapshot and derive most colors from it.
+    Appearance {
+        light: bool,
     },
     Shutdown,
 }
@@ -61,8 +79,16 @@ pub enum HostToTui {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TuiToHost {
-    Ready { agent_id: String },
-    Submit { text: String },
+    Ready {
+        agent_id: String,
+    },
+    Submit {
+        text: String,
+    },
+    /// Exact ACP `model` config option value selected in the picker.
+    SetModel {
+        value: String,
+    },
     ShutdownAck,
 }
 
@@ -153,7 +179,7 @@ mod tests {
     #[test]
     fn parse_session_status() {
         let msg = parse_host_line(
-            r#"{"type":"session_status","model":"gpt","provider_error":null,"clear_provider_error":true}"#,
+            r#"{"type":"session_status","model":"gpt","models":[{"value":"gpt","name":"GPT"}],"provider_error":null,"clear_provider_error":true}"#,
         )
         .unwrap()
         .unwrap();
@@ -161,9 +187,29 @@ mod tests {
             msg,
             HostToTui::SessionStatus {
                 model: Some("gpt".into()),
+                models: Some(vec![ModelChoice {
+                    value: "gpt".into(),
+                    name: Some("GPT".into()),
+                }]),
                 provider_error: None,
                 clear_provider_error: true,
             }
+        );
+    }
+
+    #[test]
+    fn parse_appearance() {
+        assert_eq!(
+            parse_host_line(r#"{"type":"appearance","light":true}"#)
+                .unwrap()
+                .unwrap(),
+            HostToTui::Appearance { light: true }
+        );
+        assert_eq!(
+            parse_host_line(r#"{"type":"appearance","light":false}"#)
+                .unwrap()
+                .unwrap(),
+            HostToTui::Appearance { light: false }
         );
     }
 

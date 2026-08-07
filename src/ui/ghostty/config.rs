@@ -239,6 +239,14 @@ impl Default for TerminalMetrics {
 }
 
 impl TerminalTheme {
+    /// Whether Ghostty's background is light (luminance heuristic).
+    ///
+    /// Used for ACP TUI light/dark polarity today; a future path can map the
+    /// full Ghostty palette into TUI chrome / syntect colors.
+    pub(super) fn is_light(&self) -> bool {
+        is_light_background(self.background)
+    }
+
     /// Generate a DSR 997 sequence that notifies a running terminal application
     /// that the terminal's color scheme (dark/light) has changed.
     ///
@@ -248,7 +256,7 @@ impl TerminalTheme {
     /// this notification after applying a new theme makes those apps pick up
     /// the new colors without being restarted.
     pub(super) fn color_scheme_notification(&self) -> Vec<u8> {
-        let mode = if is_light_background(self.background) {
+        let mode = if self.is_light() {
             2 // light
         } else {
             1 // dark

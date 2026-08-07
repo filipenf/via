@@ -243,6 +243,26 @@ impl Mediator {
                     }
                     self.handle_prompt_submitted(text, agent_id).await;
                 }
+                Event::Ui(UiEvent::AgentModelSelected { agent_id, value }) => {
+                    if value.trim().is_empty() {
+                        continue;
+                    }
+                    if let Err(error) = self
+                        .acp_runtime
+                        .set_session_model(&self.ui_commands, &agent_id, &value)
+                        .await
+                    {
+                        error!(%agent_id, %error, "failed to set ACP model from TUI");
+                        self.acp_runtime
+                            .resync_session_status(&self.ui_commands, &agent_id)
+                            .await;
+                        let _ = self.ui_commands.try_send(UiCommand::AcpTranscriptChunk {
+                            agent_id,
+                            kind: "system".to_string(),
+                            text: format!("via: failed to set model — {error}"),
+                        });
+                    }
+                }
                 Event::Ui(UiEvent::AcpHandshakeAction { agent_id, action }) => {
                     let ctx = self.connect_ctx();
                     self.acp_runtime
