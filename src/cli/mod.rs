@@ -39,7 +39,7 @@ pub struct Cli {
     #[arg(long = "scroll-sensitivity")]
     pub scroll_sensitivity: Option<f32>,
 
-    /// Local directory holding a user plugin (extra skills/agents/workflows).
+    /// Local directory of skills used by `via plugin install` (via checkout or skills/).
     #[arg(long = "plugin-dir")]
     pub plugin_dir: Option<String>,
 
@@ -386,8 +386,25 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Plugin {
-                command: PluginCommand::Install { from: Some(path) },
+                command: PluginCommand::Install {
+                    from: Some(path),
+                    force: false,
+                },
             }) if path == Path::new("/tmp/my-plugin")
+        ));
+    }
+
+    #[test]
+    fn parses_plugin_install_force() {
+        let cli = Cli::try_parse_from(["via", "plugin", "install", "--force"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Plugin {
+                command: PluginCommand::Install {
+                    from: None,
+                    force: true,
+                },
+            })
         ));
     }
 

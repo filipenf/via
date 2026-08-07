@@ -1,7 +1,7 @@
 # Task-board orchestration eval
 
-Repeatable eval of via's **task board + multi-agent review loop** (the bundled
-`via-agents` skill). An agent gets one fixed prompt, must create tasks on a
+Repeatable eval of via's **task board + multi-agent review loop** (the
+`via-agents` / `via-orc` skills). An agent gets one fixed prompt, must create tasks on a
 dedicated board, spawn **coder and reviewer**, repair a small multi-file Lua
 fixture (QuixBugs-class defects) through a reject→fix→approve loop, and leave
 `./verify.sh` green. Scoring is deterministic (`grade.sh`) — no LLM judge.

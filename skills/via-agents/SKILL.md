@@ -1,31 +1,20 @@
 ---
 name: via-agents
 description: >-
-  Coordinate with other AI agents and the via task board in a via session: discover running agents, spawn role-based
-  helpers (orchestrator, reviewer, coder), message them, and manage workspace-scoped tasks (create, claim, update,
-  review, done). Append status updates to task bodies as work progresses so humans and other agents share context. Use
-  when VIA_SESSION is set and you need another agent's help, want to delegate or hand off work, track multi-step work on
-  the board, post progress on a task, or move a task through claim / review / done.
+  Use the via agent bus and workspace task board when VIA_SESSION is set: discover agents, send
+  messages, read the inbox, spawn or terminate helper panes, and manage tasks (create, claim, update,
+  review, done). Append status updates to task bodies so humans and agents share context. Use for
+  any durable or multi-step work — not only multi-agent orchestration. For orchestration policy
+  (main agent as human POC, when to spawn helpers), see via-orc.
 ---
 
 # via agents skill
 
 via can run several agent panes side by side. The **default** is a single interactive PTY agent pane
-(`--agent opencode`, etc.) for everyday work. **ACP orchestration is opt-in:** when you need coordinated multi-agent
-handoff, spawn an ACP orchestrator plus helpers (reviewer, coder, …).
+(`--agent opencode`, etc.) for everyday work. Spawn helpers when you need them; for *when* and *how*
+to orchestrate multi-agent work with the main pane as human POC, see the **via-orc** skill.
 
-This skill covers the bus/CLI used when `VIA_SESSION` is set.
-
-## Default vs orchestration
-
-| Mode              | Primary pane                             | When                              |
-| ----------------- | ---------------------------------------- | --------------------------------- |
-| **Default**       | PTY `agent` (`opencode`, `claude`, …)    | Simple changes, interactive use   |
-| **Orchestration** | PTY `agent` stays; add spawned ACP panes | Multi-agent handoff, auto prompts |
-
-`--agent opencode` does **not** auto-upgrade to `opencode acp`. Spawned helpers **do** resolve to ACP when the
-configured agent is in the known table (`opencode`, `cursor-agent`, `agent`) or when `acp_agent` / `--acp-agent` is set
-(e.g. `claude-code-acp`).
+This skill covers the bus/board CLI used when `VIA_SESSION` is set.
 
 ## Your identity
 
@@ -45,10 +34,10 @@ via agent list           # id + role of every agent in this session
 via agent list --json    # machine-readable
 ```
 
-## Start orchestration
+## Spawn and terminate helpers
 
-Spawn an ACP orchestrator, then helpers. Built-in presets supply default roles for `orchestrator`, `reviewer`, and
-`coder` when `--role` is omitted. Commands without an explicit `--command` resolve to ACP form (e.g. `opencode` →
+Built-in presets supply default roles for `orchestrator`, `reviewer`, and `coder` when `--role` is
+omitted. Commands without an explicit `--command` resolve to ACP form (e.g. `opencode` →
 `opencode acp`).
 
 Override presets in `~/.config/via/via.conf`:
@@ -89,7 +78,7 @@ via agent spawn --id coder
 
 Spawn is unavailable when the session has no ACP mapping for the configured agent (e.g. `claude` without `--acp-agent`).
 
-When orchestration is done, terminate spawned panes (orchestrator included):
+When helpers are done, terminate spawned panes:
 
 ```bash
 via agent terminate --id reviewer
@@ -97,6 +86,9 @@ via agent terminate --id orchestrator
 ```
 
 The primary PTY `agent` pane cannot be terminated.
+
+For orchestration policy (main agent stays human POC, when to spawn, how board fits the loop), use
+**via-orc**.
 
 ## Send a message
 
@@ -135,7 +127,8 @@ message lands, or after the timeout with an empty result.
 | Ephemeral chat, quick question, one-off nudge    | `via agent send`                          |
 | Live prompt to an ACP pane without board state   | `via agent send`                          |
 
-Prefer the board for structured workflow; use `via agent send` for ad-hoc messages.
+Prefer the board for structured workflow; use `via agent send` for ad-hoc messages. The board is
+useful even without orchestration — it keeps context flowing between agent and human.
 
 ## Task boards (workspace-scoped)
 
@@ -262,3 +255,8 @@ agent bus; tasks use `workspaces/` under the via data directory.
 
 If you see "VIA_SESSION is not set", you are not inside a via-launched pane (agent bus commands only). `via task` can
 still run from the project directory.
+
+## Related skills
+
+- **via-orc** — multi-agent orchestration policy (main agent as human POC)
+- **via-editor** — diagnostics and session CLI

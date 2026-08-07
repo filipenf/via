@@ -110,8 +110,8 @@ pub struct UserConfig {
     pub review_backend: ReviewBackend,
     /// Mouse wheel sensitivity multiplier; higher scrolls faster, lower slower.
     pub scroll_sensitivity: f32,
-    /// Optional local directory holding a user plugin (extra skills/agents/workflows),
-    /// overlaid on top of the embedded base skills at install time.
+    /// Optional local directory holding a user plugin (skills/agents/workflows),
+    /// used as the skills source for `via plugin install` when set.
     pub plugin_dir: Option<PathBuf>,
     /// Spawn presets keyed by agent id (built-ins merged with `via.conf` `[agents.*]`).
     pub agent_presets: HashMap<String, AgentPreset>,

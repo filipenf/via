@@ -1,7 +1,7 @@
 # Task-board orchestration eval (program repair + review loop)
 
 You are driving a **via** multi-agent session (`VIA_SESSION` is set). Use the
-bundled **via-agents** skill and the `via` CLI. Do not ask the human for
+**via-agents** and **via-orc** skills and the `via` CLI. Do not ask the human for
 confirmation — plan, delegate, review in a loop, and finish.
 
 ## Run id

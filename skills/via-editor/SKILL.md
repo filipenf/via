@@ -20,13 +20,17 @@ CLI so agents can inspect editor state without scraping the terminal UI.
 
 ## Setup
 
-via installs this skill under your home directory for the configured agent when a session starts. You can refresh or
-inspect paths with:
+Skills are **not** auto-installed on via startup. Install (or refresh) the core skills explicitly, then inspect
+paths:
 
 ```bash
-via plugin install
+via plugin install          # into every available agent on this host; skips existing unless --force
 via plugin status
 ```
+
+Install targets cursor / claude / opencode / crush skill roots that look present on the host (PATH or
+config dir), similar to `npx skills add`. Startup warns if `via-editor`, `via-agents`, or `via-orc`
+are missing. Forks are left alone unless you pass `--force`.
 
 ## Session resolution
 
@@ -101,10 +105,10 @@ via session refresh --file src/lib.rs
 | `via session get`                              | Show the session resolved from `VIA_SESSION`                                |
 | `via session diagnostics [--file PATH] --json` | Refresh unchanged Neovim buffers with `:checktime`, then export diagnostics |
 | `via session refresh [--file PATH] [--json]`   | Ask Neovim to reload externally changed buffers                             |
-| `via plugin install`                           | Install or update the via plugin skills                                     |
+| `via plugin install [--from PATH] [--force]`   | Install core skills from the repo (or `--from`); skip existing unless `--force` |
 | `via plugin status`                            | Show install paths and state                                                |
-| `via plugin cleanup`                           | Remove the base skills from every known location                            |
-| `via plugin path`                              | Print the primary install root                                              |
+| `via plugin cleanup`                           | Remove the core skills from every known location                            |
+| `via plugin path`                              | Print skill roots install would target on this host                         |
 
 ## Output shape
 
@@ -127,3 +131,4 @@ commands are unavailable.
 - `:ViaBufferSend` / `<leader>ab` — push buffer or visual selection to the agent (explicit context)
 - Diagnostics CLI — pull structured state on demand (this skill)
 - Task board / agent bus — see the **via-agents** skill (`via task …`, `via agent …`)
+- Multi-agent orchestration — see the **via-orc** skill (main agent stays human POC)

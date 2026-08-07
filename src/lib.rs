@@ -89,12 +89,13 @@ async fn async_main(cli: Cli) -> Result<()> {
 
     if let Some(agent_command) = &app.user.agent_command {
         let family = plugin::detect_agent_family(agent_command);
-        match plugin::install(family, app.user.plugin_dir.as_deref()) {
-            Ok(paths) if !paths.is_empty() => {
-                info!(
+        match plugin::missing_core_skills(family) {
+            Ok(missing) if !missing.is_empty() => {
+                tracing::warn!(
                     agent = %agent_command,
-                    count = paths.len(),
-                    "installed via plugin skills for agent"
+                    missing = %missing.join(", "),
+                    "via core skills not installed; agent via functionality may be incomplete. \
+                     Run `via plugin install` (see `via plugin status`)"
                 );
             }
             Ok(_) => {}
@@ -102,7 +103,7 @@ async fn async_main(cli: Cli) -> Result<()> {
                 tracing::warn!(
                     agent = %agent_command,
                     %err,
-                    "failed to install via plugin for agent"
+                    "failed to check via plugin skills for agent"
                 );
             }
         }
