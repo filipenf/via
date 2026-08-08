@@ -21,7 +21,7 @@ use crate::acp_tui::{
     AcpTuiBridge, HostToTui, TranscriptKind, TuiToHost, resolve_acp_tui_bin, socket_path_for_agent,
     spawn_env_and_args,
 };
-use crate::config::{Config, PRIMARY_PTY_AGENT_ID, ReviewBackend};
+use crate::config::{AppContext, PRIMARY_PTY_AGENT_ID, ReviewBackend};
 use crate::event::{AcpHandshakeAction, AcpModalKind, EditorEvent, Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
@@ -61,7 +61,7 @@ const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(30);
 const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
 
 pub struct GhosttyUi {
-    config: Config,
+    app: AppContext,
     events: EventSender,
     ui_commands: TokioReceiver<UiCommand>,
     pending_agent_write: Option<PendingAgentWrite>,
@@ -73,9 +73,9 @@ struct PendingAgentWrite {
 }
 
 impl GhosttyUi {
-    pub fn new(config: Config, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
+    pub fn new(app: AppContext, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
         Self {
-            config,
+            app,
             events,
             ui_commands,
             pending_agent_write: None,
@@ -118,7 +118,7 @@ impl OutputNotifier for EventLoopProxy<UserEvent> {
 }
 
 struct WinitGhosttyApp {
-    config: Config,
+    app: AppContext,
     events: EventSender,
     ui_commands: TokioReceiver<UiCommand>,
     pending_agent_write: Option<PendingAgentWrite>,
@@ -373,7 +373,7 @@ impl WinitGhosttyApp {
         let terminal_config = TerminalConfig::load();
         let font_renderer = FontRenderer::new(&terminal_config)?;
         let pane_split_direction = PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
-        let pane_count = pane_count(&ui.config);
+        let pane_count = pane_count(&ui.app);
         let layout = SplitLayout::for_window(
             INITIAL_WIDTH,
             INITIAL_HEIGHT,
@@ -384,7 +384,7 @@ impl WinitGhosttyApp {
         );
 
         Ok(Self {
-            config: ui.config,
+            app: ui.app,
             events: ui.events,
             ui_commands: ui.ui_commands,
             pending_agent_write: ui.pending_agent_write,
@@ -457,18 +457,18 @@ impl WinitGhosttyApp {
                 self.height,
                 self.terminal_config.metrics,
             )?];
-            let nvim_args = nvim_args(&self.config);
+            let nvim_args = nvim_args(&self.app);
             let Some(editor_pane) = self.panes[0].as_terminal_mut() else {
                 return Err(anyhow!("editor pane is not a terminal"));
             };
             editor_pane.spawn(
-                &self.config.nvim_command,
+                &self.app.user.nvim_command,
                 nvim_args,
-                &self.config.working_directory,
+                &self.app.launch.working_directory,
                 &[],
                 self.output_notifier.clone(),
             )?;
-            if let Some(agent_command) = self.config.agent_command.clone() {
+            if let Some(agent_command) = self.app.user.agent_command.clone() {
                 self.create_agent_pane(
                     PRIMARY_PTY_AGENT_ID,
                     Some("agent"),
@@ -499,7 +499,7 @@ impl WinitGhosttyApp {
         let layout = SplitLayout::for_window(
             width,
             height,
-            pane_count(&self.config),
+            pane_count(&self.app),
             PaneLayoutMode::Split,
             PaneSplitDirection::for_window(width, height),
             self.split_layout_options(),
@@ -513,7 +513,7 @@ impl WinitGhosttyApp {
                 metrics,
                 &self.terminal_config.theme,
             )?,
-            self.config.scroll_sensitivity,
+            self.app.user.scroll_sensitivity,
         )))
     }
 
@@ -537,7 +537,7 @@ impl WinitGhosttyApp {
         // finally fall back to $SHELL so the pane is at least usable.
         let cmd = command
             .map(|s| s.to_string())
-            .or_else(|| self.config.agent_command.clone())
+            .or_else(|| self.app.user.agent_command.clone())
             .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
 
         if crate::config::is_acp_command(&cmd) {
@@ -550,7 +550,7 @@ impl WinitGhosttyApp {
             let role_label = role.unwrap_or(id);
             pane.spawn_shell_command(
                 &cmd,
-                &self.config.working_directory,
+                &self.app.launch.working_directory,
                 &[
                     (crate::agent_bus::VIA_AGENT_ID_ENV, id),
                     (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
@@ -566,7 +566,7 @@ impl WinitGhosttyApp {
                         acp_tui: false,
                     },
                     pane,
-                    self.config.scroll_sensitivity,
+                    self.app.user.scroll_sensitivity,
                 )));
         }
 
@@ -617,7 +617,7 @@ impl WinitGhosttyApp {
         pane.spawn(
             &bin_str,
             args.iter().map(|s| OsString::from(*s)),
-            &self.config.working_directory,
+            &self.app.launch.working_directory,
             &env,
             self.output_notifier.clone(),
         )
@@ -633,7 +633,7 @@ impl WinitGhosttyApp {
                     acp_tui: true,
                 },
                 pane,
-                self.config.scroll_sensitivity,
+                self.app.user.scroll_sensitivity,
             )));
         info!(%id, socket = %socket.display(), bin = %bin.display(), "spawned ACP TUI pane");
         Ok(())
@@ -683,7 +683,7 @@ impl WinitGhosttyApp {
             .iter()
             .filter_map(|pane| pane.agent_record())
             .collect();
-        if let Err(error) = crate::agent_bus::write_registry(&self.config.agents_dir, &records) {
+        if let Err(error) = crate::agent_bus::write_registry(&self.app.paths.agents_dir, &records) {
             warn!(%error, "failed to write agent registry");
         }
     }
@@ -854,7 +854,7 @@ impl WinitGhosttyApp {
     fn split_layout_options(&self) -> SplitLayoutOptions {
         SplitLayoutOptions {
             cell_width: self.terminal_config.metrics.cell_width,
-            agent_pane_cols: self.config.agent_pane_col_limits(),
+            agent_pane_cols: self.app.user.agent_pane_col_limits(),
         }
     }
 
@@ -864,7 +864,7 @@ impl WinitGhosttyApp {
         }
 
         let fits = match (
-            self.config.agent_pane_col_limits(),
+            self.app.user.agent_pane_col_limits(),
             self.pane_split_direction,
         ) {
             (Some((agent_min, _)), PaneSplitDirection::Vertical) => vertical_split_fits(
@@ -1182,7 +1182,7 @@ impl WinitGhosttyApp {
             return Ok(false);
         }
 
-        match self.config.review_backend {
+        match self.app.user.review_backend {
             ReviewBackend::Hunk => self.toggle_hunk_review()?,
             ReviewBackend::Nvim => self.open_nvim_review(),
         }
@@ -1209,14 +1209,14 @@ impl WinitGhosttyApp {
             )?;
             pane.spawn_shell_command(
                 hunk_review_command(),
-                &self.config.working_directory,
+                &self.app.launch.working_directory,
                 &[],
                 self.output_notifier.clone(),
             )?;
             let controller = TerminalPaneController::new(
                 PaneRole::ReviewTerminal,
                 pane,
-                self.config.scroll_sensitivity,
+                self.app.user.scroll_sensitivity,
             );
             self.review_pane = Some(controller);
         } else {
@@ -1228,7 +1228,7 @@ impl WinitGhosttyApp {
     }
 
     fn reload_hunk_review(&self) {
-        let repo = self.config.working_directory.clone();
+        let repo = self.app.launch.working_directory.clone();
         std::thread::spawn(move || {
             let status = Command::new("hunk")
                 .args(["session", "reload", "--repo"])
@@ -1325,7 +1325,7 @@ impl WinitGhosttyApp {
                         y,
                         self.modifiers,
                         ReferenceContext::new(
-                            &self.config.working_directory,
+                            &self.app.launch.working_directory,
                             Some(&self.file_index),
                         ),
                     )?;
@@ -1361,7 +1361,7 @@ impl WinitGhosttyApp {
             x - rect.x,
             y - rect.y,
             self.modifiers,
-            ReferenceContext::new(&self.config.working_directory, Some(&self.file_index)),
+            ReferenceContext::new(&self.app.launch.working_directory, Some(&self.file_index)),
         )?;
         let reference_navigation = Self::is_reference_navigation_command(&outcome.command);
         self.apply_pane_outcome(outcome);
@@ -1653,7 +1653,7 @@ impl WinitGhosttyApp {
                         &path,
                         start_line,
                         end_line,
-                        &self.config.working_directory,
+                        &self.app.launch.working_directory,
                     );
                     let Some(agent_pane) = self.first_agent_terminal_mut() else {
                         continue;
@@ -1806,7 +1806,7 @@ impl WinitGhosttyApp {
                 }
                 UiCommand::ReviewGateOpened { task_id, title } => {
                     info!(%task_id, %title, "review gate surfaced to UI");
-                    if self.config.review_backend == ReviewBackend::Hunk && !self.review_active {
+                    if self.app.user.review_backend == ReviewBackend::Hunk && !self.review_active {
                         if let Err(e) = self.toggle_hunk_review() {
                             error!(%e, "failed to open hunk review");
                         } else {
@@ -2037,7 +2037,7 @@ impl WinitGhosttyApp {
     fn handle_modifiers_changed(&mut self) {
         let mut dirty = false;
         let mut force_redraw = false;
-        let ctx = ReferenceContext::new(&self.config.working_directory, Some(&self.file_index));
+        let ctx = ReferenceContext::new(&self.app.launch.working_directory, Some(&self.file_index));
 
         if self.review_active {
             if let Some(review_pane) = &mut self.review_pane {
@@ -2059,8 +2059,8 @@ impl WinitGhosttyApp {
     }
 }
 
-fn pane_count(config: &Config) -> usize {
-    if config.agent_command.is_some() { 2 } else { 1 }
+fn pane_count(app: &AppContext) -> usize {
+    if app.user.agent_command.is_some() { 2 } else { 1 }
 }
 
 fn full_window_rect(width: usize, height: usize) -> PaneRect {
@@ -2076,24 +2076,24 @@ fn hunk_review_command() -> &'static str {
     r#"if command -v hunk >/dev/null 2>&1; then hunk diff; printf '\n[hunk exited - press Alt+R to return to via]\n'; exec "${SHELL:-sh}"; else printf 'via: hunk is not available on PATH. Set VIA_REVIEW_BACKEND=nvim or install hunk.\n'; exec "${SHELL:-sh}"; fi"#
 }
 
-fn nvim_args(config: &Config) -> Vec<OsString> {
+fn nvim_args(app: &AppContext) -> Vec<OsString> {
     vec![
         OsString::from("--listen"),
-        config.nvim_socket_path.clone().into_os_string(),
+        app.paths.nvim_socket_path.clone().into_os_string(),
         OsString::from("--cmd"),
         OsString::from(format!(
             "lua vim.g.via_editor_socket = {}",
-            lua_string_literal(&config.editor_socket_path)
+            lua_string_literal(&app.paths.editor_socket_path)
         )),
         OsString::from("--cmd"),
         OsString::from(format!(
             "lua vim.g.via_lsp_bridge_socket = {}",
-            lua_string_literal(&config.lsp_bridge_socket_path)
+            lua_string_literal(&app.paths.lsp_bridge_socket_path)
         )),
         OsString::from("--cmd"),
         OsString::from(format!(
             "lua vim.g.via_module_path = {}",
-            lua_string_literal(&config.nvim_via_module_path)
+            lua_string_literal(&app.paths.nvim_via_module_path)
         )),
         OsString::from("--cmd"),
         {
@@ -2107,7 +2107,7 @@ fn nvim_args(config: &Config) -> Vec<OsString> {
         OsString::from("-c"),
         OsString::from(format!(
             "luafile {}",
-            vim_fnameescape(&config.nvim_context_bridge_path)
+            vim_fnameescape(&app.paths.nvim_context_bridge_path)
         )),
     ]
 }
@@ -2182,6 +2182,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::config::AttachMode;
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
@@ -2614,26 +2615,36 @@ mod tests {
 
     #[test]
     fn nvim_args_install_context_bridge() {
-        let config = Config {
-            nvim_command: "nvim".to_string(),
-            agent_command: None,
-            acp_agent: None,
-            orchestration_enabled: false,
-            agent_pane_cols: None,
-            review_backend: ReviewBackend::Nvim,
-            scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
-            agents_dir: PathBuf::from("/tmp/via-agents"),
-            nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
-            working_directory: PathBuf::from("/repo"),
-            plugin_dir: None,
-            agent_presets: crate::config::default_agent_presets(),
-            auto_approve: crate::config::AutoApproveConfig::default(),
+        let app = AppContext {
+            user: crate::config::UserConfig {
+                nvim_command: "nvim".to_string(),
+                agent_command: None,
+                acp_agent: None,
+                agent_pane_cols: crate::config::AgentPaneCols {
+                    min: crate::config::DEFAULT_AGENT_PANE_MIN_COLS,
+                    max: crate::config::DEFAULT_AGENT_PANE_MAX_COLS,
+                },
+                review_backend: ReviewBackend::Nvim,
+                scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
+                plugin_dir: None,
+                agent_presets: crate::config::default_agent_presets(),
+                auto_approve: crate::config::AutoApproveConfig::default(),
+            },
+            paths: crate::config::RuntimePaths {
+                nvim_socket_path: PathBuf::from("/tmp/via-nvim.sock"),
+                editor_socket_path: PathBuf::from("/tmp/via-editor.sock"),
+                agents_dir: PathBuf::from("/tmp/via-agents"),
+                nvim_context_bridge_path: PathBuf::from("/repo/nvim/context bridge.lua"),
+                nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+                lsp_bridge_socket_path: PathBuf::from("/tmp/via-lsp-bridge.sock"),
+            },
+            launch: crate::config::LaunchContext {
+                working_directory: PathBuf::from("/repo"),
+                attach: AttachMode::Local,
+                orchestration_enabled: false,
+            },
         };
-        let args = nvim_args(&config);
+        let args = nvim_args(&app);
 
         assert_eq!(args[0], OsString::from("--listen"));
         assert_eq!(args[1], OsString::from("/tmp/via-nvim.sock"));

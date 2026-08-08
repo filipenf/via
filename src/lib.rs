@@ -82,14 +82,14 @@ async fn async_main(cli: Cli) -> Result<()> {
     logging::init();
     config::ensure_runtime_dir()?;
 
-    let config = config::Config::load(cli.config_overrides())?;
-    info!(?config, "starting via");
+    let app = config::AppContext::load(cli.config_overrides(), cli.attach_mode())?;
+    info!(?app, "starting via");
 
-    let _session_guard = session::SessionGuard::create(&config)?;
+    let _session_guard = session::SessionGuard::create(&app)?;
 
-    if let Some(agent_command) = &config.agent_command {
+    if let Some(agent_command) = &app.user.agent_command {
         let family = plugin::detect_agent_family(agent_command);
-        match plugin::install(family, config.plugin_dir.as_deref()) {
+        match plugin::install(family, app.user.plugin_dir.as_deref()) {
             Ok(paths) if !paths.is_empty() => {
                 info!(
                     agent = %agent_command,
@@ -108,17 +108,17 @@ async fn async_main(cli: Cli) -> Result<()> {
         }
     }
 
-    let mediator = Mediator::new(config.clone());
+    let mediator = Mediator::new(app.clone());
 
-    if let Some(cmd) = &config.agent_command {
+    if let Some(cmd) = &app.user.agent_command {
         info!(agent = %cmd, "primary PTY agent");
-        if config.orchestration_enabled {
+        if app.launch.orchestration_enabled {
             info!("ACP orchestration available; spawn orchestrator/reviewer/coder panes as needed");
         }
     }
 
     let mut handle = mediator.spawn();
-    let ui = GhosttyUi::new(config.clone(), handle.events(), handle.take_ui_commands());
+    let ui = GhosttyUi::new(app, handle.events(), handle.take_ui_commands());
     ui.describe_backend();
 
     ui.run()?;

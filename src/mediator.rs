@@ -12,7 +12,7 @@ use crate::acp_runtime::{AcpConnectCtx, AcpRuntime};
 use crate::agent_bus;
 use crate::agent_delivery::AgentDelivery;
 use crate::config::ReviewBackend;
-use crate::config::{Config, SpawnPreset};
+use crate::config::{AppContext, SpawnPreset};
 use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
@@ -68,7 +68,7 @@ fn selection_resource_uri(path: &Path, start_line: u32, end_line: u32) -> String
 /// bridge handle, and the `@tool` JSON protocol over PTY stdout. Workflow
 /// policy stays in skills/config — no new match-arm logic here.
 pub struct Mediator {
-    config: Config,
+    app: AppContext,
     events: mpsc::Receiver<Event>,
     ui_commands: mpsc::Sender<UiCommand>,
     editor_state: EditorState,
@@ -98,13 +98,13 @@ pub struct MediatorHandle {
 }
 
 impl Mediator {
-    pub fn new(config: Config) -> Self {
-        let auto_approve = AutoApprovePolicy::from_config(&config.auto_approve);
+    pub fn new(app: AppContext) -> Self {
+        let auto_approve = AutoApprovePolicy::from_config(&app.user.auto_approve);
         let (_events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
         let (ui_commands_tx, _ui_commands_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
         Self {
-            config,
+            app,
             events: events_rx,
             ui_commands: ui_commands_tx,
             editor_state: EditorState::default(),
@@ -122,8 +122,8 @@ impl Mediator {
     fn connect_ctx(&self) -> AcpConnectCtx {
         AcpConnectCtx {
             pending: self.agent_delivery.pending_arc(),
-            agents_dir: self.config.agents_dir.clone(),
-            cwd: self.config.working_directory.clone(),
+            agents_dir: self.app.paths.agents_dir.clone(),
+            cwd: self.app.launch.working_directory.clone(),
             event_sender: self.event_sender.clone(),
             ui_commands: self.ui_commands.clone(),
         }
@@ -143,15 +143,15 @@ impl Mediator {
             .spawn_initial_readers(events.clone(), self.ui_commands.clone());
 
         let editor_listener = editor::spawn_listener(
-            self.config.editor_socket_path.clone(),
-            self.config.working_directory.clone(),
+            self.app.paths.editor_socket_path.clone(),
+            self.app.launch.working_directory.clone(),
             events.clone(),
         );
 
         let (lsp_handle, lsp_listener, _lsp_state, mut lsp_clients_updates) =
             lsp_bridge::spawn_listener(
-                self.config.lsp_bridge_socket_path.clone(),
-                self.config.working_directory.clone(),
+                self.app.paths.lsp_bridge_socket_path.clone(),
+                self.app.launch.working_directory.clone(),
             );
         self.lsp_handle = Some(lsp_handle.clone());
 
@@ -184,10 +184,10 @@ impl Mediator {
 
     async fn run(&mut self) {
         info!(
-            nvim_command = %self.config.nvim_command,
-            nvim_socket = %self.config.nvim_socket_path.display(),
-            editor_socket = %self.config.editor_socket_path.display(),
-            agent_configured = self.config.agent_command.is_some(),
+            nvim_command = %self.app.user.nvim_command,
+            nvim_socket = %self.app.paths.nvim_socket_path.display(),
+            editor_socket = %self.app.paths.editor_socket_path.display(),
+            agent_configured = self.app.user.agent_command.is_some(),
             "mediator ready"
         );
 
@@ -206,8 +206,8 @@ impl Mediator {
                         .file_index
                         .resolve_open_from_index(path, line);
                     if let Err(error) = nvim::open_file(
-                        &self.config.nvim_socket_path,
-                        &self.config.working_directory,
+                        &self.app.paths.nvim_socket_path,
+                        &self.app.launch.working_directory,
                         target,
                         &candidates,
                     )
@@ -220,7 +220,7 @@ impl Mediator {
                     if let Some(task) = self.in_flight_symbol_open.take() {
                         task.abort();
                     }
-                    let socket_path = self.config.nvim_socket_path.clone();
+                    let socket_path = self.app.paths.nvim_socket_path.clone();
                     self.in_flight_symbol_open = Some(tokio::spawn(async move {
                         if let Err(error) = nvim::open_symbol(&socket_path, &symbol).await {
                             error!(%error, symbol, "failed to open symbol in Neovim");
@@ -229,8 +229,8 @@ impl Mediator {
                 }
                 Event::Ui(UiEvent::ReviewRequested) => {
                     if let Err(error) = nvim::open_review(
-                        &self.config.nvim_socket_path,
-                        &self.config.working_directory,
+                        &self.app.paths.nvim_socket_path,
+                        &self.app.launch.working_directory,
                     )
                     .await
                     {
@@ -310,7 +310,7 @@ impl Mediator {
             });
         } else if self
             .acp_runtime
-            .recipient_is_acp(&self.config.agents_dir, target)
+            .recipient_is_acp(&self.app.paths.agents_dir, target)
             .await
         {
             self.agent_delivery.queue_prompt(target, text, false).await;
@@ -319,7 +319,7 @@ impl Mediator {
                 .deliver_if_ready(
                     &self.agent_delivery.pending_arc(),
                     target,
-                    &self.config.agents_dir,
+                    &self.app.paths.agents_dir,
                     &self.ui_commands,
                 )
                 .await
@@ -345,7 +345,7 @@ impl Mediator {
                 // Explicit buffer/selection send always targets the primary PTY
                 // agent pane — never a spawned ACP helper (reviewer/coder/…).
                 let display_path = path
-                    .strip_prefix(&self.config.working_directory)
+                    .strip_prefix(&self.app.launch.working_directory)
                     .unwrap_or(path);
                 let payload = if let (Some(start), Some(end)) = (start_line, end_line) {
                     format!("@{}:{start}-{end}\n", display_path.display())
@@ -367,7 +367,7 @@ impl Mediator {
                 let target = agent_id.as_deref().unwrap_or(ORCHESTRATOR_AGENT_ID);
                 if self
                     .acp_runtime
-                    .recipient_is_acp(&self.config.agents_dir, target)
+                    .recipient_is_acp(&self.app.paths.agents_dir, target)
                     .await
                 {
                     info!(
@@ -386,7 +386,7 @@ impl Mediator {
                         .deliver_if_ready(
                             &self.agent_delivery.pending_arc(),
                             target,
-                            &self.config.agents_dir,
+                            &self.app.paths.agents_dir,
                             &self.ui_commands,
                         )
                         .await
@@ -406,7 +406,7 @@ impl Mediator {
                         ts: crate::util::now_millis(),
                         text: content.clone(),
                     };
-                    if let Err(err) = agent_bus::enqueue(&self.config.agents_dir, &envelope) {
+                    if let Err(err) = agent_bus::enqueue(&self.app.paths.agents_dir, &envelope) {
                         warn!(%err, agent_id = target, "failed to enqueue bus message");
                     }
                 } else {
@@ -422,7 +422,7 @@ impl Mediator {
                 command,
                 model,
             } => {
-                if !self.config.orchestration_enabled {
+                if !self.app.launch.orchestration_enabled {
                     warn!(
                         %id,
                         "spawn agent ignored: orchestration unavailable (no ACP mapping for configured agent)"
@@ -438,13 +438,13 @@ impl Mediator {
                         role,
                         command,
                         model,
-                    } = self.config.apply_spawn_preset(
+                    } = self.app.user.apply_spawn_preset(
                         id.as_str(),
                         role.clone(),
                         command.clone(),
                         model.clone(),
                     );
-                    let launch = self.config.resolve_spawn_command(command.as_deref());
+                    let launch = self.app.user.resolve_spawn_command(command.as_deref());
                     let resolved = launch.command;
 
                     if launch.acp {
@@ -483,11 +483,11 @@ impl Mediator {
             }
             EditorEvent::ReviewGateOpened { task_id, title } => {
                 info!(%task_id, %title, "review gate opened");
-                match self.config.review_backend {
+                match self.app.user.review_backend {
                     ReviewBackend::Nvim => {
                         if let Err(error) = nvim::open_review(
-                            &self.config.nvim_socket_path,
-                            &self.config.working_directory,
+                            &self.app.paths.nvim_socket_path,
+                            &self.app.launch.working_directory,
                         )
                         .await
                         {
@@ -717,37 +717,50 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
-    fn test_config() -> Config {
-        Config {
-            nvim_command: "nvim".to_string(),
-            agent_command: Some("echo agent".to_string()),
-            acp_agent: None,
-            orchestration_enabled: false,
-            agent_pane_cols: None,
-            review_backend: crate::config::ReviewBackend::Nvim,
-            scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
-            nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
-            editor_socket_path: PathBuf::from("/tmp/editor.sock"),
-            agents_dir: PathBuf::from("/tmp/agents"),
-            nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
-            nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
-            lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
-            working_directory: PathBuf::from("/tmp"),
-            plugin_dir: None,
-            agent_presets: crate::config::default_agent_presets(),
-            auto_approve: crate::config::AutoApproveConfig::default(),
+    fn test_app() -> AppContext {
+        AppContext {
+            user: crate::config::UserConfig {
+                nvim_command: "nvim".to_string(),
+                agent_command: Some("echo agent".to_string()),
+                acp_agent: None,
+                agent_pane_cols: crate::config::AgentPaneCols {
+                    min: crate::config::DEFAULT_AGENT_PANE_MIN_COLS,
+                    max: crate::config::DEFAULT_AGENT_PANE_MAX_COLS,
+                },
+                review_backend: crate::config::ReviewBackend::Nvim,
+                scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
+                plugin_dir: None,
+                agent_presets: crate::config::default_agent_presets(),
+                auto_approve: crate::config::AutoApproveConfig::default(),
+            },
+            paths: crate::config::RuntimePaths {
+                nvim_socket_path: PathBuf::from("/tmp/nvim.sock"),
+                editor_socket_path: PathBuf::from("/tmp/editor.sock"),
+                agents_dir: PathBuf::from("/tmp/agents"),
+                nvim_context_bridge_path: PathBuf::from("/tmp/context_bridge.lua"),
+                nvim_via_module_path: PathBuf::from("/tmp/via-module.lua"),
+                lsp_bridge_socket_path: PathBuf::from("/tmp/lsp.sock"),
+            },
+            launch: crate::config::LaunchContext {
+                working_directory: PathBuf::from("/tmp"),
+                attach: crate::config::AttachMode::Local,
+                orchestration_enabled: false,
+            },
         }
     }
 
-    fn test_config_with_agents_dir(agents_dir: PathBuf) -> Config {
-        Config {
-            agents_dir,
-            ..test_config()
+    fn test_app_with_agents_dir(agents_dir: PathBuf) -> AppContext {
+        AppContext {
+            paths: crate::config::RuntimePaths {
+                agents_dir,
+                ..test_app().paths
+            },
+            ..test_app()
         }
     }
 
-    fn mediator_with_ui_receiver(config: Config) -> (Mediator, mpsc::Receiver<UiCommand>) {
-        let mut mediator = Mediator::new(config);
+    fn mediator_with_ui_receiver(app: AppContext) -> (Mediator, mpsc::Receiver<UiCommand>) {
+        let mut mediator = Mediator::new(app);
         let (ui_tx, ui_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
         mediator.ui_commands = ui_tx;
         (mediator, ui_rx)
@@ -762,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_clients_tool_returns_empty_array_without_bridge() {
-        let mediator = Mediator::new(test_config());
+        let mediator = Mediator::new(test_app());
         let response = mediator
             .handle_tool_command(r#"{"id":"1","method":"lsp_clients"}"#)
             .await
@@ -776,7 +789,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_tool_method_returns_error() {
-        let mediator = Mediator::new(test_config());
+        let mediator = Mediator::new(test_app());
         let response = mediator
             .handle_tool_command(r#"{"id":"2","method":"lsp_hover"}"#)
             .await
@@ -796,13 +809,21 @@ mod tests {
     #[tokio::test]
     async fn spawn_agent_without_command_uses_preset_role_and_resolved_acp_command() {
         let agents_dir = temp_dir("spawn-default-acp");
-        let config = Config {
+        let mut base = test_app();
+        base.user = crate::config::UserConfig {
             agent_command: Some("unknown-agent".to_string()),
             acp_agent: Some("false acp".to_string()),
-            orchestration_enabled: true,
-            agents_dir: agents_dir.clone(),
-            ..test_config()
+            ..base.user
         };
+        base.paths = crate::config::RuntimePaths {
+            agents_dir: agents_dir.clone(),
+            ..base.paths
+        };
+        base.launch = crate::config::LaunchContext {
+            orchestration_enabled: true,
+            ..base.launch
+        };
+        let config = base;
         let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(config);
 
         mediator
@@ -852,14 +873,22 @@ mod tests {
                 model: Some("from-preset".to_string()),
             },
         );
-        let config = Config {
+        let mut base = test_app();
+        base.user = crate::config::UserConfig {
             agent_command: Some("unknown-agent".to_string()),
             acp_agent: Some("false acp".to_string()),
-            orchestration_enabled: true,
-            agents_dir: agents_dir.clone(),
             agent_presets: presets,
-            ..test_config()
+            ..base.user
         };
+        base.paths = crate::config::RuntimePaths {
+            agents_dir: agents_dir.clone(),
+            ..base.paths
+        };
+        base.launch = crate::config::LaunchContext {
+            orchestration_enabled: true,
+            ..base.launch
+        };
+        let config = base;
         let (mut mediator, _ui_rx) = mediator_with_ui_receiver(config);
 
         mediator
@@ -896,14 +925,22 @@ mod tests {
                 model: Some("composer-2.5".to_string()),
             },
         );
-        let config = Config {
+        let mut base = test_app();
+        base.user = crate::config::UserConfig {
             agent_command: Some("unknown-agent".to_string()),
             acp_agent: Some("false acp".to_string()),
-            orchestration_enabled: true,
-            agents_dir: agents_dir.clone(),
             agent_presets: presets,
-            ..test_config()
+            ..base.user
         };
+        base.paths = crate::config::RuntimePaths {
+            agents_dir: agents_dir.clone(),
+            ..base.paths
+        };
+        base.launch = crate::config::LaunchContext {
+            orchestration_enabled: true,
+            ..base.launch
+        };
+        let config = base;
         let (mut mediator, _ui_rx) = mediator_with_ui_receiver(config);
 
         mediator
@@ -931,12 +968,20 @@ mod tests {
     #[tokio::test]
     async fn spawn_agent_rejects_human_reserved_id() {
         let agents_dir = temp_dir("spawn-human-rejected");
-        let config = Config {
+        let mut base = test_app();
+        base.user = crate::config::UserConfig {
             agent_command: Some("opencode".to_string()),
-            orchestration_enabled: true,
-            agents_dir: agents_dir.clone(),
-            ..test_config()
+            ..base.user
         };
+        base.paths = crate::config::RuntimePaths {
+            agents_dir: agents_dir.clone(),
+            ..base.paths
+        };
+        base.launch = crate::config::LaunchContext {
+            orchestration_enabled: true,
+            ..base.launch
+        };
+        let config = base;
         let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(config);
 
         mediator
@@ -983,7 +1028,7 @@ mod tests {
         )
         .unwrap();
         let (mut mediator, mut ui_rx) =
-            mediator_with_ui_receiver(test_config_with_agents_dir(agents_dir.clone()));
+            mediator_with_ui_receiver(test_app_with_agents_dir(agents_dir.clone()));
 
         mediator
             .apply_editor_event(EditorEvent::AgentSend {
@@ -1008,7 +1053,7 @@ mod tests {
 
     #[tokio::test]
     async fn buffer_send_targets_primary_agent_not_spawned_helpers() {
-        let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(test_config());
+        let (mut mediator, mut ui_rx) = mediator_with_ui_receiver(test_app());
 
         mediator
             .apply_editor_event(EditorEvent::BufferSendRequested {

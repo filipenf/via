@@ -67,7 +67,7 @@ helpers use ACP when the configured driver supports it.
 
 The central async coordinator. It owns:
 
-- A `Config`.
+- An `AppContext` (user prefs, runtime paths, and launch/attach context).
 - `EditorState` (current buffer, diagnostics per path, visual selection, LSP
   client summaries).
 - Optional `AcpClient` (when `VIA_AGENT` ends with `acp`).
@@ -244,17 +244,28 @@ conversation handles inside an instance, not file-backed storage.
 
 ### Config, instances, and CLI (src/config.rs, src/session.rs, src/cli/\*)
 
-Config resolution is strict precedence: CLI > env (`VIA_*`) >
-`~/.config/via/via.conf` (TOML) > built-in defaults. The primary `agent` command
-must be a PTY launch (not ending with `acp`). `orchestration_enabled` reflects
-whether spawned helpers can resolve to ACP (known-agent table or `acp_agent`
-override). Spawn presets (`[agents.orchestrator]`, `[agents.reviewer]`,
-`[agents.coder]` in `via.conf`, plus built-in defaults) fill missing `role` /
-`command` / `model` when opening helper panes. Each preset may include an optional
-`model` slug; on ACP connect, `establish_acp` calls `session/set_config_option`
-after `session/new` and pushes the result to the pane header via
-`UiCommand::AcpSessionStatus`. Explicit `--model` on `via agent spawn` or
-`assign` overrides the preset for that spawn. Requires ACP orchestration and
+Startup wiring is split into three ownership-aligned pieces bundled as
+`AppContext`:
+
+- **`UserConfig`** — durable preferences from CLI > env (`VIA_*`) >
+  `~/.config/via/via.conf` (TOML) > built-in defaults (`nvim`, `agent`, scroll,
+  `auto_approve`, spawn presets, …).
+- **`RuntimePaths`** — per-instance sockets, agents dir, and bridge module paths
+  (env overrides or defaults under the runtime root).
+- **`LaunchContext`** — how this process was started: working directory, local vs
+  remote `AttachMode`, and derived `orchestration_enabled`. Remote attach is
+  CLI-only (not stored in `via.conf`); the attach CLI lands with remote
+  execution.
+
+The primary `agent` command must be a PTY launch (not ending with `acp`).
+`orchestration_enabled` reflects whether spawned helpers can resolve to ACP
+(known-agent table or `acp_agent` override). Spawn presets (`[agents.orchestrator]`,
+`[agents.reviewer]`, `[agents.coder]` in `via.conf`, plus built-in defaults) fill
+missing `role` / `command` / `model` when opening helper panes. Each preset may
+include an optional `model` slug; on ACP connect, `establish_acp` calls
+`session/set_config_option` after `session/new` and pushes the result to the pane
+header via `UiCommand::AcpSessionStatus`. Explicit `--model` on `via agent spawn`
+or `assign` overrides the preset for that spawn. Requires ACP orchestration and
 agent support for the `model` config option.
 
 `SessionGuard` writes (and removes on drop) a per-instance manifest under
