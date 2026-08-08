@@ -93,14 +93,6 @@ impl Cli {
         }
     }
 
-    /// Local vs remote attach mode for this process launch.
-    ///
-    /// Remote attach CLI (`--remote`) lands with remote execution; until then
-    /// every process is local.
-    pub fn attach_mode(&self) -> crate::config::AttachMode {
-        crate::config::AttachMode::Local
-    }
-
     /// Options for [`crate::acp_tui::run`] when `--acp-tui` is set.
     pub fn acp_tui_args(&self) -> crate::acp_tui::Args {
         crate::acp_tui::Args {

@@ -2182,7 +2182,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::config::AttachMode;
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
     use layout::PaneRect;
@@ -2640,7 +2639,6 @@ mod tests {
             },
             launch: crate::config::LaunchContext {
                 working_directory: PathBuf::from("/repo"),
-                attach: AttachMode::Local,
                 orchestration_enabled: false,
             },
         };

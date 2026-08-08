@@ -82,7 +82,7 @@ async fn async_main(cli: Cli) -> Result<()> {
     logging::init();
     config::ensure_runtime_dir()?;
 
-    let app = config::AppContext::load(cli.config_overrides(), cli.attach_mode())?;
+    let app = config::AppContext::load(cli.config_overrides())?;
     info!(?app, "starting via");
 
     let _session_guard = session::SessionGuard::create(&app)?;

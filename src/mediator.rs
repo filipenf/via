@@ -743,7 +743,6 @@ mod tests {
             },
             launch: crate::config::LaunchContext {
                 working_directory: PathBuf::from("/tmp"),
-                attach: crate::config::AttachMode::Local,
                 orchestration_enabled: false,
             },
         }

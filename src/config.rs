@@ -131,35 +131,10 @@ pub struct RuntimePaths {
     pub lsp_bridge_socket_path: PathBuf,
 }
 
-/// How this process was started (not persisted to `via.conf`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AttachMode {
-    Local,
-    /// Local GUI attached to a remote helper (`via --remote <host>` / `via remote <host>`).
-    Remote {
-        host: String,
-        /// Working directory on the remote host for spawned panes.
-        cwd: Option<PathBuf>,
-        /// Optional control socket override (also used for `host=local` / `VIA_REMOTE_SOCKET`).
-        socket: Option<PathBuf>,
-    },
-}
-
-impl AttachMode {
-    /// Remote helper cwd when attaching; `None` for local or when `--cwd` was omitted.
-    pub fn cwd(&self) -> Option<&PathBuf> {
-        match self {
-            Self::Remote { cwd, .. } => cwd.as_ref(),
-            Self::Local => None,
-        }
-    }
-}
-
-/// Session launch context: cwd, attach mode, and derived orchestration capability.
+/// Session launch context: working directory and derived orchestration capability.
 #[derive(Debug, Clone)]
 pub struct LaunchContext {
     pub working_directory: PathBuf,
-    pub attach: AttachMode,
     /// True when the configured agent can be launched in ACP form for spawned helpers
     /// (known-agent table or `acp_agent` override). Does not upgrade the primary pane.
     pub orchestration_enabled: bool,
@@ -527,7 +502,7 @@ impl RuntimePaths {
 }
 
 impl AppContext {
-    pub fn load(cli: ConfigOverrides, attach: AttachMode) -> AnyResult<Self> {
+    pub fn load(cli: ConfigOverrides) -> AnyResult<Self> {
         let prefs = resolve_user_config(cli)?;
         let agent_command = prefs.agent_command.clone();
         if let Some(agent) = agent_command.as_deref() {
@@ -538,8 +513,7 @@ impl AppContext {
             .map(|agent| resolve_agent_launch(agent, prefs.acp_agent.as_deref()).acp)
             .unwrap_or(false);
 
-        let local_cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let working_directory = attach.cwd().cloned().unwrap_or(local_cwd);
+        let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let user = UserConfig {
             nvim_command: prefs.nvim_command,
@@ -558,7 +532,6 @@ impl AppContext {
             paths: RuntimePaths::from_env_or_defaults(),
             launch: LaunchContext {
                 working_directory,
-                attach,
                 orchestration_enabled,
             },
         })
@@ -805,7 +778,6 @@ fn default_lsp_bridge_socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     #[test]
     fn default_socket_path_is_process_scoped() {
@@ -1444,57 +1416,14 @@ model = "composer-2.5"
 
     #[test]
     fn load_rejects_acp_primary_agent() {
-        let err = AppContext::load(
-            ConfigOverrides {
-                agent: Some("opencode acp".to_string()),
-                ..ConfigOverrides::default()
-            },
-            AttachMode::Local,
-        )
+        let err = AppContext::load(ConfigOverrides {
+            agent: Some("opencode acp".to_string()),
+            ..ConfigOverrides::default()
+        })
         .unwrap_err();
         assert!(
             err.to_string()
                 .contains("primary agent must be a PTY command")
         );
-    }
-
-    #[test]
-    fn load_uses_remote_cwd_for_working_directory() {
-        let app = AppContext::load(
-            ConfigOverrides::default(),
-            AttachMode::Remote {
-                host: "devbox".to_string(),
-                cwd: Some(PathBuf::from("/repo-r")),
-                socket: Some(PathBuf::from("/tmp/c.sock")),
-            },
-        )
-        .expect("load");
-
-        assert_eq!(app.launch.working_directory, PathBuf::from("/repo-r"));
-        match &app.launch.attach {
-            AttachMode::Remote { host, cwd, socket } => {
-                assert_eq!(host, "devbox");
-                assert_eq!(cwd.as_deref(), Some(Path::new("/repo-r")));
-                assert_eq!(socket.as_deref(), Some(Path::new("/tmp/c.sock")));
-            }
-            AttachMode::Local => panic!("expected remote attach"),
-        }
-    }
-
-    #[test]
-    fn load_remote_without_cwd_keeps_local_working_directory() {
-        let local = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        let app = AppContext::load(
-            ConfigOverrides::default(),
-            AttachMode::Remote {
-                host: "local".to_string(),
-                cwd: None,
-                socket: None,
-            },
-        )
-        .expect("load");
-
-        assert_eq!(app.launch.working_directory, local);
-        assert!(matches!(app.launch.attach, AttachMode::Remote { .. }));
     }
 }

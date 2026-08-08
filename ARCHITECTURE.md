@@ -252,10 +252,8 @@ Startup wiring is split into three ownership-aligned pieces bundled as
   `auto_approve`, spawn presets, …).
 - **`RuntimePaths`** — per-instance sockets, agents dir, and bridge module paths
   (env overrides or defaults under the runtime root).
-- **`LaunchContext`** — how this process was started: working directory, local vs
-  remote `AttachMode`, and derived `orchestration_enabled`. Remote attach is
-  CLI-only (not stored in `via.conf`); the attach CLI lands with remote
-  execution.
+- **`LaunchContext`** — process launch wiring: working directory and derived
+  `orchestration_enabled`.
 
 The primary `agent` command must be a PTY launch (not ending with `acp`).
 `orchestration_enabled` reflects whether spawned helpers can resolve to ACP
