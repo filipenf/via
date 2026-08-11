@@ -227,7 +227,7 @@ pub(super) fn forward_special_keys(
             }
         }
 
-        if let Some(bytes) = key_sequence(key) {
+        if let Some(bytes) = key_sequence(key, modifiers) {
             payload.extend_from_slice(bytes);
         }
     }
@@ -274,10 +274,12 @@ fn ctrl_sequence(key: Key) -> Option<[u8; 1]> {
     Some([byte])
 }
 
-fn key_sequence(key: Key) -> Option<&'static [u8]> {
+fn key_sequence(key: Key, modifiers: Modifiers) -> Option<&'static [u8]> {
     match key {
         Key::Enter | Key::NumPadEnter => Some(b"\r"),
         Key::Backspace => Some(b"\x7f"),
+        // xterm/CSI back-tab — cursor-agent and other TUIs use this for mode cycling.
+        Key::Tab if modifiers.shift => Some(b"\x1b[Z"),
         Key::Tab => Some(b"\t"),
         Key::Escape => Some(b"\x1b"),
         Key::Up => Some(b"\x1b[A"),
@@ -291,5 +293,30 @@ fn key_sequence(key: Key) -> Option<&'static [u8]> {
         Key::Insert => Some(b"\x1b[2~"),
         Key::Delete => Some(b"\x1b[3~"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_encodes_as_horizontal_tab() {
+        assert_eq!(
+            key_sequence(Key::Tab, Modifiers::default()),
+            Some(b"\t".as_slice())
+        );
+    }
+
+    #[test]
+    fn shift_tab_encodes_as_csi_back_tab() {
+        let modifiers = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            key_sequence(Key::Tab, modifiers),
+            Some(b"\x1b[Z".as_slice())
+        );
     }
 }
