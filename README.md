@@ -50,9 +50,9 @@ doesn't support ACP (e.g. claude, crush), you can pick a different agent for orc
 primary PTY pane keeps the id `agent`; the coordinator is `orchestrator`.
 
 **Design policy:** Via provides the transports (panes, bus, ACP). Agents orchestrate themselves using skills and the
-`via agent` CLI; multi-agent workflows are not encoded in the mediator. Install skills explicitly with
-`via plugin install` (see `via-editor`, `via-agents`, `via-orc`). Orchestration policy — main interactive agent stays
-the human point of contact — lives in `via-orc`.
+`via agent` CLI; multi-agent workflows are not encoded in the mediator. Install the `via-editor`, `via-agents`, and
+`via-orc` skills yourself (see [Build](#build)). Orchestration policy — main interactive agent stays the human point of
+contact — lives in `via-orc`.
 
 ### Per-agent models and drivers
 
@@ -232,20 +232,28 @@ cargo build --release
 
 `libghostty-vt` is statically linked into the binary, so no runtime library search path setup is needed.
 
-Via provides 3 skills for agent management, orchestration and basic editor functionality. You can install the skill
-directly from the repo using:
+Via ships three agent skills under [`skills/`](skills/) (`via-editor`, `via-agents`, `via-orc`). Via does **not**
+install them — pick whatever fits your toolchain:
 
 ```sh
-via plugin install              # into every available agent on this host (cursor/claude/opencode/…)
-via plugin status               # presence of via-editor / via-agents / via-orc across roots
-# via plugin install --force    # overwrite forks
+# Node (vercel-labs/skills)
+npx skills add filipenf/via -g
+
+# No Node — Rust CLI (https://github.com/olamedia/skills-rs)
+skills add filipenf/via --global
+
+# Manual: clone or curl, then copy into agent skill roots
+git clone https://github.com/filipenf/via.git /tmp/via
+cp -R /tmp/via/skills/via-* ~/.agents/skills/
+# also e.g. ~/.cursor/skills/, ~/.claude/skills/, ~/.config/opencode/skills/
+
+via plugin status               # check presence across known roots
+via plugin path                 # list those roots
 ```
 
-Or use `npx skills add filipenf/via` to pull the skills from GitHub. You can fork and edit the skills if you need to
-tweak them for your workflow.
+Fork and edit installed copies freely. Startup warns if any core skill is missing for the session agent; it never
+writes skill files.
 
-Install detects agents via PATH / config dirs (similar to `npx skills add`). Startup warns if any core skill is missing
-for the session agent; it never writes skill files.
 ### Development
 
 ```sh
@@ -278,7 +286,6 @@ agent = "agent"             # PTY primary; spawned helpers resolve to ACP separa
 # acp_agent = "cursor-agent acp"  # when primary is not ACP-capable (claude, crush, …)
 agent_pane_cols = "80:120"
 review_backend = "nvim"
-plugin_dir = "~/my-via-plugin"
 
 [agents.orchestrator]
 model = "claude-opus-4-8-thinking-high"
@@ -319,12 +326,6 @@ Equivalent CLI/env names:
 - `--acp-agent` / `VIA_ACP_AGENT`
 - `--agent-pane-cols` / `VIA_AGENT_PANE_COLS`
 - `--review-backend` / `VIA_REVIEW_BACKEND`
-- `--plugin-dir` / `VIA_PLUGIN_DIR`
-
-`plugin_dir` / `--from` points at a local directory of agent skills (a via checkout with `skills/`, a plugin root with
-`skills/`, or the `skills/` dir itself). `via plugin install` copies those skills into every available agent skill root
-on the host; existing skill dirs are skipped unless `--force` so forks survive. Startup never installs — it only warns
-if `via-editor`, `via-agents`, or `via-orc` are missing for the session agent.
 
 Use `--persist` to write the resolved user-facing config to `via.conf` before running. For example, this writes
 `agent = "opencode"` (PTY primary) plus defaults:

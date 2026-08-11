@@ -39,10 +39,6 @@ pub struct Cli {
     #[arg(long = "scroll-sensitivity")]
     pub scroll_sensitivity: Option<f32>,
 
-    /// Local directory of skills used by `via plugin install` (via checkout or skills/).
-    #[arg(long = "plugin-dir")]
-    pub plugin_dir: Option<String>,
-
     /// Write the resolved user-facing configuration to via.conf before running.
     #[arg(long = "persist")]
     pub persist: bool,
@@ -87,7 +83,6 @@ impl Cli {
             agent_pane_cols: self.agent_pane_cols,
             review_backend: self.review_backend,
             scroll_sensitivity: self.scroll_sensitivity,
-            plugin_dir: self.plugin_dir.clone(),
             agent_presets: Default::default(),
             auto_approve: Default::default(),
         }
@@ -374,35 +369,6 @@ mod tests {
                     json: false,
                     peek: true,
                     wait: Some(30),
-                },
-            })
-        ));
-    }
-
-    #[test]
-    fn parses_plugin_install_from() {
-        let cli =
-            Cli::try_parse_from(["via", "plugin", "install", "--from", "/tmp/my-plugin"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Plugin {
-                command: PluginCommand::Install {
-                    from: Some(path),
-                    force: false,
-                },
-            }) if path == Path::new("/tmp/my-plugin")
-        ));
-    }
-
-    #[test]
-    fn parses_plugin_install_force() {
-        let cli = Cli::try_parse_from(["via", "plugin", "install", "--force"]).unwrap();
-        assert!(matches!(
-            cli.command,
-            Some(Command::Plugin {
-                command: PluginCommand::Install {
-                    from: None,
-                    force: true,
                 },
             })
         ));

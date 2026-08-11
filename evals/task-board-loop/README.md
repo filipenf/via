@@ -22,7 +22,8 @@ Not CI-gated (same policy as `mise run e2e-agents`).
 - `via` on `PATH` (built/installed)
 - `jq`, `nvim` (≥ 0.9, for `nvim -l` fixture tests — same as `mise run test-nvim`)
 - For the full loop: a live via session with ACP spawn enabled (e.g.
-  `via --agent opencode`), and skills installed (`via plugin install`)
+  `via --agent opencode`), and via skills installed (`npx skills add filipenf/via`
+  or equivalent)
 
 ## Portable pack (any harness / model)
 

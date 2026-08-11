@@ -729,7 +729,6 @@ mod tests {
                 },
                 review_backend: crate::config::ReviewBackend::Nvim,
                 scroll_sensitivity: crate::config::DEFAULT_SCROLL_SENSITIVITY,
-                plugin_dir: None,
                 agent_presets: crate::config::default_agent_presets(),
                 auto_approve: crate::config::AutoApproveConfig::default(),
             },

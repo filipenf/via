@@ -318,11 +318,11 @@ within a **workspace** — not in the ephemeral instance directory.
 ### Plugin (src/plugin.rs)
 
 Core skills (`via-editor`, `via-agents`, `via-orc`) live as files under the
-repo's `skills/` tree — not embedded in the binary. `via plugin install`
-copies them into every available agent skill root on the host (cursor, claude,
-opencode, crush, …), detected via PATH / config dirs, similar to
-`npx skills add`. Explicit only; skips existing dirs unless `--force`. Startup
-warns if any core skill is missing for the session agent.
+repo's `skills/` tree — not embedded in the binary and not installed by via.
+Users install them with an external skills CLI (`npx skills`, `skills-rs`) or a
+manual copy into agent skill roots. This module only maps the session agent to
+skill roots, exposes `via plugin status` / `path`, and warns at startup when
+core skills are missing.
 
 ### Other notable pieces
 
@@ -364,10 +364,10 @@ and are mitigated by the native + GPU nature of the stack.
   active buffer was removed to reduce noise.
 - The review backend can be `nvim` (opens a Neovim diff/review layout) or
   `hunk`.
-- Core skills (`via-editor`, `via-agents`, `via-orc`) are installed explicitly with
-  `via plugin install` into every available agent on the host so agents can pull
-  diagnostics, use the board/bus, and follow orchestration policy. Startup warns
-  if they are missing for the session agent.
+- Core skills (`via-editor`, `via-agents`, `via-orc`) are user-installed (npx
+  skills / skills-rs / manual copy) so agents can pull diagnostics, use the
+  board/bus, and follow orchestration policy. Startup warns if they are missing
+  for the session agent.
 - Multi-agent spawning: the orchestrator (primary agent) or Neovim Lua
   (`require('via').agent.spawn(id, role, command, model)`) can request additional
   agent panes at runtime. A spawned agent whose command ends in `acp` (see

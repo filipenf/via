@@ -95,7 +95,8 @@ async fn async_main(cli: Cli) -> Result<()> {
                     agent = %agent_command,
                     missing = %missing.join(", "),
                     "via core skills not installed; agent via functionality may be incomplete. \
-                     Run `via plugin install` (see `via plugin status`)"
+                     Install via-editor / via-agents / via-orc (npx skills, skills-rs, or manual \
+                     copy — see README); check with `via plugin status`"
                 );
             }
             Ok(_) => {}

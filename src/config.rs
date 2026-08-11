@@ -110,9 +110,6 @@ pub struct UserConfig {
     pub review_backend: ReviewBackend,
     /// Mouse wheel sensitivity multiplier; higher scrolls faster, lower slower.
     pub scroll_sensitivity: f32,
-    /// Optional local directory holding a user plugin (skills/agents/workflows),
-    /// used as the skills source for `via plugin install` when set.
-    pub plugin_dir: Option<PathBuf>,
     /// Spawn presets keyed by agent id (built-ins merged with `via.conf` `[agents.*]`).
     pub agent_presets: HashMap<String, AgentPreset>,
     /// ACP permission auto-approve extensions (built-in allows always on).
@@ -157,7 +154,6 @@ pub struct ConfigOverrides {
     pub agent_pane_cols: Option<AgentPaneCols>,
     pub review_backend: Option<ReviewBackend>,
     pub scroll_sensitivity: Option<f32>,
-    pub plugin_dir: Option<String>,
     pub agent_presets: HashMap<String, AgentPreset>,
     pub auto_approve: AutoApproveConfig,
 }
@@ -274,6 +270,9 @@ struct FileConfig {
     agent_pane_cols: Option<AgentPaneCols>,
     review_backend: Option<ReviewBackend>,
     scroll_sensitivity: Option<f32>,
+    /// Accepted for backward compatibility; ignored (skills are installed externally).
+    #[serde(default)]
+    #[allow(dead_code)]
     plugin_dir: Option<String>,
     #[serde(default)]
     agents: HashMap<String, AgentPreset>,
@@ -290,7 +289,6 @@ impl From<FileConfig> for ConfigOverrides {
             agent_pane_cols: config.agent_pane_cols,
             review_backend: config.review_backend,
             scroll_sensitivity: config.scroll_sensitivity,
-            plugin_dir: config.plugin_dir,
             agent_presets: config.agents,
             auto_approve: config.auto_approve,
         }
@@ -312,14 +310,13 @@ impl ConfigOverrides {
             scroll_sensitivity: env::var("VIA_SCROLL_SENSITIVITY")
                 .ok()
                 .and_then(|value| value.parse().ok()),
-            plugin_dir: env::var("VIA_PLUGIN_DIR").ok().filter(|s| !s.is_empty()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         }
     }
 }
 
-/// Intermediate prefs after CLI/env/file merge (plugin_dir still a string for persist).
+/// Intermediate prefs after CLI/env/file merge.
 #[derive(Debug, Clone, PartialEq)]
 struct ResolvedPrefs {
     nvim_command: String,
@@ -328,7 +325,6 @@ struct ResolvedPrefs {
     agent_pane_cols: AgentPaneCols,
     review_backend: ReviewBackend,
     scroll_sensitivity: f32,
-    plugin_dir: Option<String>,
     agent_presets: HashMap<String, AgentPreset>,
     auto_approve: AutoApproveConfig,
 }
@@ -364,11 +360,6 @@ fn resolve_user_config_from_sources(
         .or(file.scroll_sensitivity)
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(DEFAULT_SCROLL_SENSITIVITY);
-    let plugin_dir = cli
-        .plugin_dir
-        .or(env.plugin_dir)
-        .or(file.plugin_dir)
-        .filter(|s| !s.is_empty());
 
     ResolvedPrefs {
         nvim_command,
@@ -380,7 +371,6 @@ fn resolve_user_config_from_sources(
         }),
         review_backend,
         scroll_sensitivity,
-        plugin_dir,
         agent_presets: file.agent_presets,
         auto_approve: file.auto_approve,
     }
@@ -432,9 +422,6 @@ fn render_user_config(config: &ResolvedPrefs) -> String {
         "scroll_sensitivity = {}\n",
         config.scroll_sensitivity
     ));
-    if let Some(dir) = &config.plugin_dir {
-        output.push_str(&format!("plugin_dir = \"{}\"\n", toml_escape_string(dir)));
-    }
     for (id, preset) in &config.agent_presets {
         output.push_str(&format!("\n[agents.{id}]\n"));
         if let Some(role) = &preset.role {
@@ -522,7 +509,6 @@ impl AppContext {
             agent_pane_cols: prefs.agent_pane_cols,
             review_backend: prefs.review_backend,
             scroll_sensitivity: prefs.scroll_sensitivity,
-            plugin_dir: prefs.plugin_dir.map(PathBuf::from),
             agent_presets: merge_agent_presets(prefs.agent_presets),
             auto_approve: prefs.auto_approve,
         };
@@ -740,8 +726,7 @@ fn ensure_lua_assets() {
             );
         });
         // Base Lua assets are always re-asserted (overwrite if content differs)
-        // so updates to the embedded files propagate on restart. User
-        // customizations live in the plugin_dir, not here.
+        // so updates to the embedded files propagate on restart.
         for (filename, content) in [
             (
                 "context_bridge.lua",
@@ -874,7 +859,6 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
-            plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -885,7 +869,6 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
-            plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -896,7 +879,6 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 90, max: 110 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(2.0),
-            plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -908,10 +890,6 @@ mod tests {
         assert_eq!(config.agent_pane_cols, AgentPaneCols { min: 90, max: 110 });
         assert_eq!(config.review_backend, ReviewBackend::Nvim);
         assert_eq!(config.scroll_sensitivity, 2.0);
-        assert_eq!(
-            config.plugin_dir.as_deref(),
-            Some("/home/user/my-via-plugin")
-        );
     }
 
     #[test]
@@ -923,7 +901,6 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 70, max: 90 }),
             review_backend: Some(ReviewBackend::Nvim),
             scroll_sensitivity: Some(0.5),
-            plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -934,7 +911,6 @@ mod tests {
             agent_pane_cols: Some(AgentPaneCols { min: 80, max: 100 }),
             review_backend: Some(ReviewBackend::Hunk),
             scroll_sensitivity: Some(0.75),
-            plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -972,7 +948,6 @@ mod tests {
             agent_pane_cols: AgentPaneCols { min: 80, max: 120 },
             review_backend: ReviewBackend::Hunk,
             scroll_sensitivity: 1.5,
-            plugin_dir: Some("/home/user/my-via-plugin".to_string()),
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         });
@@ -985,7 +960,6 @@ mod tests {
                 "agent_pane_cols = \"80:120\"\n",
                 "review_backend = \"hunk\"\n",
                 "scroll_sensitivity = 1.5\n",
-                "plugin_dir = \"/home/user/my-via-plugin\"\n",
             )
         );
     }
@@ -1025,7 +999,6 @@ scroll_sensitivity = 1.5
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1042,7 +1015,6 @@ scroll_sensitivity = 1.5
             agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1107,7 +1079,6 @@ scroll_sensitivity = 1.5
             agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: HashMap::new(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1138,7 +1109,6 @@ scroll_sensitivity = 1.5
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1269,7 +1239,6 @@ model = "composer-2.5"
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: merge_agent_presets(file.agents),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1290,7 +1259,6 @@ model = "composer-2.5"
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: default_agent_presets(),
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1348,7 +1316,6 @@ model = "composer-2.5"
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1378,7 +1345,6 @@ model = "composer-2.5"
             },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets: presets,
             auto_approve: AutoApproveConfig::default(),
         };
@@ -1405,7 +1371,6 @@ model = "composer-2.5"
             agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
             review_backend: ReviewBackend::Nvim,
             scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
-            plugin_dir: None,
             agent_presets,
             auto_approve: AutoApproveConfig::default(),
         });

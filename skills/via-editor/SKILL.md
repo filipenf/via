@@ -20,17 +20,23 @@ CLI so agents can inspect editor state without scraping the terminal UI.
 
 ## Setup
 
-Skills are **not** auto-installed on via startup. Install (or refresh) the core skills explicitly, then inspect
-paths:
+Skills are **not** installed by via. Install `via-editor`, `via-agents`, and `via-orc` yourself, then check presence:
 
 ```bash
-via plugin install          # into every available agent on this host; skips existing unless --force
+# Node
+npx skills add filipenf/via -g
+
+# No Node (https://github.com/olamedia/skills-rs)
+skills add filipenf/via --global
+
+# Manual copy from a checkout
+cp -R skills/via-* ~/.agents/skills/
+
 via plugin status
+via plugin path
 ```
 
-Install targets cursor / claude / opencode / crush skill roots that look present on the host (PATH or
-config dir), similar to `npx skills add`. Startup warns if `via-editor`, `via-agents`, or `via-orc`
-are missing. Forks are left alone unless you pass `--force`.
+Startup warns if any of the three are missing for the session agent.
 
 ## Session resolution
 
@@ -105,10 +111,8 @@ via session refresh --file src/lib.rs
 | `via session get`                              | Show the session resolved from `VIA_SESSION`                                |
 | `via session diagnostics [--file PATH] --json` | Refresh unchanged Neovim buffers with `:checktime`, then export diagnostics |
 | `via session refresh [--file PATH] [--json]`   | Ask Neovim to reload externally changed buffers                             |
-| `via plugin install [--from PATH] [--force]`   | Install core skills from the repo (or `--from`); skip existing unless `--force` |
-| `via plugin status`                            | Show install paths and state                                                |
-| `via plugin cleanup`                           | Remove the core skills from every known location                            |
-| `via plugin path`                              | Print skill roots install would target on this host                         |
+| `via plugin status`                            | Show whether core skills are present in known agent skill roots             |
+| `via plugin path`                              | Print known agent skill roots                                               |
 
 ## Output shape
 
