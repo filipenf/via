@@ -114,10 +114,6 @@ t.it("build_content: human review task appears in Your queue and All tasks", fun
   -- t1 appears twice (queue + all), t2 once.
   local t1_count = select(2, joined:gsub("t1%s", ""))
   t.eq(2, t1_count, "t1 should appear in both Your queue and All tasks")
-  -- snapshot is keyed by id.
-  t.truthy(content.snapshot.t1)
-  t.truthy(content.snapshot.t2)
-  t.eq("review", content.snapshot.t1.status)
 end)
 
 t.it("build_content: no Your queue header when nothing is human/review", function()
@@ -245,10 +241,9 @@ local function create_task_fixture()
   end
   local bufnr = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(bufnr, "via://tasks-create-" .. bufnr)
-  vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].buftype = "nofile"
   vim.bo[bufnr].filetype = "via-tasks"
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, { "# Board: default", "# All tasks" })
-  vim.b[bufnr].via_tasks_snapshot = {}
   vim.b[bufnr].via_tasks_board = "default"
   vim.b[bufnr].via_tasks_signature = ""
   vim.bo[bufnr].modified = false
@@ -357,202 +352,11 @@ t.it("create_task: notifies and does not refresh when via task create fails", fu
   t.truthy(saw_warn, "should notify at WARN level about the failure")
 end)
 
-t.it("create_task: refuses to run when the board buffer is modified", function()
-  local mod, _, calls = create_task_fixture()
-  local ui_invocations = 0
-  local ui = vim.ui.input
-  vim.ui.input = function(_, on_done)
-    ui_invocations = ui_invocations + 1
-    on_done(nil)
-  end
-  local orig_notify = vim.notify
-  vim.notify = function() end
-  vim.bo[vim.api.nvim_get_current_buf()].modified = true
-  local ok, err = pcall(mod.create_task)
-  vim.bo[vim.api.nvim_get_current_buf()].modified = false
-  vim.ui.input = ui
-  vim.notify = orig_notify
-  if not ok then
-    error(err, 0)
-  end
-  t.eq(0, ui_invocations, "vim.ui.input must not fire when the buffer is modified")
-  t.eq(0, #create_calls(calls), "no task create should be sent when the buffer is modified")
-  t.eq(0, list_call_count(calls), "refresh should not run when the buffer is modified")
-end)
-
 -- ---------------------------------------------------------------------------
--- validate_rows (uses a real scratch buffer)
+-- M.open_task_body (centered floating task editor)
 -- ---------------------------------------------------------------------------
 
-t.it("validate_rows: clean buffer produces no diagnostics", function()
-  local bufnr = vim.api.nvim_create_buf(false, true)
-  local lines = {
-    "# All tasks",
-    "t1  queued  agent  Title one",
-    "t2  done    -      Title two",
-  }
-  local parsed, errors = I.validate_rows(bufnr, lines)
-  t.eq(0, errors)
-  t.eq(2, #parsed)
-end)
-
-t.it("validate_rows: malformed row sets a diagnostic", function()
-  local bufnr = vim.api.nvim_create_buf(false, true)
-  local lines = {
-    "# All tasks",
-    "t1  queued  agent", -- missing title
-  }
-  local _, errors = I.validate_rows(bufnr, lines)
-  t.eq(1, errors)
-  local diags = vim.diagnostic.get(bufnr, { namespace = I.diagnostics_ns })
-  t.eq(1, #diags)
-  t.contains(diags[1].message, "missing task title")
-  t.eq(1, diags[1].lnum, "diagnostic should be on the second line (0-based 1)")
-end)
-
--- ---------------------------------------------------------------------------
--- M.save (stubs the command runner; uses a real buffer + snapshot)
--- ---------------------------------------------------------------------------
-
---- Set up a fresh module + buffer for a save test. Returns (mod, bufnr, calls).
-local function save_fixture(lines, snapshot)
-  local mod = t.load_tasks_module()
-  local calls = {}
-  mod.run = function(cmd)
-    table.insert(calls, cmd)
-    if cmd[3] == "list" then
-      return '{"board":"default","tasks":[]}', 0
-    end
-    return "", 0
-  end
-  local bufnr = vim.api.nvim_create_buf(false, true)
-  -- Use a normal-like buftype so `modified` tracks user edits the way the real
-  -- :ViaTasks buffer does (scratch buffers reset `modified` automatically).
-  vim.api.nvim_buf_set_name(bufnr, "via://tasks-test-" .. bufnr)
-  vim.bo[bufnr].buftype = ""
-  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
-  vim.b[bufnr].via_tasks_snapshot = snapshot
-  vim.api.nvim_set_current_buf(bufnr)
-  return mod, bufnr, calls
-end
-
-local function update_calls(calls)
-  local updates = {}
-  for _, c in ipairs(calls) do
-    if c[3] == "update" then
-      table.insert(updates, c)
-    end
-  end
-  return updates
-end
-
-t.it("save: sends a field-scoped update for the changed field only", function()
-  local mod, _, calls = save_fixture({
-    "# All tasks",
-    "t1  queued  agent  Hello",
-  }, {
-    t1 = { status = "done", assignee = "agent", title = "Hello" },
-  })
-  mod.save()
-  local updates = update_calls(calls)
-  t.eq(1, #updates)
-  t.eq({ "via", "task", "update", "t1", "--status", "queued" }, updates[1])
-end)
-
-t.it("save: dedups a task shown in both Your queue and All tasks", function()
-  local mod, _, calls = save_fixture({
-    "# Your queue (assignee=human, status=review|in_progress)",
-    "  t1  done  human  Task one",
-    "",
-    "# All tasks",
-    "t1  done  human  Task one",
-  }, {
-    t1 = { status = "review", assignee = "human", title = "Task one" },
-  })
-  mod.save()
-  local updates = update_calls(calls)
-  t.eq(1, #updates, "duplicate rows for one id must produce a single update")
-end)
-
-t.it("save: aborts with a diagnostic when a row is malformed", function()
-  local mod, bufnr, calls = save_fixture({
-    "# All tasks",
-    "t1  queued  agent", -- missing title
-  }, {
-    t1 = { status = "done", assignee = "agent", title = "Hello" },
-  })
-  mod.save()
-  t.eq(0, #update_calls(calls), "no update should be sent when any row is invalid")
-  local diags = vim.diagnostic.get(bufnr, { namespace = mod._internal.diagnostics_ns })
-  t.eq(1, #diags)
-  t.contains(diags[1].message, "missing task title")
-end)
-
-t.it("save: clears assignee when the column is set to '-'", function()
-  local mod, _, calls = save_fixture({
-    "# All tasks",
-    "t1  queued  -  Hello",
-  }, {
-    t1 = { status = "queued", assignee = "coder", title = "Hello" },
-  })
-  mod.save()
-  local updates = update_calls(calls)
-  t.eq(1, #updates)
-  t.eq({ "via", "task", "update", "t1", "--clear-assignee" }, updates[1])
-end)
-
-t.it("save: aborts with a diagnostic when a task id is unknown", function()
-  local mod, bufnr, calls = save_fixture({
-    "# All tasks",
-    "t1  queued  agent  Hello",
-  }, {
-    t2 = { status = "done", assignee = "agent", title = "Other" },
-  })
-  mod.save()
-  t.eq(0, #update_calls(calls), "no update should be sent when any id is unknown")
-  local diags = vim.diagnostic.get(bufnr, { namespace = mod._internal.diagnostics_ns })
-  t.eq(1, #diags)
-  t.contains(diags[1].message, "unknown task id")
-end)
-
-t.it("save: keeps buffer modified and does not refresh when an update fails", function()
-  local mod, bufnr, calls = save_fixture({
-    "# All tasks",
-    "t1  done  agent  Hello",
-    "t2  done  agent  World",
-  }, {
-    t1 = { status = "queued", assignee = "agent", title = "Hello" },
-    t2 = { status = "queued", assignee = "agent", title = "World" },
-  })
-  -- Simulate an active edit so `modified` is meaningful.
-  vim.bo[bufnr].modified = true
-  -- First update succeeds, second fails.
-  local call_idx = 0
-  mod.run = function(cmd)
-    table.insert(calls, cmd)
-    if cmd[3] == "list" then
-      return '{"board":"default","tasks":[]}', 0
-    end
-    call_idx = call_idx + 1
-    if call_idx == 1 then
-      return "", 0
-    end
-    return "server error", 1
-  end
-  mod.save()
-  local updates = update_calls(calls)
-  t.eq(2, #updates, "both updates should have been attempted")
-  t.eq(true, vim.bo[bufnr].modified, "buffer must stay modified after a failed update")
-  local list_calls = 0
-  for _, c in ipairs(calls) do
-    if c[3] == "list" then
-      list_calls = list_calls + 1
-    end
-  end
-  t.eq(0, list_calls, "refresh (list) must not run after a failed update")
-end)
-
-t.it("open_task_body: opens the task Markdown file in a regular editor buffer", function()
+t.it("open_task_body: opens the task Markdown file in a centered float", function()
   local mod = t.load_tasks_module()
   local path = vim.fn.tempname() .. ".md"
   vim.fn.writefile({
@@ -572,12 +376,14 @@ t.it("open_task_body: opens the task Markdown file in a regular editor buffer", 
     return path .. "\n", 0
   end
   mod.open_task_body("t1")
-  local bufnr = vim.fn.bufnr(path, false)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
   t.eq({ "via", "task", "path", "t1" }, calls[1])
   t.neq(-1, bufnr, "task file buffer should exist")
-  t.eq(path, vim.api.nvim_buf_get_name(bufnr))
+  t.eq(abs, vim.api.nvim_buf_get_name(bufnr))
   t.eq("", vim.bo[bufnr].buftype, "task file should use a regular buffer")
-  t.eq(true, vim.bo[bufnr].buflisted, "task file should be listed like a regular buffer")
+  t.eq(false, vim.bo[bufnr].buflisted, "task popup buffer must be unlisted")
+  t.eq("wipe", vim.bo[bufnr].bufhidden, "task popup buffer must wipe on close")
   t.eq("markdown", vim.bo[bufnr].filetype, "task file should use Markdown filetype")
   t.eq({
     "---",
@@ -590,55 +396,17 @@ t.it("open_task_body: opens the task Markdown file in a regular editor buffer", 
     "line one",
     "line two",
   }, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false))
-  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  local float_win = vim.fn.bufwinid(bufnr)
+  t.truthy(float_win > 0, "task file should open in a floating window")
+  t.eq("editor", vim.api.nvim_win_get_config(float_win).relative, "float should be editor-relative")
+  t.eq(bufnr, vim.api.nvim_get_current_buf(), "float should take focus for editing")
+  vim.api.nvim_win_close(float_win, true)
+  t.eq(-1, vim.fn.bufnr(abs, false), "closing the float must wipe the popup buffer")
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
   vim.fn.delete(path)
 end)
 
-t.it("open_task_body: replaces the task board window instead of splitting", function()
-  local mod = t.load_tasks_module()
-  local board = vim.api.nvim_create_buf(false, false)
-  vim.api.nvim_buf_set_name(board, "via://tasks-replace-test")
-  vim.bo[board].buftype = "acwrite"
-  vim.bo[board].filetype = "via-tasks"
-  vim.api.nvim_win_set_buf(0, board)
-  local wins_before = #vim.api.nvim_list_wins()
-  local path = vim.fn.tempname() .. ".md"
-  vim.fn.writefile({ "# Task body" }, path)
-  mod.run = function()
-    return path .. "\n", 0
-  end
-  mod.open_task_body("replace1")
-  local bufnr = vim.fn.bufnr(path, false)
-  t.eq(wins_before, #vim.api.nvim_list_wins(), "must not open a new split")
-  t.eq(bufnr, vim.api.nvim_get_current_buf(), "current window should show the task file")
-  t.eq(path, vim.api.nvim_buf_get_name(0))
-  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
-  pcall(vim.api.nvim_buf_delete, board, { force = true })
-  vim.fn.delete(path)
-end)
-
-t.it("open_task_body: refuses when the via-tasks board buffer is modified", function()
-  local mod = t.load_tasks_module()
-  local board = vim.api.nvim_create_buf(false, false)
-  vim.api.nvim_buf_set_name(board, "via://tasks-modified-guard")
-  vim.bo[board].buftype = "acwrite"
-  vim.bo[board].filetype = "via-tasks"
-  vim.api.nvim_buf_set_lines(board, 0, -1, false, { "via:t1  queued  -  unsaved" })
-  vim.api.nvim_win_set_buf(0, board)
-  vim.bo[board].modified = true
-  local ran = false
-  mod.run = function()
-    ran = true
-    return "/tmp/should-not-open.md\n", 0
-  end
-  mod.open_task_body("t1")
-  t.eq(false, ran, "must not resolve task path when board has unsaved edits")
-  t.eq(board, vim.api.nvim_get_current_buf(), "must stay on the board buffer")
-  t.eq(true, vim.bo[board].modified, "modified flag must remain")
-  pcall(vim.api.nvim_buf_delete, board, { force = true })
-end)
-
-t.it("open_task_body: regular Markdown buffers remain editable and listed", function()
+t.it("open_task_body: task popup buffer is writable", function()
   local mod = t.load_tasks_module()
   local path = vim.fn.tempname() .. ".md"
   vim.fn.writefile({ "# Task", "hello" }, path)
@@ -646,10 +414,55 @@ t.it("open_task_body: regular Markdown buffers remain editable and listed", func
     return path .. "\n", 0
   end
   mod.open_task_body("body1")
-  local bufnr = vim.fn.bufnr(path, false)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
   t.eq(true, vim.bo[bufnr].modifiable, "task file should be editable")
   t.eq(false, vim.bo[bufnr].readonly, "task file should not be read-only")
-  pcall(vim.api.nvim_buf_delete, bufnr, { force = true })
+  local float_win = vim.fn.bufwinid(bufnr)
+  vim.api.nvim_win_close(float_win, true)
+  vim.fn.delete(path)
+end)
+
+t.it("open_task_body: :w persists edits to disk", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task", "hello" }, path)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("save1")
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
+  vim.api.nvim_buf_set_lines(bufnr, 1, 2, false, { "hello world" })
+  vim.cmd("write")
+  t.eq({ "# Task", "hello world" }, vim.fn.readfile(abs))
+  local float_win = vim.fn.bufwinid(bufnr)
+  vim.api.nvim_win_close(float_win, true)
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(path)
+end)
+
+t.it("open_task_body: refocuses existing float instead of opening a duplicate", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task" }, path)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("dup1")
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
+  local float_win = vim.fn.bufwinid(bufnr)
+  local wins_before = #vim.api.nvim_list_wins()
+
+  mod.open_task_body("dup1")
+
+  t.eq(wins_before, #vim.api.nvim_list_wins(), "must not open a second float")
+  t.eq(bufnr, vim.fn.bufnr(abs, false), "must reuse the same buffer")
+  t.eq(float_win, vim.fn.bufwinid(bufnr), "must refocus the existing float")
+  t.eq(float_win, vim.api.nvim_get_current_win(), "refocused float must be current")
+  vim.api.nvim_win_close(float_win, true)
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
   vim.fn.delete(path)
 end)
 
@@ -660,24 +473,30 @@ end)
 --- Force-delete any buffer still holding the via://tasks name so each test
 --- starts clean. Idempotent and safe when no such buffer exists.
 local function tasks_buf_cleanup()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    local cfg = vim.api.nvim_win_get_config(win)
+    if cfg.relative == "editor" or cfg.relative == "win" then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+  local cur = vim.api.nvim_get_current_buf()
+  if vim.api.nvim_buf_is_valid(cur) then
+    vim.bo[cur].modified = false
+  end
   local existing = vim.fn.bufnr(I.TASKS_BUF, false)
   if existing > 0 and vim.api.nvim_buf_is_valid(existing) then
     pcall(vim.api.nvim_buf_delete, existing, { force = true })
   end
 end
 
---- Create a via-tasks buffer bound to the current window and seed it with the
---- snapshot/signature. Returns `(mod, bufnr)`. `opts.output` becomes the
---- `via task list --json` stdout returned by the stubbed `run_async`;
---- `opts.signature` is the previously-seen signature (defaults to the same
---- output, so the poll sees "no change" unless overridden).
+--- Create a via-tasks buffer bound to the current window and seed signature.
+--- Returns `(mod, bufnr)`. `opts.output` becomes the `via task list --json`
+--- stdout returned by the stubbed `run_async`; `opts.signature` is the
+--- previously-seen signature (defaults to the same output).
 local function autorefresh_fixture(opts)
   opts = opts or {}
   tasks_buf_cleanup()
   local mod = t.load_tasks_module()
-  -- Avoid starting a real libuv timer in tests (FileType autocmd calls
-  -- setup_tasks_buffer -> start_autorefresh); the poll under test is driven
-  -- manually via mod.poll_autorefresh().
   mod.start_autorefresh = function() end
   local output = opts.output or '{"board":"default","tasks":[]}'
   mod.run_async = function(cmd, on_done)
@@ -686,24 +505,22 @@ local function autorefresh_fixture(opts)
 
   local bufnr = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_name(bufnr, I.TASKS_BUF)
-  -- Use a normal-like buftype so `modified` actually tracks the way the real
-  -- :ViaTasks buffer does (scratch buffers reset `modified` automatically).
-  vim.bo[bufnr].buftype = ""
+  vim.bo[bufnr].buftype = "nofile"
   vim.bo[bufnr].swapfile = false
   vim.bo[bufnr].filetype = "via-tasks"
+  vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, opts.lines or {
     "# Board: default",
     "# All tasks",
     "via:t1  queued  agent  Old",
   })
-  vim.b[bufnr].via_tasks_snapshot = opts.snapshot or {
-    t1 = { status = "queued", assignee = "agent", title = "Old" },
-  }
   vim.b[bufnr].via_tasks_board = "default"
   vim.b[bufnr].via_tasks_signature = opts.signature or output
   vim.bo[bufnr].modified = false
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].readonly = true
 
-  -- Display the buffer in the current window so tasks_buffer_visible() finds it.
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
   vim.api.nvim_win_set_buf(0, bufnr)
   return mod, bufnr
 end
@@ -772,55 +589,6 @@ t.it("poll_autorefresh: does nothing when the signature is unchanged", function(
   tasks_buf_cleanup()
 end)
 
-t.it("poll_autorefresh: skips when the buffer is modified", function()
-  local new_output = '{"board":"default","tasks":[{"id":"t2","status":"queued","assignee":"agent","title":"New"}]}'
-  local mod, bufnr = autorefresh_fixture({ output = new_output, signature = "OLD" })
-  mod.run_async = function(_, _)
-    -- Should never be called: the poll short-circuits on `modified` first.
-    error("run_async must not fire when buffer is modified")
-  end
-  vim.bo[bufnr].modified = true
-
-  mod.poll_autorefresh()
-
-  local joined = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  t.truthy(not joined:find("via:t2", 1, true), "buffer content should not have changed")
-  t.eq(true, vim.bo[bufnr].modified, "buffer should remain modified")
-  tasks_buf_cleanup()
-end)
-
-t.it("poll_autorefresh: skips while a save is in flight", function()
-  local new_output = '{"board":"default","tasks":[{"id":"t2","status":"queued","assignee":"agent","title":"New"}]}'
-  local mod, bufnr = autorefresh_fixture({ output = new_output, signature = "OLD" })
-  mod.run_async = function(_, _)
-    error("run_async must not fire during a save")
-  end
-  mod._saving = true
-
-  mod.poll_autorefresh()
-
-  local joined = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  t.truthy(not joined:find("via:t2", 1, true), "buffer content should not have changed")
-  tasks_buf_cleanup()
-end)
-
-t.it("poll_autorefresh: does not redraw if buffer was modified during async fetch", function()
-  local new_output = '{"board":"default","tasks":[{"id":"t2","status":"queued","assignee":"agent","title":"New"}]}'
-  local mod, bufnr = autorefresh_fixture({ output = new_output, signature = "OLD" })
-  mod.run_async = function(_, on_done)
-    -- Simulate the user starting to type while the fetch is in flight.
-    vim.bo[bufnr].modified = true
-    on_done(new_output, 0)
-  end
-
-  mod.poll_autorefresh()
-
-  local joined = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "\n")
-  t.truthy(not joined:find("via:t2", 1, true), "buffer content should not have changed")
-  t.eq(true, vim.bo[bufnr].modified, "user's unsaved edit must survive")
-  tasks_buf_cleanup()
-end)
-
 t.it("poll_autorefresh: ignores unparseable stdout without modifying the buffer", function()
   local mod, bufnr = autorefresh_fixture({ output = "not-json", signature = "OLD" })
 
@@ -854,26 +622,8 @@ t.it("silent_refresh: rebuilds buffer from data preserving cursor and clearing m
   tasks_buf_cleanup()
 end)
 
-t.it("silent_refresh: no-op when the buffer is modified (do not clobber edits)", function()
-  local mod, bufnr = autorefresh_fixture({
-    output = '{"board":"default","tasks":[{"id":"t1","status":"queued","assignee":"agent","title":"Old"}]}',
-    signature = "OLD",
-  })
-  vim.bo[bufnr].modified = true
-  local before = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-
-  mod.silent_refresh(bufnr, {
-    board = "default",
-    tasks = { { id = "t2", status = "queued", assignee = "agent", title = "New" } },
-  })
-
-  t.eq(before, vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), "modified buffer must be left untouched")
-  t.eq(true, vim.bo[bufnr].modified)
-  tasks_buf_cleanup()
-end)
-
 -- ---------------------------------------------------------------------------
--- M.open: transient board buffer options (buflisted=false, bufhidden=hide)
+-- M.open: read-only transient board buffer options
 -- ---------------------------------------------------------------------------
 
 --- Open the board via `M.open()` with `mod.run` stubbed. Returns `(mod, bufnr)`.
@@ -923,9 +673,11 @@ t.it("open: unlisted board buffer is still resolvable by name via bufnr(name, fa
   tasks_buf_cleanup()
 end)
 
-t.it("open: board buffer keeps buftype=acwrite and is unlisted (skipped by :wa, :bn/:bp)", function()
+t.it("open: board buffer is read-only nofile (not editable via :w)", function()
   local _, bufnr = open_board_fixture()
-  t.eq("acwrite", vim.bo[bufnr].buftype, "board buffer must stay acwrite")
+  t.eq("nofile", vim.bo[bufnr].buftype, "board buffer must be nofile")
+  t.eq(true, vim.bo[bufnr].readonly, "board buffer must be read-only")
+  t.eq(false, vim.bo[bufnr].modifiable, "board buffer must not be modifiable")
   t.eq(false, vim.bo[bufnr].buflisted, "unlisted buffers are skipped by :wa and excluded from :bn/:bp")
   tasks_buf_cleanup()
 end)

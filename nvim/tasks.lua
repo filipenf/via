@@ -2,24 +2,20 @@
 -- Project Management UI for via task boards.
 -- Load with: require('via.tasks')
 --
--- :ViaTasks (or <leader>at) toggles a structured buffer listing tasks on the active board.
+-- :ViaTasks (or <leader>at) toggles a read-only board listing tasks on the active board.
 -- One task per line: via:<id>  STATUS  ASSIGNEE  TITLE. Plain text, greppable.
 -- "Your queue" section filters on assignee=human AND status=review|in_progress.
--- :w diffs against the loaded snapshot and calls `via task update` for changed
--- rows only (field-scoped, not whole-row). Buffer-local keys: gR refresh,
--- <CR> open task, gn new board, gb switch board.
+-- <CR> opens the task Markdown file in a centered floating editor window.
+-- Buffer-local keys: gR refresh, gn new board, gb switch board, gc create task.
 -- A background autorefresh poll watches `via task list --json` and silently
--- redraws the board when the store changes and the buffer has no unsaved
--- edits. Set `vim.g.via_tasks_autorefresh_ms` (default 2000; 0 disables).
+-- redraws the board when the store changes. Set `vim.g.via_tasks_autorefresh_ms`
+-- (default 2000; 0 disables).
 -- Prefer non-leader keys here so LazyVim/which-key global leader maps never
 -- race the board UI (leader prefixes open which-key before buffer maps run).
 
 local M = {}
 
 local augroup = vim.api.nvim_create_augroup("ViaTasks", { clear = false })
-
--- Namespace for validation diagnostics on the task board buffer.
-local diagnostics_ns = vim.api.nvim_create_namespace("via-tasks")
 
 --- Command-execution seam. Runs `cmd` (a list) and returns `(stdout, exit_code)`.
 --- Overridable in tests so the Lua logic can be exercised without the real
@@ -222,13 +218,9 @@ local function parse_row(line)
   }, nil
 end
 
---- Build the buffer content from a tasks data table.
---- Returns { lines = {...}, snapshot = { [id] = {status, assignee, title, dirty=false} } }.
---- The snapshot is the pre-edit state used to diff on `:w`; it is keyed by id,
---- so a task shown in both "Your queue" and "All tasks" has one entry.
+--- Build the buffer content from a tasks data table. Returns `{ lines = {...} }`.
 local function build_content(data)
   local lines = {}
-  local snapshot = {}
 
   local tasks = data.tasks or {}
 
@@ -248,12 +240,6 @@ local function build_content(data)
     table.insert(lines, YOUR_QUEUE_HEADER)
     for _, task in ipairs(your_queue) do
       table.insert(lines, format_row(task, "  "))
-      snapshot[task.id] = {
-        status = task.status,
-        assignee = task.assignee,
-        title = task.title,
-        dirty = false,
-      }
     end
     table.insert(lines, "")
   end
@@ -261,15 +247,9 @@ local function build_content(data)
   table.insert(lines, ALL_TASKS_HEADER)
   for _, task in ipairs(all_tasks) do
     table.insert(lines, format_row(task))
-    snapshot[task.id] = {
-      status = task.status,
-      assignee = task.assignee,
-      title = task.title,
-      dirty = false,
-    }
   end
 
-  return { lines = lines, snapshot = snapshot }
+  return { lines = lines }
 end
 
 --- Height for the task board split: 30% of the current editor height, capped at
@@ -395,38 +375,27 @@ function M.open()
   end
 
   -- buftype before filetype so FileType autocmds see the final buffer options.
-  vim.bo[bufnr].buftype = "acwrite"
+  vim.bo[bufnr].buftype = "nofile"
   vim.bo[bufnr].swapfile = false
-  vim.bo[bufnr].modifiable = true
+  vim.bo[bufnr].readonly = true
+  vim.bo[bufnr].modifiable = false
   vim.bo[bufnr].filetype = "via-tasks"
 
   local content = build_content(data)
+  vim.bo[bufnr].readonly = false
+  vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, content.lines)
-
-  -- Store the snapshot as a buffer-local variable for diffing on :w.
-  vim.b[bufnr].via_tasks_snapshot = content.snapshot
   vim.b[bufnr].via_tasks_board = data.board
   -- Signature of the loaded board state; the autorefresh poll compares this
   -- against fresh `via task list --json` output to decide whether to redraw.
   vim.b[bufnr].via_tasks_signature = raw_output or ""
-
   vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].readonly = true
 
   -- Open in a bounded horizontal split.
   show_tasks_split(bufnr)
-  vim.bo[bufnr].modifiable = true
 
   setup_tasks_buffer(bufnr)
-
-  -- BufWriteCmd: parse, diff, update.
-  vim.api.nvim_clear_autocmds({ group = augroup, buffer = bufnr, event = "BufWriteCmd" })
-  vim.api.nvim_create_autocmd("BufWriteCmd", {
-    group = augroup,
-    buffer = bufnr,
-    callback = function()
-      M.save()
-    end,
-  })
 end
 
 --- Toggle the :ViaTasks panel (open, focus, or close).
@@ -443,13 +412,10 @@ function M.toggle()
     if closed then
       return
     end
-    -- Buffer exists but is hidden: show it. Refresh when unmodified so a
-    -- reopened board picks up tasks created since it was last loaded.
+    -- Buffer exists but is hidden: show it and refresh from the store.
     show_tasks_split(bufnr)
     setup_tasks_buffer(bufnr)
-    if not vim.bo[bufnr].modified then
-      M.refresh()
-    end
+    M.refresh()
     return
   end
   M.open()
@@ -463,14 +429,14 @@ function M.refresh()
   end
   local bufnr = vim.api.nvim_get_current_buf()
   local content = build_content(data)
+  vim.bo[bufnr].readonly = false
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, content.lines)
-  vim.b[bufnr].via_tasks_snapshot = content.snapshot
   vim.b[bufnr].via_tasks_board = data.board
   vim.b[bufnr].via_tasks_signature = raw_output or ""
   vim.bo[bufnr].modified = false
-  -- Rebuilt from the store (always valid rows); clear any stale diagnostics.
-  vim.diagnostic.reset(diagnostics_ns, bufnr)
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].readonly = true
   setup_tasks_buffer(bufnr)
   apply_task_id_highlight(vim.fn.win_getid())
   vim.notify("via: tasks refreshed (" .. #(data.tasks or {}) .. " tasks)", vim.log.levels.INFO)
@@ -519,12 +485,6 @@ end
 --- Prompt for a board name, derive the id, create+activate it, refresh.
 --- Bound to buffer-local `gn` on the :ViaTasks buffer only.
 function M.new_board()
-  local bufnr = vim.api.nvim_get_current_buf()
-  if vim.bo[bufnr].modified then
-    vim.notify("via: save or discard board edits before creating a new board", vim.log.levels.WARN)
-    return
-  end
-
   vim.ui.input({ prompt = "New board name: " }, function(name)
     if type(name) ~= "string" then
       return
@@ -553,12 +513,6 @@ end
 --- Prompt for a task title and optional context, create it via the CLI, refresh.
 --- Bound to buffer-local `gc` on the :ViaTasks buffer only.
 function M.create_task()
-  local bufnr = vim.api.nvim_get_current_buf()
-  if vim.bo[bufnr].modified then
-    vim.notify("via: save or discard board edits before creating a task", vim.log.levels.WARN)
-    return
-  end
-
   vim.ui.input({ prompt = "New task title: " }, function(title)
     if type(title) ~= "string" then
       return
@@ -622,12 +576,6 @@ end
 --- Pick a board and switch to it (`via task board use`), then refresh.
 --- Bound to buffer-local `gb` on the :ViaTasks buffer only.
 function M.switch_board()
-  local bufnr = vim.api.nvim_get_current_buf()
-  if vim.bo[bufnr].modified then
-    vim.notify("via: save or discard board edits before switching boards", vim.log.levels.WARN)
-    return
-  end
-
   local data = M.load_boards()
   if not data then
     return
@@ -670,142 +618,71 @@ function M.switch_board()
   end)
 end
 
---- Validate every task row in the buffer, publishing diagnostics on malformed
---- rows. A row is invalid when it is missing columns/a title, or (when
---- `snapshot` is given) when its ID is not a task on the board — the buffer
---- can only edit existing tasks, so an unknown ID is a typo and its edits
---- would otherwise be silently dropped. Returns `(parsed_rows, error_count)`.
-local function validate_rows(bufnr, lines, snapshot)
-  local diagnostics = {}
-  local parsed_rows = {}
-  for idx, line in ipairs(lines) do
-    local parsed, err = parse_row(line)
-    if err then
-      table.insert(diagnostics, {
-        lnum = idx - 1,
-        col = 0,
-        severity = vim.diagnostic.severity.ERROR,
-        source = "via-tasks",
-        message = err,
-      })
-    elseif parsed then
-      if snapshot and not snapshot[parsed.id] then
-        table.insert(diagnostics, {
-          lnum = idx - 1,
-          col = 0,
-          severity = vim.diagnostic.severity.ERROR,
-          source = "via-tasks",
-          message = "unknown task id '" .. parsed.id .. "' (not on this board)",
-        })
-      else
-        table.insert(parsed_rows, parsed)
-      end
-    end
-  end
-  vim.diagnostic.set(diagnostics_ns, bufnr, diagnostics)
-  return parsed_rows, #diagnostics
+--- Width/height for the centered task-body float (80% of editor, capped).
+local function task_float_dims()
+  local width = math.max(40, math.min(vim.o.columns - 4, math.floor(vim.o.columns * 0.80)))
+  local height = math.max(10, math.min(vim.o.lines - 4, math.floor(vim.o.lines * 0.80)))
+  local row = math.max(0, math.floor((vim.o.lines - height) / 2))
+  local col = math.max(0, math.floor((vim.o.columns - width) / 2))
+  return width, height, row, col
 end
 
---- Parse the buffer, diff against the snapshot, and call `via task update`
---- for changed rows only (:w).
----
---- Validation is all-or-nothing: if any task row is malformed (missing
---- title/columns) the save aborts before ANY `via task update`, diagnostics
---- mark the offending lines, and the buffer stays modified.
----
---- Command execution is per-row and NOT transactional: `via task update` runs
---- once per changed row, so an earlier update can persist even if a later one
---- fails. On any failed update we do NOT refresh (which would clobber the
---- user's still-unsaved edits) and leave the buffer modified so the user can
---- inspect and retry. Only a fully successful save refreshes + clears modified.
-function M.save()
-  local bufnr = vim.api.nvim_get_current_buf()
-  -- Block the autorefresh poll from racing a save: `save` calls `via task
-  -- update` + `refresh` synchronously, but a poll fired mid-save would
-  -- operate on a stale snapshot. The flag is cleared on every exit path.
-  M._saving = true
-  local function save_impl()
-    local snapshot = vim.b[bufnr].via_tasks_snapshot or {}
-    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-
-    local parsed_rows, error_count = validate_rows(bufnr, lines, snapshot)
-    if error_count > 0 then
-      -- Leave the buffer modified (no partial writes). Diagnostics mark the rows.
-      vim.notify(
-        "via: cannot save — " .. error_count .. " invalid task row(s); see diagnostics",
-        vim.log.levels.WARN
-      )
-      return
-    end
-
-    local updates = {}
-    local seen = {}
-    for _, parsed in ipairs(parsed_rows) do
-      if snapshot[parsed.id] and not seen[parsed.id] then
-        seen[parsed.id] = true
-        local snap = snapshot[parsed.id]
-        local changed = {}
-        if snap.status ~= parsed.status then
-          table.insert(changed, "--status")
-          table.insert(changed, parsed.status)
-        end
-        if snap.assignee ~= parsed.assignee then
-          if parsed.assignee then
-            table.insert(changed, "--assignee")
-            table.insert(changed, parsed.assignee)
-          else
-            table.insert(changed, "--clear-assignee")
-          end
-        end
-        if snap.title ~= parsed.title then
-          table.insert(changed, "--title")
-          table.insert(changed, parsed.title)
-        end
-        if #changed > 0 then
-          table.insert(updates, { id = parsed.id, args = changed })
-        end
+--- Return the floating window displaying `bufnr`, if any.
+local function task_popup_win(bufnr)
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == bufnr then
+      local cfg = vim.api.nvim_win_get_config(win)
+      if cfg.relative ~= "" then
+        return win
       end
     end
-
-    if #updates == 0 then
-      vim.bo[bufnr].modified = false
-      vim.notify("via: no changes to save", vim.log.levels.INFO)
-      return
-    end
-
-    local errors = 0
-    for _, update in ipairs(updates) do
-      local cmd = vim.list_extend({ "via", "task", "update", update.id }, update.args)
-      local output, code = M.run(cmd)
-      if code ~= 0 then
-        errors = errors + 1
-        vim.notify("via: failed to update " .. update.id .. ": " .. output, vim.log.levels.WARN)
-      end
-    end
-
-    if errors == 0 then
-      vim.notify("via: saved " .. #updates .. " task update(s)", vim.log.levels.INFO)
-      -- Refresh to reflect the new store state (also clears `modified`).
-      M.refresh()
-    else
-      -- Some updates failed. Keep the buffer modified and do NOT refresh, so the
-      -- user's unsaved edits survive for inspection/retry. Successful updates in
-      -- this batch are already persisted (no rollback — the store is not
-      -- transactional); `gR` will reconcile once the user is ready.
-      vim.notify(
-        "via: " .. errors .. " of " .. #updates .. " update(s) failed; buffer kept for retry",
-        vim.log.levels.WARN
-      )
-    end
   end
-  local ok, err = pcall(save_impl)
-  M._saving = false
-  if not ok then
-    error(err, 0)
-  end
+  return nil
 end
 
---- Open the task Markdown file in a regular editor buffer (<CR> / Ctrl+click
+--- Open `path` in a centered floating window. Uses `bufadd` + `bufload` so `:w`
+--- persists to disk. The buffer is unlisted and wiped when the window closes
+--- (`bufhidden=wipe`). Reopening the same path while its float is visible
+--- refocuses the existing window instead of creating a duplicate buffer.
+local function open_task_float(path)
+  path = vim.fn.fnamemodify(path, ":p")
+
+  local bufnr = vim.fn.bufnr(path, true)
+  if bufnr <= 0 then
+    bufnr = vim.fn.bufadd(path)
+  end
+
+  local existing_win = task_popup_win(bufnr)
+  if existing_win then
+    vim.api.nvim_set_current_win(existing_win)
+    return
+  end
+
+  vim.bo[bufnr].buflisted = false
+  vim.bo[bufnr].bufhidden = "wipe"
+  vim.bo[bufnr].swapfile = false
+
+  if vim.fn.bufloaded(bufnr) == 0 then
+    vim.fn.bufload(bufnr)
+  end
+
+  if vim.bo[bufnr].filetype == "" then
+    vim.bo[bufnr].filetype = "markdown"
+  end
+
+  local width, height, row, col = task_float_dims()
+  vim.api.nvim_open_win(bufnr, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    row = row,
+    col = col,
+    style = "minimal",
+    border = "rounded",
+  })
+end
+
+--- Open the task Markdown file in a centered floating window (<CR> / Ctrl+click
 --- on via:<id>).
 function M.open_task_at_mouse()
   local pos = vim.fn.getmousepos()
@@ -823,17 +700,9 @@ function M.open_task_at_mouse()
   end
 end
 
---- Open the task Markdown file in the current window (`<CR>` / Ctrl+click on
---- `via:<id>`), replacing the task board pane rather than splitting below it.
---- Refuses when the board buffer has unsaved edits (same guard as gn/gb/gc),
---- because `:edit` would hide those edits behind the task file.
+--- Open the task Markdown file in a centered floating window (`<CR>` /
+--- Ctrl+click on `via:<id>`).
 function M.open_task_body(task_id)
-  local board_bufnr = vim.api.nvim_get_current_buf()
-  if vim.bo[board_bufnr].filetype == "via-tasks" and vim.bo[board_bufnr].modified then
-    vim.notify("via: save or discard board edits before opening a task", vim.log.levels.WARN)
-    return
-  end
-
   local id = task_id
   if not id then
     local line = vim.api.nvim_get_current_line()
@@ -858,8 +727,7 @@ function M.open_task_body(task_id)
     return
   end
 
-  vim.cmd("edit " .. vim.fn.fnameescape(path))
-  vim.bo.filetype = "markdown"
+  open_task_float(path)
 end
 
 --- Autorefresh poll interval in milliseconds.
@@ -891,20 +759,11 @@ local function tasks_buffer_visible()
   return nil
 end
 
---- Silently redraw the board from `data` (no notify). Runs only when the
---- buffer is unmodified, and restores the cursor in every window showing it.
---- Differs from `M.refresh` (which is the explicit `gR` path and notifies):
---- autorefresh should stay quiet and never steal cursor focus.
+--- Silently redraw the board from `data` (no notify). Restores the cursor in
+--- every window showing the buffer. Differs from `M.refresh` (the explicit `gR`
+--- path, which notifies): autorefresh stays quiet and never steals cursor focus.
 function M.silent_refresh(bufnr, data)
   if type(bufnr) ~= "number" or not vim.api.nvim_buf_is_valid(bufnr) then
-    return
-  end
-  -- The buffer may have switched to modified since the poll gated on it (the
-  -- async fetch can race user typing); bail rather than clobbering edits.
-  if vim.bo[bufnr].modified then
-    return
-  end
-  if M._saving then
     return
   end
 
@@ -920,13 +779,13 @@ function M.silent_refresh(bufnr, data)
   end
 
   local content = build_content(data)
+  vim.bo[bufnr].readonly = false
   vim.bo[bufnr].modifiable = true
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, content.lines)
-  vim.b[bufnr].via_tasks_snapshot = content.snapshot
   vim.b[bufnr].via_tasks_board = data.board
   vim.bo[bufnr].modified = false
-  -- Rebuilt from the store (always valid rows); clear any stale diagnostics.
-  vim.diagnostic.reset(diagnostics_ns, bufnr)
+  vim.bo[bufnr].modifiable = false
+  vim.bo[bufnr].readonly = true
   -- Re-apply maps / id highlight in case a refresh path dropped them.
   setup_tasks_buffer(bufnr)
 
@@ -944,10 +803,10 @@ function M.silent_refresh(bufnr, data)
   end
 end
 
---- One autorefresh poll tick. Cheap fast-path checks (no visible buffer,
---- buffer modified, save in flight) run synchronously; only when something
---- may have changed does it dispatch `via task list --json` via `M.run_async`
---- and silently redraw on a signature mismatch.
+--- One autorefresh poll tick. Cheap fast-path checks (no visible buffer) run
+--- synchronously; only when something may have changed does it dispatch
+--- `via task list --json` via `M.run_async` and silently redraw on a signature
+--- mismatch.
 ---
 --- The signature is the raw `via task list --json` stdout. We compare it
 --- against the last value stored in `vim.b[bufnr].via_tasks_signature`
@@ -961,21 +820,13 @@ function M.poll_autorefresh()
   if not bufnr then
     return
   end
-  if vim.bo[bufnr].modified then
-    return
-  end
-  if M._saving then
-    return
-  end
   M._polling = true
   M.run_async({ "via", "task", "list", "--json" }, function(output, code)
     M._polling = false
     if code ~= 0 or type(output) ~= "string" then
       return
     end
-    -- The buffer may have been modified or wiped while the fetch was in
-    -- flight; re-validate before touching it.
-    if not vim.api.nvim_buf_is_valid(bufnr) or vim.bo[bufnr].modified or M._saving then
+    if not vim.api.nvim_buf_is_valid(bufnr) then
       return
     end
     local last = vim.b[bufnr].via_tasks_signature or ""
@@ -1039,9 +890,10 @@ M._internal = {
   format_millis = format_millis,
   format_board_item = format_board_item,
   board_sort_key = board_sort_key,
-  validate_rows = validate_rows,
   split_height = split_height,
-  diagnostics_ns = diagnostics_ns,
+  task_float_dims = task_float_dims,
+  task_popup_win = task_popup_win,
+  open_task_float = open_task_float,
   TASK_ID_PREFIX = TASK_ID_PREFIX,
   TASKS_BUF = TASKS_BUF,
   autorefresh_interval_ms = autorefresh_interval_ms,
