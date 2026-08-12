@@ -73,7 +73,11 @@ struct PendingAgentWrite {
 }
 
 impl GhosttyUi {
-    pub fn new(app: AppContext, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
+    pub fn new(
+        app: AppContext,
+        events: EventSender,
+        ui_commands: TokioReceiver<UiCommand>,
+    ) -> Self {
         Self {
             app,
             events,
@@ -253,6 +257,22 @@ impl AppPane {
     fn has_exited_agent(&mut self) -> bool {
         let Self::Terminal(pane) = self;
         pane.has_exited()
+    }
+
+    fn editor_has_exited(&mut self) -> bool {
+        let Self::Terminal(pane) = self;
+        pane.editor_has_exited()
+    }
+
+    /// Launch metadata for the primary agent pane, used when respawning after exit.
+    fn primary_agent_launch(&self) -> Option<(String, Option<String>)> {
+        let Self::Terminal(pane) = self;
+        match pane.role() {
+            PaneRole::AgentTerminal {
+                id, label, command, ..
+            } if id == PRIMARY_PTY_AGENT_ID => Some((label.clone(), command.clone())),
+            _ => None,
+        }
     }
 
     fn terminate_agent(&mut self) -> Result<()> {
@@ -690,11 +710,19 @@ impl WinitGhosttyApp {
     }
 
     /// Drop terminal agent panes whose PTY child has exited and refresh the registry.
+    /// The primary agent is respawned instead of removed.
     fn prune_exited_agent_panes(&mut self) {
         let mut acp_tui_exited: Vec<String> = Vec::new();
         let mut pty_remove: Vec<usize> = Vec::new();
+        let mut primary_respawn: Option<(String, Option<String>)> = None;
         for (index, pane) in self.panes.iter_mut().enumerate() {
             if !pane.has_exited_agent() {
+                continue;
+            }
+            if pane.agent_id_matches(PRIMARY_PTY_AGENT_ID) {
+                if let Some((label, command)) = pane.primary_agent_launch() {
+                    primary_respawn = Some((label, command));
+                }
                 continue;
             }
             if pane.is_acp_tui_agent() {
@@ -713,10 +741,7 @@ impl WinitGhosttyApp {
                 .try_send(Event::Editor(EditorEvent::TerminateAgent { id }));
         }
 
-        if pty_remove.is_empty() {
-            return;
-        }
-
+        let mut removed_any = false;
         for index in pty_remove.into_iter().rev() {
             self.panes.remove(index);
             adjust_pane_indices_after_removal(
@@ -725,13 +750,70 @@ impl WinitGhosttyApp {
                 index,
                 self.panes.len(),
             );
+            removed_any = true;
+        }
+
+        // Resolve the primary by id after other removals so the pane index stays valid.
+        if let Some((label, command)) = primary_respawn {
+            if let Some(index) = self
+                .panes
+                .iter()
+                .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+            {
+                if let Err(error) =
+                    self.respawn_primary_agent_pane(index, &label, command.as_deref())
+                {
+                    error!(%error, "failed to respawn primary agent pane");
+                }
+                removed_any = true;
+            }
+        }
+
+        if !removed_any {
+            return;
         }
 
         self.write_agent_registry();
         self.relayout();
         self.dirty = true;
         self.force_redraw = true;
-        info!("removed exited agent pane(s); refreshed agent registry");
+        info!("pruned/respawned exited agent pane(s); refreshed agent registry");
+    }
+
+    /// Replace an exited primary agent pane with a fresh spawn at the same index.
+    fn respawn_primary_agent_pane(
+        &mut self,
+        index: usize,
+        label: &str,
+        command: Option<&str>,
+    ) -> Result<()> {
+        if index >= self.panes.len() || !self.panes[index].agent_id_matches(PRIMARY_PTY_AGENT_ID) {
+            return Ok(());
+        }
+
+        if self.panes[index].is_acp_tui_agent() {
+            self.close_acp_tui_bridge(PRIMARY_PTY_AGENT_ID);
+        }
+
+        self.panes.remove(index);
+        self.create_agent_pane(PRIMARY_PTY_AGENT_ID, Some(label), command)?;
+
+        // `create_agent_pane` appends; put the primary back where it was.
+        if let Some(pane) = self.panes.pop() {
+            let insert_at = index.min(self.panes.len());
+            self.panes.insert(insert_at, pane);
+        }
+
+        info!(%index, "respawned primary agent pane");
+        Ok(())
+    }
+
+    fn editor_has_exited(&mut self) -> bool {
+        self.panes.iter_mut().any(|pane| pane.editor_has_exited())
+    }
+
+    fn request_quit(&mut self, event_loop: &ActiveEventLoop) {
+        event_loop.exit();
     }
 
     fn close_acp_tui_bridge(&mut self, agent_id: &str) {
@@ -1455,7 +1537,8 @@ impl WinitGhosttyApp {
         }
     }
 
-    fn drain_background_work(&mut self) -> Result<()> {
+    /// Drain PTY/UI work. Returns `Ok(true)` when Neovim has exited and via should quit.
+    fn drain_background_work(&mut self) -> Result<bool> {
         // Clear the coalescing flag *before* draining so that any PTY data arriving
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
         // rather than being silently swallowed.
@@ -1483,7 +1566,7 @@ impl WinitGhosttyApp {
         self.dirty |= self.poll_acp_tui_bridges()?;
         self.dirty |= self.flush_pending_agent_write()?;
         self.prune_exited_agent_panes();
-        Ok(())
+        Ok(self.editor_has_exited())
     }
 
     fn reload_theme_if_needed(&mut self) -> Result<bool> {
@@ -1925,6 +2008,22 @@ impl WinitGhosttyApp {
         }
         event_loop.exit();
     }
+
+    fn handle_drain_result(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        result: Result<bool>,
+        on_continue: impl FnOnce(&mut Self, &ActiveEventLoop),
+    ) {
+        match result {
+            Err(error) => self.fail(event_loop, error),
+            Ok(true) => {
+                info!("nvim exited; shutting down via");
+                self.request_quit(event_loop);
+            }
+            Ok(false) => on_continue(self, event_loop),
+        }
+    }
 }
 
 fn open_url_in_browser(url: &str) {
@@ -1958,15 +2057,13 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::PtyOutput => {
-                if let Err(error) = self.drain_background_work() {
-                    self.fail(event_loop, error);
-                    return;
-                }
-
-                if self.dirty {
-                    self.request_redraw();
-                    self.set_wait_for_next_redraw(event_loop);
-                }
+                let result = self.drain_background_work();
+                self.handle_drain_result(event_loop, result, |this, event_loop| {
+                    if this.dirty {
+                        this.request_redraw();
+                        this.set_wait_for_next_redraw(event_loop);
+                    }
+                });
             }
         }
     }
@@ -1989,7 +2086,7 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 
         let result = match event {
             WindowEvent::CloseRequested => {
-                event_loop.exit();
+                self.request_quit(event_loop);
                 Ok(())
             }
             WindowEvent::Resized(size) => self.resize_window(size.width, size.height),
@@ -2039,29 +2136,32 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
 
         if self.skip_background_drain_once {
             self.skip_background_drain_once = false;
-        } else if let Err(error) = self.drain_background_work() {
-            self.fail(event_loop, error);
+            if self.dirty {
+                self.request_redraw();
+                self.set_wait_for_next_redraw(event_loop);
+            }
             return;
         }
 
-        if self.dirty {
-            self.request_redraw();
-            self.set_wait_for_next_redraw(event_loop);
-        }
+        let result = self.drain_background_work();
+        self.handle_drain_result(event_loop, result, |this, event_loop| {
+            if this.dirty {
+                this.request_redraw();
+                this.set_wait_for_next_redraw(event_loop);
+            }
+        });
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if let Err(error) = self.drain_background_work() {
-            self.fail(event_loop, error);
-            return;
-        }
-
-        if self.dirty {
-            self.request_redraw();
-            self.set_wait_for_next_redraw(event_loop);
-        } else {
-            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
-        }
+        let result = self.drain_background_work();
+        self.handle_drain_result(event_loop, result, |this, event_loop| {
+            if this.dirty {
+                this.request_redraw();
+                this.set_wait_for_next_redraw(event_loop);
+            } else {
+                event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(50)));
+            }
+        });
     }
 }
 
@@ -2092,7 +2192,11 @@ impl WinitGhosttyApp {
 }
 
 fn pane_count(app: &AppContext) -> usize {
-    if app.user.agent_command.is_some() { 2 } else { 1 }
+    if app.user.agent_command.is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn full_window_rect(width: usize, height: usize) -> PaneRect {
