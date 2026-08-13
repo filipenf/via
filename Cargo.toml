@@ -9,6 +9,7 @@ anyhow = "1.0.100"
 clap = { version = "4.5", features = ["derive"] }
 # `wayland-data-control`: on Linux Wayland, the default X11 clipboard path often sees an empty
 # clipboard when copying from native Wayland apps; this enables the wl-clipboard protocol instead.
+# The feature is ignored on macOS.
 arboard = { version = "3", features = ["wayland-data-control"] }
 crossbeam-channel = "0.5.15"
 cosmic-text = "0.19.0"
@@ -53,7 +54,7 @@ tokio = { version = "1.48.0", features = [
 ] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter"] }
-winit = { version = "0.30", features = ["wayland", "x11"] }
+winit = { version = "0.30", features = ["wayland", "x11"] } # wayland/x11 apply on Linux; ignored on macOS
 # ratatui 0.29 pins `unicode-width = "=0.2.0"`; keep in lockstep.
 unicode-width = "=0.2.0"
 

@@ -376,7 +376,9 @@ t.it("open_task_body: opens the task Markdown file in a centered float", functio
     return path .. "\n", 0
   end
   mod.open_task_body("t1")
-  local abs = vim.fn.fnamemodify(path, ":p")
+  -- Neovim names buffers with symlinks resolved; on macOS tempname() lives
+  -- under /var, which is a symlink to /private/var.
+  local abs = vim.fn.resolve(vim.fn.fnamemodify(path, ":p"))
   local bufnr = vim.fn.bufnr(abs, false)
   t.eq({ "via", "task", "path", "t1" }, calls[1])
   t.neq(-1, bufnr, "task file buffer should exist")

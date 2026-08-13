@@ -245,7 +245,9 @@ impl TerminalPaneController {
         if matches!(self.role, PaneRole::Editor) {
             return PaneEventOutcome::default();
         }
-        let dirty = self.pane.set_reference_cues_enabled(modifiers.ctrl, ctx);
+        let dirty = self
+            .pane
+            .set_reference_cues_enabled(modifiers.reference_nav(), ctx);
         PaneEventOutcome {
             dirty,
             force_redraw: dirty,
@@ -447,7 +449,7 @@ impl TerminalPaneController {
         let mut outcome = PaneEventOutcome::default();
         if just_pressed {
             let is_reference_click =
-                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.ctrl;
+                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.reference_nav();
             if !is_reference_click {
                 outcome.dirty |= self.start_selection(local_x, local_y);
             }
@@ -489,7 +491,7 @@ impl TerminalPaneController {
                 info!(
                     path = %target.path.display(),
                     line = ?target.line,
-                    "file reference ctrl-clicked"
+                    "file reference clicked"
                 );
                 *command = Some(PaneCommand::OpenRequested {
                     path: target.path,
@@ -566,10 +568,7 @@ mod tests {
     use super::*;
 
     fn ctrl_modifiers() -> Modifiers {
-        Modifiers {
-            ctrl: true,
-            ..Modifiers::default()
-        }
+        Modifiers::with_reference_nav()
     }
 
     #[test]

@@ -246,22 +246,23 @@ impl SplitLayout {
         })
     }
 }
+
 pub(super) fn handle_layout_shortcuts(
     pressed_keys: &[Key],
-    alt: bool,
+    chrome: bool,
     shift: bool,
     pane_count: usize,
     mode: &mut PaneLayoutMode,
     split_direction: &mut PaneSplitDirection,
     active_pane: &mut usize,
 ) -> bool {
-    if !alt {
+    if !chrome {
         return false;
     }
 
-    // Alt+J (without Shift) toggles the split direction (replaces the old Alt+Shift+3).
+    // Alt+J (without Shift) toggles the split direction.
     for key in pressed_keys {
-        if alt && !shift && *key == Key::J {
+        if chrome && !shift && *key == Key::J {
             *mode = PaneLayoutMode::Split;
             *split_direction = split_direction.toggled();
             return true;
@@ -304,8 +305,8 @@ pub(super) fn handle_layout_shortcuts(
             }
         }
 
-        // Alt+2..9 focuses the corresponding agent pane (Alt+2 = first agent = index 1)
-        if alt && !shift {
+        // Chrome+2..9 focuses the corresponding agent pane (2 = first agent = index 1)
+        if chrome && !shift {
             if let Some(digit) = key_to_digit(*key) {
                 if (2..=9).contains(&digit) {
                     let target = digit - 1; // Alt+2 -> 1, Alt+3 -> 2, ...

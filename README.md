@@ -25,11 +25,12 @@ and I also test other agents like claude-code and crush.
 
 ### Agent to Neovim
 
-- Hold Ctrl in the agent pane to highlight clickable filenames, symbols, and OSC 8 hyperlinks.
-- Ctrl+click on a filename to open that file in Neovim and focus the Neovim pane (enter fullscreen Neovim if the agent
-  was fullscreen; otherwise keep the split).
-- Ctrl+click on a symbol to open the symbol search pane in Neovim with the same focus behavior.
-- Ctrl+click on an external OSC 8 hyperlink to open it in the system browser.
+- Hold Ctrl in the agent pane to highlight clickable filenames, symbols, and OSC 8 hyperlinks (Command on macOS;
+  Ctrl-click is a right-click on Mac).
+- Ctrl+click (Command-click on macOS) on a filename to open that file in Neovim and focus the Neovim pane (enter
+  fullscreen Neovim if the agent was fullscreen; otherwise keep the split).
+- Ctrl+click (Command-click on macOS) on a symbol to open the symbol search pane in Neovim with the same focus behavior.
+- Ctrl+click (Command-click on macOS) on an external OSC 8 hyperlink to open it in the system browser.
 
 ## Multi-agent orchestration
 
@@ -153,8 +154,10 @@ via agent spawn --id coder --model gpt-5.3-codex-high
 
 **Navigation**
 
-- `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent).
-- `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2 for the first agent, etc.).
+Pane shortcuts use **Alt** on Linux and macOS.
+
+- `Alt+2..9` focuses the corresponding agent pane (2 is the first agent).
+- `Alt+Shift+1..9` maximizes that pane (1 for the editor, 2 for the first agent, etc.).
 - `Alt+J` toggles the split direction.
 
 **Lua API for plugins**
@@ -205,14 +208,16 @@ planned:
 ## Runtime requirements
 
 via is primarily developed and tested on Linux (Wayland compositors such as Hyprland on Omarchy, with an X11 fallback
-via winit). Other Linux distributions and operating systems (macOS, Windows) are not regularly tested; you will likely
-need to build from source. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and platform notes.
+via winit). macOS is supported when building from source (CI covers arm64 and x86_64). Windows is not
+supported. See [CONTRIBUTING.md](CONTRIBUTING.md) for prerequisites and platform notes.
 
 ## Build requirements
 
 - Rust
 - [Zig 0.15.2](https://ziglang.org) — required by the vendored `libghostty-vt` build.
 - `git` (used by the `libghostty-vt-sys` build script to fetch ghostty sources).
+- On macOS: the Xcode Command Line Tools (`xcode-select --install`). No other
+  system libraries are needed (no fontconfig/Wayland/X11).
 
 If you use [mise](https://mise.jdx.dev/), the project's `mise.toml` pins the
 correct Zig version automatically:
@@ -346,9 +351,12 @@ the release.
 
 ## Detached mode
 
-On Linux, via detaches to avoid keeping the terminal waiting for it to finish. Runtime files for each live process live
-under `$XDG_DATA_HOME/via/instances/<pid>/` (default `~/.local/share/via/instances/<pid>/`). Stale instance directories
-can be pruned in bulk from that folder.
+On Linux, via detaches to avoid keeping the terminal waiting for it to finish. On macOS, via stays attached: AppKit
+cannot reliably create windows after daemonizing, so `cargo run` / `./target/release/via` keep the process in the
+foreground (the same as `VIA_FOREGROUND` on Linux).
+
+Runtime files for each live process live under `$XDG_DATA_HOME/via/instances/<pid>/` (default
+`~/.local/share/via/instances/<pid>/`). Stale instance directories can be pruned in bulk from that folder.
 
 The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip detaching and keep the terminal attached
 (for example during development), set `VIA_FOREGROUND` to any value.

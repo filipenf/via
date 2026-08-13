@@ -131,6 +131,44 @@ pub(super) struct Modifiers {
     pub(super) super_key: bool,
 }
 
+impl Modifiers {
+    /// Via window chrome (pane layout / review). Alt on all platforms.
+    pub(super) fn chrome(self) -> bool {
+        self.alt && !self.ctrl && !self.super_key
+    }
+
+    /// Hold to highlight/open agent-pane references. Ctrl on Linux, Command on macOS
+    /// (Ctrl+click is a right-click on Mac).
+    pub(super) fn reference_nav(self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            self.super_key
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.ctrl
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_reference_nav() -> Self {
+        #[cfg(target_os = "macos")]
+        {
+            Self {
+                super_key: true,
+                ..Self::default()
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Self {
+                ctrl: true,
+                ..Self::default()
+            }
+        }
+    }
+}
+
 pub(super) fn forward_text_input(
     text: &str,
     modifiers: Modifiers,
@@ -318,5 +356,40 @@ mod tests {
             key_sequence(Key::Tab, modifiers),
             Some(b"\x1b[Z".as_slice())
         );
+    }
+
+    #[test]
+    fn chrome_modifier_is_alt() {
+        let chrome = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        assert!(chrome.chrome());
+        assert!(!Modifiers::default().chrome());
+        assert!(
+            !Modifiers {
+                ctrl: true,
+                alt: true,
+                super_key: true,
+                ..Modifiers::default()
+            }
+            .chrome()
+        );
+        #[cfg(target_os = "macos")]
+        assert!(
+            !Modifiers {
+                super_key: true,
+                ..Modifiers::default()
+            }
+            .chrome(),
+            "Command is for reference-nav clicks, not pane chrome"
+        );
+    }
+
+    #[test]
+    fn reference_nav_modifier_is_platform_specific() {
+        let held = Modifiers::with_reference_nav();
+        assert!(held.reference_nav());
+        assert!(!Modifiers::default().reference_nav());
     }
 }

@@ -22,6 +22,9 @@ You will need:
   sources.
 - On Linux (the primary development and release target): system development
   libraries for fonts, Wayland/X11, and input.
+- On macOS: **Xcode Command Line Tools** (`xcode-select --install`). No extra
+  Homebrew packages are required for a source build; winit uses AppKit and
+  cosmic-text uses Core Text.
 
 ### System libraries (Debian/Ubuntu example, matching CI)
 
@@ -41,9 +44,27 @@ sudo apt-get install -y \
   pkg-config
 ```
 
+### macOS
+
+On macOS, install the Xcode Command Line Tools plus the pinned Rust/Zig/git
+tools — no fontconfig/Wayland/X11 system libraries are needed (font discovery
+uses the system font database, winit uses AppKit):
+
+```sh
+xcode-select --install
+mise install   # or install Rust >= 1.93 and Zig 0.15.2 manually
+cargo build --release
+```
+
+macOS CI (`macos-15` arm64 and `macos-15-intel`) installs Zig via mise and runs
+`cargo test` / `cargo build --release`; Git and the Xcode toolchain are already
+on the runners.
+
 ### Zig + tools via mise (recommended)
 
-The project pins Rust 1.93 (MSRV), Zig, and rust-analyzer in `mise.toml`:
+The project pins Rust 1.93 (MSRV) and Zig in `mise.toml`. Install
+`rust-analyzer` via rustup (`rustup component add rust-analyzer`) if you want
+it; it is not required to build.
 
 ```sh
 mise install
@@ -85,12 +106,14 @@ triggers a checkout of Ghostty sources + a Zig build of the VT core during
 `cargo build`. Results are cached under `target/`.
 
 For local iteration without detach (Linux detaches by default to free the
-terminal):
+terminal; macOS stays attached because AppKit cannot create windows after
+daemonizing):
 
 ```sh
 VIA_FOREGROUND=1 cargo run -- ...
 # or, if using mise:
 mise dev
+# macOS: `cargo run` is already attached; VIA_FOREGROUND is optional
 ```
 
 ## Testing, formatting, and linting
@@ -208,9 +231,9 @@ In Neovim:
   buffers after agent edits. via also runs `:checktime` on `FocusGained` and
   `BufEnter`.
 - Hold Ctrl in the agent output to highlight clickable filenames, symbols, and
-  OSC 8 hyperlinks. Ctrl-click file paths or `symbol://Foo::bar` references to
-  open them in the Neovim pane; Ctrl-click external OSC 8 hyperlinks to open
-  them in the system browser.
+  OSC 8 hyperlinks (Command on macOS). Ctrl-click (Command-click on macOS) file
+  paths or `symbol://Foo::bar` references to open them in the Neovim pane;
+  Ctrl-click external OSC 8 hyperlinks to open them in the system browser.
 
 See the main [README.md](README.md) for configuration (`~/.config/via/via.conf`,
 env vars, `--agent-pane-cols`, review backends, font tweaks, etc.) and the
@@ -347,8 +370,9 @@ and completes the prompt with `stopReason=cancelled`.
 5. In the PR description, explain the motivation, user impact, and any
    performance or behavior changes. Link related issues.
 
-CI (once added) will enforce formatting, clippy, and tests on Linux. The release
-workflow remains separate (triggered by GitHub releases).
+CI (once added) will enforce formatting, clippy, and tests on Linux, plus a
+macOS compile/test job. The release workflow remains separate (triggered by
+GitHub releases).
 
 Small, reviewable PRs are strongly preferred. We can always iterate.
 

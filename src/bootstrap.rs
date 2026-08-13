@@ -18,6 +18,11 @@ mod unix {
         if cfg!(test) {
             return Ok(());
         }
+        // AppKit cannot reliably create windows after fork/setsid. Keep the
+        // process attached so `cargo run` from Terminal opens a focused window.
+        if cfg!(target_os = "macos") {
+            return Ok(());
+        }
         if env::var_os("VIA_RUNTIME_ROOT").is_some() {
             return Ok(());
         }

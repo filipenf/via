@@ -11,7 +11,7 @@ use tokio::sync::mpsc::Receiver as TokioReceiver;
 use tracing::{debug, error, info, warn};
 
 use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalSize;
+use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -73,7 +73,11 @@ struct PendingAgentWrite {
 }
 
 impl GhosttyUi {
-    pub fn new(app: AppContext, events: EventSender, ui_commands: TokioReceiver<UiCommand>) -> Self {
+    pub fn new(
+        app: AppContext,
+        events: EventSender,
+        ui_commands: TokioReceiver<UiCommand>,
+    ) -> Self {
         Self {
             app,
             events,
@@ -89,7 +93,15 @@ impl GhosttyUi {
     }
 
     pub fn run(self) -> Result<()> {
-        let event_loop = EventLoop::<UserEvent>::with_user_event()
+        let mut event_loop = EventLoop::<UserEvent>::with_user_event();
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            // CLI binaries have no Info.plist; without Regular, the window may
+            // appear but never take keyboard focus.
+            event_loop.with_activation_policy(ActivationPolicy::Regular);
+        }
+        let event_loop = event_loop
             .build()
             .context("failed to create native event loop")?;
         let mut app = WinitGhosttyApp::new(self, event_loop.create_proxy())?;
@@ -431,9 +443,9 @@ impl WinitGhosttyApp {
         let attributes = WindowAttributes::default()
             .with_title("via")
             .with_resizable(true)
-            .with_inner_size(PhysicalSize::new(
-                INITIAL_WIDTH as u32,
-                INITIAL_HEIGHT as u32,
+            .with_inner_size(LogicalSize::new(
+                INITIAL_WIDTH as f64,
+                INITIAL_HEIGHT as f64,
             ));
         let window = Arc::new(
             event_loop
@@ -833,12 +845,13 @@ impl WinitGhosttyApp {
         let previous_metrics = self.terminal_config.metrics;
         self.terminal_config
             .finalize_metrics_for_scale(scale_factor);
+        self.font_renderer = FontRenderer::new(&self.terminal_config)?;
+        self.terminal_config.metrics = self.font_renderer.apply_measured_cell_width();
 
         if self.terminal_config.metrics == previous_metrics {
             return Ok(());
         }
 
-        self.font_renderer = FontRenderer::new(&self.terminal_config)?;
         self.relayout();
         self.resize_panes();
         self.dirty = true;
@@ -1157,7 +1170,7 @@ impl WinitGhosttyApp {
         }
         let layout_shortcut_consumed = handle_layout_shortcuts(
             &pressed_keys,
-            self.modifiers.alt,
+            self.modifiers.chrome(),
             self.modifiers.shift,
             self.panes.len(),
             &mut self.pane_layout_mode,
@@ -1187,7 +1200,7 @@ impl WinitGhosttyApp {
     }
 
     fn handle_review_shortcut(&mut self, pressed_keys: &[Key]) -> Result<bool> {
-        if !self.modifiers.alt || self.modifiers.ctrl || self.modifiers.super_key {
+        if !self.modifiers.chrome() {
             return Ok(false);
         }
         if !pressed_keys.contains(&Key::R) {
@@ -1855,13 +1868,13 @@ impl WinitGhosttyApp {
                 } => {
                     self.file_index
                         .set_files(buffers, vcs_working_tree, vcs_branch);
-                    if self.modifiers.ctrl {
+                    if self.modifiers.reference_nav() {
                         self.handle_modifiers_changed();
                     }
                 }
                 UiCommand::SymbolIndexChanged { symbols } => {
                     self.file_index.set_symbols(symbols);
-                    if self.modifiers.ctrl {
+                    if self.modifiers.reference_nav() {
                         self.handle_modifiers_changed();
                     }
                 }
@@ -2092,7 +2105,11 @@ impl WinitGhosttyApp {
 }
 
 fn pane_count(app: &AppContext) -> usize {
-    if app.user.agent_command.is_some() { 2 } else { 1 }
+    if app.user.agent_command.is_some() {
+        2
+    } else {
+        1
+    }
 }
 
 fn full_window_rect(width: usize, height: usize) -> PaneRect {
@@ -2289,9 +2306,19 @@ mod tests {
 
         config.finalize_metrics_for_scale(1.25);
 
-        assert_eq!(config.font_pixels, 15.0);
-        assert_eq!(config.metrics.cell_width, 9);
-        assert_eq!(config.metrics.cell_height, 21);
+        #[cfg(target_os = "macos")]
+        {
+            // 9pt × 1.25 scale at 72 DPI (1pt = 1px at 1x).
+            assert!((config.font_pixels - 11.25).abs() < f32::EPSILON);
+            assert_eq!(config.metrics.cell_width, 7);
+            assert_eq!(config.metrics.cell_height, 15);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(config.font_pixels, 15.0);
+            assert_eq!(config.metrics.cell_width, 9);
+            assert_eq!(config.metrics.cell_height, 21);
+        }
     }
 
     #[test]

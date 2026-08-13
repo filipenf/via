@@ -1,6 +1,5 @@
 [tools]
 rust = "1.93"
-rust-analyzer = "latest"
 zig = "0.15.2"
 
 # Development tasks. Run with `mise <task>` or `mise run <task>`

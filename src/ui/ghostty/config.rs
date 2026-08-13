@@ -16,7 +16,10 @@ const BLACK: u32 = 0x0c0c0c;
 const WHITE: u32 = 0xd8d8d8;
 const CURSOR: u32 = 0xb8bb26;
 const GHOSTTY_CONFIG_PATH: &str = "~/.config/ghostty/config";
-const MIN_CELL_WIDTH: usize = 4;
+#[cfg(target_os = "macos")]
+const GHOSTTY_MACOS_CONFIG_PATH: &str =
+    "~/Library/Application Support/com.mitchellh.ghostty/config";
+pub(super) const MIN_CELL_WIDTH: usize = 4;
 const MIN_CELL_HEIGHT: usize = 8;
 
 #[derive(Debug, Clone)]
@@ -51,10 +54,16 @@ pub(super) struct TerminalTheme {
 impl TerminalConfig {
     pub(super) fn load() -> Self {
         let mut config = Self::default();
-        let config_path = expand_path(GHOSTTY_CONFIG_PATH);
 
-        if let Err(error) = config.load_file(&config_path, 0) {
-            debug!(path = %config_path.display(), %error, "failed to load Ghostty config");
+        for config_path in ghostty_config_candidates() {
+            if !config_path.is_file() {
+                continue;
+            }
+            if let Err(error) = config.load_file(&config_path, 0) {
+                debug!(path = %config_path.display(), %error, "failed to load Ghostty config");
+                continue;
+            }
+            debug!(path = %config_path.display(), "loaded Ghostty config");
         }
 
         config.finalize_metrics();
@@ -134,12 +143,24 @@ impl TerminalConfig {
 
     pub(super) fn finalize_metrics_for_scale(&mut self, scale_factor: f64) {
         let scale_override = env_f64("VIA_FONT_SCALE");
-        let effective_scale_factor = scale_override.unwrap_or(scale_factor);
+        let effective_scale_factor = scale_override.unwrap_or(scale_factor).max(0.5);
         debug!(
             reported_scale_factor = scale_factor,
             scale_override, effective_scale_factor, "terminal font scale finalized"
         );
-        self.finalize_metrics_for_dpi(DEFAULT_FONT_DPI * effective_scale_factor.max(0.5) as f32);
+        // AppKit points are 1px at 1x / 2px at 2x (72 DPI * scale). CSS/Linux
+        // terminals treat 12pt as 16px at 96 DPI, then multiply by the window scale.
+        let dpi = {
+            #[cfg(target_os = "macos")]
+            {
+                72.0 * effective_scale_factor as f32
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                DEFAULT_FONT_DPI * effective_scale_factor as f32
+            }
+        };
+        self.finalize_metrics_for_dpi(dpi);
     }
 
     fn finalize_metrics_for_dpi(&mut self, dpi: f32) {
@@ -344,6 +365,28 @@ pub(super) fn ghostty_config_entry(line: &str) -> Option<(&str, &str)> {
     Some((key.trim(), unquote(value)))
 }
 
+/// Ghostty config locations, later files override earlier ones.
+///
+/// On macOS the Application Support template is often an empty stub, so
+/// `~/.config/ghostty/config` (dotfiles) is loaded after it. `XDG_CONFIG_HOME`
+/// wins last when set.
+fn ghostty_config_candidates() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        paths.push(expand_path(GHOSTTY_MACOS_CONFIG_PATH));
+    }
+    paths.push(expand_path(GHOSTTY_CONFIG_PATH));
+    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let dir = PathBuf::from(xdg);
+        if dir.is_absolute() {
+            paths.push(dir.join("ghostty/config"));
+        }
+    }
+    paths.dedup();
+    paths
+}
+
 fn ghostty_config_path(value: &str, base_dir: &Path) -> PathBuf {
     let path = expand_path(value);
 
@@ -397,4 +440,27 @@ fn parse_hex_color(value: &str) -> Option<u32> {
     }
 
     u32::from_str_radix(value, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ghostty_config_candidates_include_platform_paths() {
+        let paths = ghostty_config_candidates();
+        assert!(
+            paths.iter().any(|path| path.ends_with("ghostty/config")),
+            "expected ~/.config/ghostty/config in {paths:?}"
+        );
+        #[cfg(target_os = "macos")]
+        {
+            assert!(
+                paths
+                    .iter()
+                    .any(|path| path.ends_with("com.mitchellh.ghostty/config")),
+                "expected macOS Ghostty config path in {paths:?}"
+            );
+        }
+    }
 }
