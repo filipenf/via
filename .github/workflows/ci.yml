@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust (rustfmt)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93
         with:
           components: rustfmt
 
@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust (clippy)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93
         with:
           components: clippy
 
@@ -92,7 +92,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93
 
       - name: Install Zig
         uses: jdx/mise-action@v2
@@ -170,7 +170,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93
 
       - name: Install Zig
         uses: jdx/mise-action@v2

@@ -90,6 +90,10 @@ impl TerminalPaneController {
         matches!(self.role, PaneRole::AgentTerminal { .. }) && self.pane.child_has_exited()
     }
 
+    pub(super) fn editor_has_exited(&mut self) -> bool {
+        matches!(self.role, PaneRole::Editor) && self.pane.child_has_exited()
+    }
+
     pub(super) fn terminate_agent(&mut self) -> Result<()> {
         if matches!(self.role, PaneRole::AgentTerminal { .. }) {
             self.pane.terminate_child()?;
