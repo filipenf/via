@@ -25,18 +25,25 @@ jobs:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             asset: linux-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
 
+      - name: Install toolchain (Rust + Zig)
+        uses: jdx/mise-action@v2
+
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Install Zig
-        uses: jdx/mise-action@v2
-
       - name: Install system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -64,7 +71,11 @@ jobs:
           install -m 0755 "target/${{ matrix.target }}/release/via" "dist/${package}/via"
           cp README.md "dist/${package}/README.md"
           tar -C dist -czf "dist/${package}.tgz" "${package}"
-          sha256sum "dist/${package}.tgz" > "dist/${package}.tgz.sha256"
+          if command -v sha256sum >/dev/null; then
+            sha256sum "dist/${package}.tgz" > "dist/${package}.tgz.sha256"
+          else
+            shasum -a 256 "dist/${package}.tgz" > "dist/${package}.tgz.sha256"
+          fi
 
       - name: Upload release assets
         env:

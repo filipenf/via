@@ -379,11 +379,12 @@ Small, reviewable PRs are strongly preferred. We can always iterate.
 ## Release process (for maintainers)
 
 - Create a GitHub release with a tag like `v0.3.0`.
-- The existing [`.github/workflows/release.yml`](.github/workflows/release.yml)
-  builds on `ubuntu-24.04`, packages the binary + README into a
-  `via-<tag>-linux-x86_64.tgz` (plus SHA256), and uploads the assets.
-- Currently only linux-x86_64 is produced. Cross-platform binaries or source
-  builds for macOS/Windows are future work.
+- [`.github/workflows/release.yml`](.github/workflows/release.yml) builds and
+  uploads tarballs (binary + README + SHA256) for:
+  - `linux-x86_64` (`ubuntu-24.04`)
+  - `macos-arm64` (`macos-15`)
+  - `macos-x86_64` (`macos-15-intel`)
+- Windows binaries are still future work.
 
 ## Questions?
 

@@ -345,9 +345,12 @@ a custom script from disk during development.
 
 ## Release
 
-Create and publish a GitHub release for a tag such as `v0.1.0`. The release workflow builds `via` in release mode,
-packages the binary and README into `via-<tag>-linux-x86_64.tgz`, and uploads the archive plus its SHA-256 checksum to
-the release.
+Create and publish a GitHub release for a tag such as `v0.1.0`. The release workflow builds `via` in release mode and
+uploads a tarball plus SHA-256 checksum for each platform:
+
+- `via-<tag>-linux-x86_64.tgz`
+- `via-<tag>-macos-arm64.tgz`
+- `via-<tag>-macos-x86_64.tgz`
 
 ## Detached mode
 
