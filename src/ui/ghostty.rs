@@ -795,8 +795,15 @@ impl WinitGhosttyApp {
             self.close_acp_tui_bridge(PRIMARY_PTY_AGENT_ID);
         }
 
-        self.panes.remove(index);
-        self.create_agent_pane(PRIMARY_PTY_AGENT_ID, Some(label), command)?;
+        // `create_agent_pane` refuses a duplicate id, so the exited pane must come
+        // out first. Put it back if the replacement spawn fails so the next drain
+        // can retry instead of leaving the session without a primary agent.
+        let old = self.panes.remove(index);
+        if let Err(error) = self.create_agent_pane(PRIMARY_PTY_AGENT_ID, Some(label), command) {
+            let insert_at = index.min(self.panes.len());
+            self.panes.insert(insert_at, old);
+            return Err(error);
+        }
 
         // `create_agent_pane` appends; put the primary back where it was.
         if let Some(pane) = self.panes.pop() {
