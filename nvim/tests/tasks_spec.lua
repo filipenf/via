@@ -356,6 +356,70 @@ end)
 -- M.open_task_body (centered floating task editor)
 -- ---------------------------------------------------------------------------
 
+t.it("open_task_body: forces markdown even if detect guessed another type", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({
+    "---",
+    "title: Hello",
+    "status: queued",
+    "created_at: 1",
+    "updated_at: 1",
+    "---",
+    "",
+    "body",
+  }, path)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufadd(abs)
+  vim.fn.bufload(bufnr)
+  -- Simulate a frontmatter false-positive (common when BufRead sees `---`).
+  vim.bo[bufnr].filetype = "yaml"
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("ft1")
+  t.eq("markdown", vim.bo[bufnr].filetype, "must override a non-markdown guess")
+  local float_win = vim.fn.bufwinid(bufnr)
+  vim.api.nvim_win_close(float_win, true)
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(path)
+end)
+
+t.it("open_task_body: FileType markdown fires after the float is current", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task", "hello" }, path)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+
+  local ft_wins = {}
+  local group = vim.api.nvim_create_augroup("ViaTaskFtTest", { clear = true })
+  vim.api.nvim_create_autocmd("FileType", {
+    group = group,
+    pattern = "markdown",
+    callback = function()
+      table.insert(ft_wins, vim.api.nvim_get_current_win())
+    end,
+  })
+
+  mod.open_task_body("ft2")
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
+  local float_win = vim.fn.bufwinid(bufnr)
+  local saw_float = false
+  for _, win in ipairs(ft_wins) do
+    if win == float_win then
+      saw_float = true
+    end
+  end
+  t.truthy(saw_float, "FileType markdown must fire while the float is current")
+  vim.api.nvim_del_augroup_by_id(group)
+  vim.api.nvim_win_close(float_win, true)
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(path)
+end)
+
 t.it("open_task_body: opens the task Markdown file in a centered float", function()
   local mod = t.load_tasks_module()
   local path = vim.fn.tempname() .. ".md"

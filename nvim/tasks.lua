@@ -640,6 +640,20 @@ local function task_popup_win(bufnr)
   return nil
 end
 
+--- Force `markdown` on the task-body buffer after its float is current.
+--- `bufadd`+`bufload` skips filetype detection; a prior guess (YAML
+--- frontmatter often becomes `yaml`) must not win. FileType/ftplugin use
+--- `:setlocal` (window-sensitive: formatoptions, formatexpr), so they have
+--- to run after `nvim_open_win`, not before. Clear `did_ftplugin` so a
+--- detect that already fired on the board window does not skip the ftplugin.
+local function apply_task_markdown_filetype(bufnr)
+  vim.b[bufnr].did_ftplugin = nil
+  if vim.bo[bufnr].filetype ~= "" then
+    vim.bo[bufnr].filetype = ""
+  end
+  vim.bo[bufnr].filetype = "markdown"
+end
+
 --- Open `path` in a centered floating window. Uses `bufadd` + `bufload` so `:w`
 --- persists to disk. The buffer is unlisted and wiped when the window closes
 --- (`bufhidden=wipe`). Reopening the same path while its float is visible
@@ -658,17 +672,15 @@ local function open_task_float(path)
     return
   end
 
-  vim.bo[bufnr].buflisted = false
-  vim.bo[bufnr].bufhidden = "wipe"
-  vim.bo[bufnr].swapfile = false
-
+  -- Load before touching buffer options: assigning `vim.bo` on an unloaded
+  -- buffer can autoload it and skip the normal BufRead/filetype path.
   if vim.fn.bufloaded(bufnr) == 0 then
     vim.fn.bufload(bufnr)
   end
 
-  if vim.bo[bufnr].filetype == "" then
-    vim.bo[bufnr].filetype = "markdown"
-  end
+  vim.bo[bufnr].buflisted = false
+  vim.bo[bufnr].bufhidden = "wipe"
+  vim.bo[bufnr].swapfile = false
 
   local width, height, row, col = task_float_dims()
   vim.api.nvim_open_win(bufnr, true, {
@@ -680,6 +692,8 @@ local function open_task_float(path)
     style = "minimal",
     border = "rounded",
   })
+
+  apply_task_markdown_filetype(bufnr)
 end
 
 --- Open the task Markdown file in a centered floating window (<CR> / Ctrl+click
