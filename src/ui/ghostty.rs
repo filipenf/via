@@ -17,6 +17,9 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
+#[cfg(all(unix, not(target_os = "macos")))]
+use winit::platform::wayland::WindowAttributesExtWayland;
+
 use crate::acp_tui::{
     AcpTuiBridge, HostToTui, TranscriptKind, TuiToHost, resolve_acp_tui_bin, socket_path_for_agent,
     spawn_env_and_args,
@@ -54,6 +57,10 @@ use render::{DamageRect, draw_ratatui_buffer};
 
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
+/// Wayland app_id / X11 WM_CLASS (`WindowAttributes::with_name`). Omarchy tags
+/// `TUI.*` as terminals at map time, so Super+V/C become Shift+Insert / Ctrl+Insert.
+#[cfg(all(unix, not(target_os = "macos")))]
+const LINUX_APP_ID: &str = "TUI.via";
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
@@ -455,6 +462,8 @@ impl WinitGhosttyApp {
                 INITIAL_WIDTH as u32,
                 INITIAL_HEIGHT as u32,
             ));
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let attributes = attributes.with_name(LINUX_APP_ID, "via");
         let window = Arc::new(
             event_loop
                 .create_window(attributes)

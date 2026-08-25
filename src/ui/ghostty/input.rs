@@ -145,8 +145,8 @@ pub(super) fn forward_text_input(
     Ok(true)
 }
 
-/// Clipboard paste from OS selection (Ctrl+Shift+V, Super+V, Shift+Insert). Plain Ctrl+V is not
-/// intercepted so Neovim/shell receive `^V` (e.g. visual block mode).
+/// Clipboard paste from OS selection (Ctrl+Shift+V, Super+V, Shift+Insert).
+/// Plain Ctrl+V is not intercepted so Neovim/shell receive `^V` (e.g. visual block mode).
 pub(super) fn try_clipboard_paste(
     paste_requested: bool,
     pane: &mut TerminalPane,
@@ -184,7 +184,8 @@ pub(super) fn paste_requested(key: Key, modifiers: Modifiers) -> bool {
 }
 
 pub(super) fn copy_requested(key: Key, modifiers: Modifiers) -> bool {
-    key == Key::C && modifiers.super_key
+    (key == Key::C && modifiers.super_key)
+        || (key == Key::Insert && modifiers.ctrl && !modifiers.shift && !modifiers.alt)
 }
 
 pub(super) fn forward_special_keys(
@@ -213,6 +214,11 @@ pub(super) fn forward_special_keys(
         // Super+Insert paste (or stray Insert with Super held): never send <Insert> to the shell —
         // in Vim insert mode that toggles replace mode.
         if key == Key::Insert && modifiers.super_key {
+            continue;
+        }
+
+        // Ctrl+Insert is OS copy (Kitty/Ghostty/Omarchy terminal remap of Super+C).
+        if key == Key::Insert && modifiers.ctrl {
             continue;
         }
 
@@ -318,5 +324,65 @@ mod tests {
             key_sequence(Key::Tab, modifiers),
             Some(b"\x1b[Z".as_slice())
         );
+    }
+
+    #[test]
+    fn super_v_is_paste() {
+        let modifiers = Modifiers {
+            super_key: true,
+            ..Modifiers::default()
+        };
+        assert!(paste_requested(Key::V, modifiers));
+    }
+
+    #[test]
+    fn ctrl_shift_v_is_paste() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(paste_requested(Key::V, modifiers));
+    }
+
+    #[test]
+    fn shift_insert_is_paste() {
+        let modifiers = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert!(paste_requested(Key::Insert, modifiers));
+    }
+
+    #[test]
+    fn plain_ctrl_v_is_not_paste() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        assert!(
+            !paste_requested(Key::V, modifiers),
+            "Ctrl+V must stay ^V for Neovim visual-block"
+        );
+    }
+
+    #[test]
+    fn ctrl_insert_is_copy() {
+        let modifiers = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        assert!(copy_requested(Key::Insert, modifiers));
+        assert!(!copy_requested(Key::C, modifiers));
+    }
+
+    #[test]
+    fn super_c_is_copy() {
+        let modifiers = Modifiers {
+            super_key: true,
+            ..Modifiers::default()
+        };
+        assert!(copy_requested(Key::C, modifiers));
+        assert!(!paste_requested(Key::V, Modifiers::default()));
     }
 }
