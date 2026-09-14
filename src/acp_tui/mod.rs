@@ -129,30 +129,59 @@ fn event_loop(
         }
 
         if event::poll(Duration::from_millis(50)).context("poll terminal events")? {
-            match event::read().context("read terminal event")? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
-                    InputEvent::None => {}
-                    InputEvent::Quit => {
-                        app.request_quit();
-                    }
-                    InputEvent::Submit(text) => {
-                        outbound.send(&TuiToHost::Submit { text })?;
-                    }
-                    InputEvent::SetModel(value) => {
-                        outbound.send(&TuiToHost::SetModel { value })?;
-                    }
-                },
-                Event::Resize(_, _) => {}
-                _ => {}
-            }
+            let event = event::read().context("read terminal event")?;
+            dispatch_terminal_event(terminal, app, outbound, event)?;
         }
 
         app.tick_progress();
     }
 }
 
+fn dispatch_terminal_event<B>(
+    terminal: &mut ratatui::Terminal<B>,
+    app: &mut App,
+    outbound: &mut dyn Outbound,
+    event: Event,
+) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+{
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match app.handle_key(key) {
+            InputEvent::None => {}
+            InputEvent::Quit => {
+                app.request_quit();
+            }
+            InputEvent::Submit(text) => {
+                outbound.send(&TuiToHost::Submit { text })?;
+            }
+            InputEvent::SetModel(value) => {
+                outbound.send(&TuiToHost::SetModel { value })?;
+            }
+        },
+        // PTY relayout/resize delivers SIGWINCH (see `handle_resize`).
+        Event::Resize(_, _) => handle_resize(terminal)?,
+        _ => {}
+    }
+    Ok(())
+}
+
 trait Outbound: Send {
     fn send(&mut self, msg: &TuiToHost) -> Result<()>;
+}
+
+/// Full repaint after the PTY master resizes the pane (SIGWINCH surface as a
+/// crossterm `Event::Resize`).
+///
+/// Without an explicit clear, ratatui diffs against a stale-sized buffer and the
+/// next draws only patch part of the new area: truncated mid-line content gets
+/// stuck top-left and the pane looks frozen even though the agent keeps working
+/// (e.g. window restore after lock screen, or any relayout that resizes panes).
+fn handle_resize<B>(terminal: &mut ratatui::Terminal<B>) -> Result<()>
+where
+    B: ratatui::backend::Backend,
+{
+    terminal.clear().context("clear terminal after resize")
 }
 
 struct StderrOutbound;
@@ -254,6 +283,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::{Backend, WindowSize};
+    use ratatui::buffer::Cell;
+    use ratatui::layout::{Position, Size};
 
     #[test]
     fn args_demo_defaults() {
@@ -266,5 +298,92 @@ mod tests {
         assert_eq!(args.agent_id.as_deref(), Some("coder"));
         assert!(!args.no_input);
         assert!(args.socket.is_none());
+    }
+
+    /// Minimal backend that records how often the screen is cleared, so the
+    /// resize path can be tested without a real PTY.
+    #[derive(Debug, Default)]
+    struct ClearSpyBackend {
+        size: Size,
+        clears: usize,
+    }
+
+    impl Backend for ClearSpyBackend {
+        fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+        where
+            I: Iterator<Item = (u16, u16, &'a Cell)>,
+        {
+            let _ = content.count();
+            Ok(())
+        }
+
+        fn hide_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn get_cursor_position(&mut self) -> std::io::Result<Position> {
+            Ok(Position::ORIGIN)
+        }
+
+        fn set_cursor_position<P: Into<Position>>(&mut self, _: P) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clear(&mut self) -> std::io::Result<()> {
+            self.clears += 1;
+            Ok(())
+        }
+
+        fn size(&self) -> std::io::Result<Size> {
+            Ok(self.size)
+        }
+
+        fn window_size(&mut self) -> std::io::Result<WindowSize> {
+            Ok(WindowSize {
+                columns_rows: self.size,
+                pixels: Size::default(),
+            })
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sigwinch_resize_issues_full_clear() {
+        struct DiscardOutbound;
+        impl Outbound for DiscardOutbound {
+            fn send(&mut self, _: &TuiToHost) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut terminal = ratatui::Terminal::new(ClearSpyBackend {
+            size: Size {
+                width: 30,
+                height: 8,
+            },
+            clears: 0,
+        })
+        .unwrap();
+        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut outbound = DiscardOutbound;
+
+        // What crossterm delivers for SIGWINCH after a host relayout: without
+        // the clear, the next diffed draws leave truncated content stuck and
+        // the pane looks frozen while the agent keeps working.
+        dispatch_terminal_event(&mut terminal, &mut app, &mut outbound, Event::Resize(30, 8))
+            .unwrap();
+
+        assert_eq!(
+            terminal.backend().clears,
+            1,
+            "resize must clear the stale frame so the next draw repaints fully"
+        );
     }
 }
