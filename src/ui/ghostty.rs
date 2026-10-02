@@ -47,9 +47,9 @@ use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers};
 use layout::{
-    PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
-    adjust_pane_indices_after_removal, focus_nvim_after_agent_reference, handle_layout_shortcuts,
-    vertical_split_fits,
+    AgentPaneShare, PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
+    adjust_pane_indices_after_removal, agent_region_span, focus_nvim_after_agent_reference,
+    handle_layout_shortcuts, vertical_split_fits,
 };
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
@@ -151,6 +151,7 @@ struct WinitGhosttyApp {
     active_pane: usize,
     pane_layout_mode: PaneLayoutMode,
     pane_split_direction: PaneSplitDirection,
+    agent_pane_share: AgentPaneShare,
     /// Split was auto-collapsed because the window is too narrow; restore on widen.
     split_collapsed_for_width: bool,
     layout: SplitLayout,
@@ -432,6 +433,7 @@ impl WinitGhosttyApp {
             active_pane: 0,
             pane_layout_mode: PaneLayoutMode::Split,
             pane_split_direction,
+            agent_pane_share: AgentPaneShare::Auto,
             split_collapsed_for_width: false,
             layout,
             width: INITIAL_WIDTH,
@@ -503,6 +505,17 @@ impl WinitGhosttyApp {
                     Some("agent"),
                     Some(agent_command.as_str()),
                 )?;
+                if let Some(index) = self
+                    .panes
+                    .iter()
+                    .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                {
+                    // A narrow window may have collapsed the split onto the editor.
+                    // Keys should follow the pane that is actually visible.
+                    if self.pane_layout_mode == PaneLayoutMode::Split {
+                        self.active_pane = index;
+                    }
+                }
             } else {
                 self.relayout();
                 self.write_agent_registry();
@@ -965,6 +978,7 @@ impl WinitGhosttyApp {
         SplitLayoutOptions {
             cell_width: self.terminal_config.metrics.cell_width,
             agent_pane_cols: self.app.user.agent_pane_col_limits(),
+            agent_share: self.agent_pane_share,
         }
     }
 
@@ -1253,14 +1267,23 @@ impl WinitGhosttyApp {
             }
             return Ok(());
         }
+        let agent_span = agent_region_span(
+            &self.layout,
+            self.pane_split_direction,
+            self.width,
+            self.height,
+        );
         let layout_shortcut_consumed = handle_layout_shortcuts(
             &pressed_keys,
             self.modifiers.alt,
             self.modifiers.shift,
+            event.repeat,
             self.panes.len(),
             &mut self.pane_layout_mode,
             &mut self.pane_split_direction,
             &mut self.active_pane,
+            &mut self.agent_pane_share,
+            agent_span,
         );
         if layout_shortcut_consumed {
             self.split_collapsed_for_width = false;
@@ -2449,6 +2472,7 @@ mod tests {
             SplitLayoutOptions {
                 cell_width,
                 agent_pane_cols: Some((80, 100)),
+                agent_share: AgentPaneShare::Auto,
             },
         );
 
@@ -2644,13 +2668,37 @@ mod tests {
         assert_eq!(agent_layout.pane(0).height, 0);
     }
 
+    fn press_layout_shortcut(
+        pressed_keys: &[Key],
+        alt: bool,
+        shift: bool,
+        pane_count: usize,
+        mode: &mut PaneLayoutMode,
+        split_direction: &mut PaneSplitDirection,
+        active_pane: &mut usize,
+    ) -> bool {
+        let mut share = AgentPaneShare::Auto;
+        handle_layout_shortcuts(
+            pressed_keys,
+            alt,
+            shift,
+            false,
+            pane_count,
+            mode,
+            split_direction,
+            active_pane,
+            &mut share,
+            layout::AgentRegionSpan::unknown(),
+        )
+    }
+
     #[test]
     fn maps_alt_number_shortcuts_to_active_panes() {
         let mut mode = PaneLayoutMode::PaneMaximized(1);
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Key1],
             true,
             false,
@@ -2661,7 +2709,7 @@ mod tests {
         ));
         assert_eq!(mode, PaneLayoutMode::Split);
         assert_eq!(active_pane, 0);
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Key2],
             true,
             false,
@@ -2680,7 +2728,7 @@ mod tests {
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Key1],
             true,
             true,
@@ -2691,7 +2739,7 @@ mod tests {
         ));
         assert_eq!(mode, PaneLayoutMode::PaneMaximized(0));
         assert_eq!(active_pane, 0);
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Key2],
             true,
             true,
@@ -2710,7 +2758,7 @@ mod tests {
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 1;
 
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Left],
             true,
             false,
@@ -2721,7 +2769,7 @@ mod tests {
         ));
         assert_eq!(mode, PaneLayoutMode::Split);
         assert_eq!(active_pane, 0);
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::Right],
             true,
             false,
@@ -2740,7 +2788,7 @@ mod tests {
         let mut split_direction = PaneSplitDirection::Vertical;
         let mut active_pane = 0;
 
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::J],
             true,
             false,
@@ -2752,7 +2800,7 @@ mod tests {
         assert_eq!(mode, PaneLayoutMode::Split);
         assert_eq!(split_direction, PaneSplitDirection::Horizontal);
         assert_eq!(active_pane, 0);
-        assert!(handle_layout_shortcuts(
+        assert!(press_layout_shortcut(
             &[Key::J],
             true,
             false,

@@ -12,7 +12,9 @@ The idea is simple: glue the best code editor together with the AI coding harnes
 that make the combination feel like a lightweight IDE.
 
 By default you get an editor pane and an agent pane that automatically adjust when the window is resized, plus simple
-shortcuts to switch panes or give either one fullscreen focus.
+shortcuts to switch panes or give either one fullscreen focus. The agent pane starts with keyboard focus. Neovim
+restores the saved session for this directory when one exists, including sessions written by LazyVim's persistence
+plugin.
 
 It is currently my daily driver for AI-assisted coding. I use it mostly with cursor-agent (~80%) and opencode (~20%),
 and I also test other agents like claude-code and crush.
@@ -153,7 +155,8 @@ via agent spawn --id coder --model gpt-5.3-codex-high
 
 **Navigation**
 
-- `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent).
+- `Alt+1` focuses the editor. Pressing it again while the editor is already focused switches the editor pane between 50% and 33% of the split: width in a vertical split, height in a horizontal split.
+- `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent). Pressing that shortcut again while the same agent is already focused switches the agent pane between 50% and 33% of the split, on the same axis.
 - `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2 for the first agent, etc.).
 - `Alt+J` toggles the split direction.
 
@@ -356,7 +359,8 @@ The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip deta
 ## Agent pane width
 
 With a PTY agent, vertical split mode keeps the agent at its minimum width (default 80 columns, up to 100) and gives any
-extra columns to the editor. Override with:
+extra columns to the editor. Focusing a pane that is already focused (see Navigation) switches that pane to 50% or
+33% of the window instead, and further presses alternate between those two sizes. Override the automatic width with:
 
 ```sh
 VIA_AGENT_PANE_COLS=60:120 cargo run

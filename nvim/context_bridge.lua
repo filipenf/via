@@ -792,3 +792,8 @@ end)
 
 -- Agent helpers (`ViaAgentDel`, `require('via').agent.*`) live in via.lua.
 pcall(require, "via")
+
+-- Restore this directory's saved editor session after startup commands run.
+pcall(function()
+  require("via.session").install()
+end)

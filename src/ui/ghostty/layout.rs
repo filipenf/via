@@ -8,10 +8,77 @@ const SPLIT_GAP: usize = 2;
 /// regression testing. Not part of via's public library API.
 pub const MIN_EDITOR_PANE_COLS: u16 = 80;
 
+/// How the split axis is divided between the editor and the agent region.
+///
+/// `Auto` keeps the column range in a vertical split and half the window in a
+/// horizontal split. The other variants pin one side to half or one third of
+/// the width (vertical) or height (horizontal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum AgentPaneShare {
+    #[default]
+    Auto,
+    /// Editor and agent region each take half of the split axis.
+    Half,
+    /// Agent region takes one third; the editor takes the rest.
+    Third,
+    /// Editor takes one third; the agent region takes the rest.
+    EditorThird,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefocusSide {
+    Editor,
+    Agent,
+}
+
+impl AgentPaneShare {
+    /// Repeat focus on an already-focused pane swaps that pane between half and
+    /// one third. Sizes outside that pair, including `Auto`, jump to whichever
+    /// of the two is farther from the pane's current span.
+    fn after_refocus(self, side: RefocusSide, span: AgentRegionSpan) -> Self {
+        match (side, self) {
+            (RefocusSide::Agent, Self::Half) => Self::Third,
+            (RefocusSide::Agent, Self::Third) => Self::Half,
+            (RefocusSide::Editor, Self::Half) => Self::EditorThird,
+            (RefocusSide::Editor, Self::EditorThird) => Self::Half,
+            _ => {
+                let focused = match side {
+                    RefocusSide::Agent => span.agent,
+                    RefocusSide::Editor => span.usable.saturating_sub(span.agent),
+                };
+                // Midpoint of 1/3 and 1/2 is 5/12. At or above that, shrink to a third.
+                let shrink_to_third = focused.saturating_mul(12) >= span.usable.saturating_mul(5);
+                match (side, shrink_to_third) {
+                    (RefocusSide::Agent, true) => Self::Third,
+                    (RefocusSide::Editor, true) => Self::EditorThird,
+                    (_, false) => Self::Half,
+                }
+            }
+        }
+    }
+}
+
+/// Agent-region size along the current split axis, gap excluded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct AgentRegionSpan {
+    pub(super) agent: usize,
+    pub(super) usable: usize,
+}
+
+impl AgentRegionSpan {
+    pub(super) fn unknown() -> Self {
+        Self {
+            agent: 0,
+            usable: 0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct SplitLayoutOptions {
     pub(super) cell_width: usize,
     pub(super) agent_pane_cols: Option<(u16, u16)>,
+    pub(super) agent_share: AgentPaneShare,
 }
 
 impl SplitLayoutOptions {
@@ -19,6 +86,7 @@ impl SplitLayoutOptions {
         Self {
             cell_width: 1,
             agent_pane_cols: None,
+            agent_share: AgentPaneShare::Auto,
         }
     }
 }
@@ -198,15 +266,7 @@ impl SplitLayout {
 
             // Compute the editor + secondary area split using the normal two-pane rules,
             // then divide the secondary area among the remaining agent panes.
-            let base = match split_direction {
-                PaneSplitDirection::Vertical => vertical_split_layout(
-                    width,
-                    height,
-                    options.cell_width,
-                    options.agent_pane_cols,
-                ),
-                PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
-            };
+            let base = two_pane_layout(width, height, split_direction, options);
             let editor_rect = base.panes[0];
             let agent_area = base.panes.get(1).copied().unwrap_or(PaneRect {
                 x: 0,
@@ -225,12 +285,7 @@ impl SplitLayout {
             return Self { panes: all };
         }
 
-        match split_direction {
-            PaneSplitDirection::Vertical => {
-                vertical_split_layout(width, height, options.cell_width, options.agent_pane_cols)
-            }
-            PaneSplitDirection::Horizontal => horizontal_split_layout(width, height),
-        }
+        two_pane_layout(width, height, split_direction, options)
     }
 
     pub fn pane(&self, index: usize) -> PaneRect {
@@ -250,10 +305,13 @@ pub(super) fn handle_layout_shortcuts(
     pressed_keys: &[Key],
     alt: bool,
     shift: bool,
+    repeat: bool,
     pane_count: usize,
     mode: &mut PaneLayoutMode,
     split_direction: &mut PaneSplitDirection,
     active_pane: &mut usize,
+    agent_share: &mut AgentPaneShare,
+    agent_span: AgentRegionSpan,
 ) -> bool {
     if !alt {
         return false;
@@ -294,9 +352,7 @@ pub(super) fn handle_layout_shortcuts(
             return true;
         }
 
-        if let Some(next_active_pane) =
-            pane_focus_shortcut(*key).or_else(|| pane_navigation_shortcut(*key))
-        {
+        if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
             if next_active_pane < pane_count {
                 *mode = PaneLayoutMode::Split;
                 *active_pane = next_active_pane;
@@ -304,23 +360,39 @@ pub(super) fn handle_layout_shortcuts(
             }
         }
 
-        // Alt+2..9 focuses the corresponding agent pane (Alt+2 = first agent = index 1)
-        if alt && !shift {
-            if let Some(digit) = key_to_digit(*key) {
+        // Alt+1 focuses the editor. Alt+2..9 focuses that agent pane
+        // (Alt+2 = first agent = index 1). Pressing the focused pane's key
+        // again swaps that pane between half and one third of the split.
+        if let Some(digit) = key_to_digit(*key) {
+            let target = match digit {
+                1 => 0,
+                2..=9 => digit - 1,
+                _ => continue,
+            };
+            if target >= pane_count {
                 if (2..=9).contains(&digit) {
-                    let target = digit - 1; // Alt+2 -> 1, Alt+3 -> 2, ...
-                    if target < pane_count {
-                        *mode = PaneLayoutMode::Split;
-                        *active_pane = target;
-                        return true;
-                    }
                     info!(
                         digit,
                         pane_count,
                         "focus shortcut ignored: no pane at this index (spawn the agent first?)"
                     );
                 }
+                continue;
             }
+            if pane_count >= 2 && *mode == PaneLayoutMode::Split && *active_pane == target {
+                if !repeat {
+                    let side = if target == 0 {
+                        RefocusSide::Editor
+                    } else {
+                        RefocusSide::Agent
+                    };
+                    *agent_share = agent_share.after_refocus(side, agent_span);
+                }
+                return true;
+            }
+            *mode = PaneLayoutMode::Split;
+            *active_pane = target;
+            return true;
         }
     }
 
@@ -405,14 +477,6 @@ pub(super) fn pane_navigation_shortcut(key: Key) -> Option<usize> {
     }
 }
 
-fn pane_focus_shortcut(key: Key) -> Option<usize> {
-    match key {
-        Key::Key1 => Some(0),
-        Key::Key2 => Some(1),
-        _ => None,
-    }
-}
-
 pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
     match key {
         Key::Key1 => Some(PaneLayoutMode::PaneMaximized(0)),
@@ -425,6 +489,111 @@ pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
         Key::Key8 => Some(PaneLayoutMode::PaneMaximized(7)),
         Key::Key9 => Some(PaneLayoutMode::PaneMaximized(8)),
         _ => None,
+    }
+}
+
+fn two_pane_layout(
+    width: usize,
+    height: usize,
+    split_direction: PaneSplitDirection,
+    options: SplitLayoutOptions,
+) -> SplitLayout {
+    match split_direction {
+        PaneSplitDirection::Vertical => {
+            if let Some(agent_width) = agent_share_span(width, options.agent_share) {
+                return vertical_share_layout(width, height, agent_width);
+            }
+            vertical_split_layout(width, height, options.cell_width, options.agent_pane_cols)
+        }
+        PaneSplitDirection::Horizontal => {
+            if let Some(agent_height) = agent_share_span(height, options.agent_share) {
+                return horizontal_share_layout(width, height, agent_height);
+            }
+            horizontal_split_layout(width, height)
+        }
+    }
+}
+
+/// Agent span along `total` pixels, or `None` when the automatic layout applies.
+fn agent_share_span(total: usize, share: AgentPaneShare) -> Option<usize> {
+    let usable = total.saturating_sub(SPLIT_GAP);
+    match share {
+        AgentPaneShare::Auto => None,
+        AgentPaneShare::Half => Some(usable / 2),
+        AgentPaneShare::Third => Some(usable / 3),
+        // Editor keeps one third, so the agent region keeps the remainder.
+        AgentPaneShare::EditorThird => Some(usable.saturating_sub(usable / 3)),
+    }
+}
+
+pub(super) fn agent_region_span(
+    layout: &SplitLayout,
+    direction: PaneSplitDirection,
+    width: usize,
+    height: usize,
+) -> AgentRegionSpan {
+    if layout.panes.len() < 2 {
+        return AgentRegionSpan::unknown();
+    }
+    match direction {
+        PaneSplitDirection::Vertical => AgentRegionSpan {
+            agent: layout.pane(1).width,
+            usable: width.saturating_sub(SPLIT_GAP),
+        },
+        PaneSplitDirection::Horizontal => AgentRegionSpan {
+            agent: layout.pane(1).height,
+            usable: height.saturating_sub(SPLIT_GAP),
+        },
+    }
+}
+
+fn vertical_share_layout(width: usize, height: usize, agent_width: usize) -> SplitLayout {
+    let usable = width.saturating_sub(SPLIT_GAP);
+    let agent_width = agent_width.min(usable);
+    let leading_width = usable.saturating_sub(agent_width);
+    let trailing_x = leading_width + SPLIT_GAP;
+    let trailing_width = width.saturating_sub(trailing_x);
+
+    SplitLayout {
+        panes: vec![
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: leading_width,
+                height,
+            },
+            PaneRect {
+                x: trailing_x,
+                y: 0,
+                width: trailing_width,
+                height,
+            },
+        ],
+    }
+}
+
+fn horizontal_share_layout(width: usize, height: usize, agent_height: usize) -> SplitLayout {
+    let usable = height.saturating_sub(SPLIT_GAP);
+    let agent_height = agent_height.min(usable);
+    let top_height = usable.saturating_sub(agent_height);
+    let bottom_y = top_height + SPLIT_GAP;
+    let bottom_height = height.saturating_sub(bottom_y);
+
+    SplitLayout {
+        panes: vec![
+            PaneRect {
+                x: 0,
+                y: 0,
+                width,
+                height: top_height,
+            },
+            PaneRect {
+                x: 0,
+                y: bottom_y,
+                width,
+                height: bottom_height,
+            },
+        ],
     }
 }
 
@@ -640,5 +809,363 @@ mod tests {
         adjust_pane_indices_after_removal(&mut mode, &mut active, 0, 2);
         assert_eq!(mode, PaneLayoutMode::Split);
         assert_eq!(active, 1);
+    }
+
+    fn options_with_share(agent_share: AgentPaneShare) -> SplitLayoutOptions {
+        SplitLayoutOptions {
+            agent_share,
+            ..SplitLayoutOptions::unbounded()
+        }
+    }
+
+    #[test]
+    fn vertical_half_share_splits_width_evenly() {
+        let layout = SplitLayout::for_window(
+            302,
+            80,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Vertical,
+            options_with_share(AgentPaneShare::Half),
+        );
+
+        assert_eq!(layout.pane(0).width, 150);
+        assert_eq!(layout.pane(1).x, 152);
+        assert_eq!(layout.pane(1).width, 150);
+        assert_eq!(layout.pane(1).height, 80);
+    }
+
+    #[test]
+    fn vertical_third_share_gives_agent_one_third_of_width() {
+        let layout = SplitLayout::for_window(
+            302,
+            90,
+            3,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Vertical,
+            options_with_share(AgentPaneShare::Third),
+        );
+
+        assert_eq!(layout.pane(0).width, 200);
+        assert_eq!(layout.pane(1).width, 100);
+        assert_eq!(layout.pane(2).width, 100);
+        assert_eq!(layout.pane(1).height, 45);
+        assert_eq!(layout.pane(2).height, 45);
+    }
+
+    #[test]
+    fn horizontal_third_share_gives_agent_one_third_of_height() {
+        let layout = SplitLayout::for_window(
+            80,
+            302,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Horizontal,
+            options_with_share(AgentPaneShare::Third),
+        );
+
+        assert_eq!(layout.pane(0).height, 200);
+        assert_eq!(layout.pane(1).y, 202);
+        assert_eq!(layout.pane(1).height, 100);
+        assert_eq!(layout.pane(1).width, 80);
+    }
+
+    #[test]
+    fn vertical_editor_third_gives_editor_one_third_of_width() {
+        let layout = SplitLayout::for_window(
+            302,
+            80,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Vertical,
+            options_with_share(AgentPaneShare::EditorThird),
+        );
+
+        assert_eq!(layout.pane(0).width, 100);
+        assert_eq!(layout.pane(1).x, 102);
+        assert_eq!(layout.pane(1).width, 200);
+    }
+
+    #[test]
+    fn horizontal_editor_third_gives_editor_one_third_of_height() {
+        let layout = SplitLayout::for_window(
+            40,
+            302,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Horizontal,
+            options_with_share(AgentPaneShare::EditorThird),
+        );
+
+        assert_eq!(layout.pane(0).height, 100);
+        assert_eq!(layout.pane(1).y, 102);
+        assert_eq!(layout.pane(1).height, 200);
+    }
+
+    #[test]
+    fn horizontal_half_share_splits_height_evenly() {
+        let layout = SplitLayout::for_window(
+            40,
+            202,
+            2,
+            PaneLayoutMode::Split,
+            PaneSplitDirection::Horizontal,
+            options_with_share(AgentPaneShare::Half),
+        );
+
+        assert_eq!(layout.pane(0).height, 100);
+        assert_eq!(layout.pane(1).height, 100);
+    }
+
+    fn press_agent_focus(
+        key: Key,
+        repeat: bool,
+        mode: &mut PaneLayoutMode,
+        active_pane: &mut usize,
+        agent_share: &mut AgentPaneShare,
+        agent_span: AgentRegionSpan,
+    ) -> bool {
+        let mut split_direction = PaneSplitDirection::Vertical;
+        handle_layout_shortcuts(
+            &[key],
+            true,
+            false,
+            repeat,
+            3,
+            mode,
+            &mut split_direction,
+            active_pane,
+            agent_share,
+            agent_span,
+        )
+    }
+
+    #[test]
+    fn refocusing_agent_toggles_share_between_half_and_third() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 1;
+        let mut share = AgentPaneShare::Auto;
+        let half_span = AgentRegionSpan {
+            agent: 150,
+            usable: 300,
+        };
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            half_span
+        ));
+        assert_eq!(active, 1);
+        assert_eq!(share, AgentPaneShare::Third);
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            half_span
+        ));
+        assert_eq!(share, AgentPaneShare::Half);
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            half_span
+        ));
+        assert_eq!(share, AgentPaneShare::Third);
+    }
+
+    #[test]
+    fn refocus_from_narrow_auto_share_grows_to_half() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 1;
+        let mut share = AgentPaneShare::Auto;
+        let narrow = AgentRegionSpan {
+            agent: 80,
+            usable: 240,
+        };
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            narrow
+        ));
+        assert_eq!(share, AgentPaneShare::Half);
+    }
+
+    #[test]
+    fn focusing_a_different_agent_does_not_change_share() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 1;
+        let mut share = AgentPaneShare::Third;
+
+        assert!(press_agent_focus(
+            Key::Key3,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan::unknown()
+        ));
+        assert_eq!(active, 2);
+        assert_eq!(share, AgentPaneShare::Third);
+    }
+
+    #[test]
+    fn refocus_while_maximized_restores_split_without_resizing() {
+        let mut mode = PaneLayoutMode::PaneMaximized(1);
+        let mut active = 1;
+        let mut share = AgentPaneShare::Auto;
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan {
+                agent: 300,
+                usable: 300,
+            }
+        ));
+        assert_eq!(mode, PaneLayoutMode::Split);
+        assert_eq!(active, 1);
+        assert_eq!(share, AgentPaneShare::Auto);
+    }
+
+    #[test]
+    fn key_repeat_on_focused_agent_does_not_toggle_share() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 1;
+        let mut share = AgentPaneShare::Half;
+
+        assert!(press_agent_focus(
+            Key::Key2,
+            true,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan::unknown()
+        ));
+        assert_eq!(share, AgentPaneShare::Half);
+    }
+
+    #[test]
+    fn arrow_focus_does_not_change_agent_share() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut split_direction = PaneSplitDirection::Vertical;
+        let mut active = 1;
+        let mut share = AgentPaneShare::Half;
+
+        assert!(handle_layout_shortcuts(
+            &[Key::Right],
+            true,
+            false,
+            false,
+            2,
+            &mut mode,
+            &mut split_direction,
+            &mut active,
+            &mut share,
+            AgentRegionSpan::unknown(),
+        ));
+        assert_eq!(active, 1);
+        assert_eq!(share, AgentPaneShare::Half);
+    }
+
+    #[test]
+    fn refocusing_editor_toggles_editor_between_half_and_third() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 0;
+        let mut share = AgentPaneShare::Half;
+        let half_span = AgentRegionSpan {
+            agent: 150,
+            usable: 300,
+        };
+
+        assert!(press_agent_focus(
+            Key::Key1,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            half_span
+        ));
+        assert_eq!(active, 0);
+        assert_eq!(share, AgentPaneShare::EditorThird);
+
+        assert!(press_agent_focus(
+            Key::Key1,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            half_span
+        ));
+        assert_eq!(share, AgentPaneShare::Half);
+    }
+
+    #[test]
+    fn refocusing_large_editor_shrinks_it_to_a_third() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 0;
+        let mut share = AgentPaneShare::Auto;
+
+        assert!(press_agent_focus(
+            Key::Key1,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan {
+                agent: 80,
+                usable: 240,
+            }
+        ));
+        assert_eq!(share, AgentPaneShare::EditorThird);
+    }
+
+    #[test]
+    fn refocusing_the_other_pane_shrinks_that_pane_to_a_third() {
+        let mut mode = PaneLayoutMode::Split;
+        let mut active = 0;
+        let mut share = AgentPaneShare::Third;
+
+        assert!(press_agent_focus(
+            Key::Key1,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan {
+                agent: 100,
+                usable: 300,
+            }
+        ));
+        assert_eq!(share, AgentPaneShare::EditorThird);
+
+        active = 1;
+        assert!(press_agent_focus(
+            Key::Key2,
+            false,
+            &mut mode,
+            &mut active,
+            &mut share,
+            AgentRegionSpan {
+                agent: 200,
+                usable: 300,
+            }
+        ));
+        assert_eq!(share, AgentPaneShare::Third);
     }
 }

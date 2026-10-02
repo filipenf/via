@@ -733,6 +733,7 @@ fn ensure_lua_assets() {
                 include_str!("../nvim/context_bridge.lua"),
             ),
             ("via.lua", include_str!("../nvim/via.lua")),
+            ("via/session.lua", include_str!("../nvim/session.lua")),
             ("via/tasks.lua", include_str!("../nvim/tasks.lua")),
             ("via/vcs.lua", include_str!("../nvim/vcs.lua")),
             ("via/path_match.lua", include_str!("../nvim/path_match.lua")),
