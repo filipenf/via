@@ -11,18 +11,16 @@ pub const MIN_EDITOR_PANE_COLS: u16 = 80;
 /// How the split axis is divided between the editor and the agent region.
 ///
 /// `Auto` keeps the column range in a vertical split and half the window in a
-/// horizontal split. The other variants pin one side to half or one third of
-/// the width (vertical) or height (horizontal).
+/// horizontal split. `Half` is 50/50. `Third` gives the agent one third and the
+/// editor two thirds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) enum AgentPaneShare {
     #[default]
     Auto,
     /// Editor and agent region each take half of the split axis.
     Half,
-    /// Agent region takes one third; the editor takes the rest.
+    /// Agent region takes one third; the editor takes two thirds.
     Third,
-    /// Editor takes one third; the agent region takes the rest.
-    EditorThird,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,26 +30,29 @@ enum RefocusSide {
 }
 
 impl AgentPaneShare {
-    /// Repeat focus on an already-focused pane swaps that pane between half and
-    /// one third. Sizes outside that pair, including `Auto`, jump to whichever
-    /// of the two is farther from the pane's current span.
+    /// Repeat focus swaps between an even split and the agent at one third
+    /// (editor at two thirds). `Auto` jumps to whichever of those is farther
+    /// from the focused pane's current span.
     fn after_refocus(self, side: RefocusSide, span: AgentRegionSpan) -> Self {
         match (side, self) {
-            (RefocusSide::Agent, Self::Half) => Self::Third,
-            (RefocusSide::Agent, Self::Third) => Self::Half,
-            (RefocusSide::Editor, Self::Half) => Self::EditorThird,
-            (RefocusSide::Editor, Self::EditorThird) => Self::Half,
-            _ => {
-                let focused = match side {
-                    RefocusSide::Agent => span.agent,
-                    RefocusSide::Editor => span.usable.saturating_sub(span.agent),
-                };
-                // Midpoint of 1/3 and 1/2 is 5/12. At or above that, shrink to a third.
-                let shrink_to_third = focused.saturating_mul(12) >= span.usable.saturating_mul(5);
-                match (side, shrink_to_third) {
-                    (RefocusSide::Agent, true) => Self::Third,
-                    (RefocusSide::Editor, true) => Self::EditorThird,
-                    (_, false) => Self::Half,
+            (_, Self::Half) => Self::Third,
+            (_, Self::Third) => Self::Half,
+            (RefocusSide::Agent, Self::Auto) => {
+                // Midpoint of 1/3 and 1/2 is 5/12. At or above that, shrink the agent to a third.
+                if span.agent.saturating_mul(12) >= span.usable.saturating_mul(5) {
+                    Self::Third
+                } else {
+                    Self::Half
+                }
+            }
+            (RefocusSide::Editor, Self::Auto) => {
+                let editor = span.usable.saturating_sub(span.agent);
+                // Midpoint of 1/2 and 2/3 is 7/12. At or above that, move the editor to half.
+                // Below that, grow the editor to two thirds.
+                if editor.saturating_mul(12) >= span.usable.saturating_mul(7) {
+                    Self::Half
+                } else {
+                    Self::Third
                 }
             }
         }
@@ -362,7 +363,7 @@ pub(super) fn handle_layout_shortcuts(
 
         // Alt+1 focuses the editor. Alt+2..9 focuses that agent pane
         // (Alt+2 = first agent = index 1). Pressing the focused pane's key
-        // again swaps that pane between half and one third of the split.
+        // again swaps between an even split and the agent at one third.
         if let Some(digit) = key_to_digit(*key) {
             let target = match digit {
                 1 => 0,
@@ -521,8 +522,6 @@ fn agent_share_span(total: usize, share: AgentPaneShare) -> Option<usize> {
         AgentPaneShare::Auto => None,
         AgentPaneShare::Half => Some(usable / 2),
         AgentPaneShare::Third => Some(usable / 3),
-        // Editor keeps one third, so the agent region keeps the remainder.
-        AgentPaneShare::EditorThird => Some(usable.saturating_sub(usable / 3)),
     }
 }
 
@@ -871,38 +870,6 @@ mod tests {
     }
 
     #[test]
-    fn vertical_editor_third_gives_editor_one_third_of_width() {
-        let layout = SplitLayout::for_window(
-            302,
-            80,
-            2,
-            PaneLayoutMode::Split,
-            PaneSplitDirection::Vertical,
-            options_with_share(AgentPaneShare::EditorThird),
-        );
-
-        assert_eq!(layout.pane(0).width, 100);
-        assert_eq!(layout.pane(1).x, 102);
-        assert_eq!(layout.pane(1).width, 200);
-    }
-
-    #[test]
-    fn horizontal_editor_third_gives_editor_one_third_of_height() {
-        let layout = SplitLayout::for_window(
-            40,
-            302,
-            2,
-            PaneLayoutMode::Split,
-            PaneSplitDirection::Horizontal,
-            options_with_share(AgentPaneShare::EditorThird),
-        );
-
-        assert_eq!(layout.pane(0).height, 100);
-        assert_eq!(layout.pane(1).y, 102);
-        assert_eq!(layout.pane(1).height, 200);
-    }
-
-    #[test]
     fn horizontal_half_share_splits_height_evenly() {
         let layout = SplitLayout::for_window(
             40,
@@ -1102,7 +1069,7 @@ mod tests {
             half_span
         ));
         assert_eq!(active, 0);
-        assert_eq!(share, AgentPaneShare::EditorThird);
+        assert_eq!(share, AgentPaneShare::Third);
 
         assert!(press_agent_focus(
             Key::Key1,
@@ -1116,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn refocusing_large_editor_shrinks_it_to_a_third() {
+    fn refocusing_large_editor_moves_it_to_half() {
         let mut mode = PaneLayoutMode::Split;
         let mut active = 0;
         let mut share = AgentPaneShare::Auto;
@@ -1132,31 +1099,17 @@ mod tests {
                 usable: 240,
             }
         ));
-        assert_eq!(share, AgentPaneShare::EditorThird);
+        assert_eq!(share, AgentPaneShare::Half);
     }
 
     #[test]
-    fn refocusing_the_other_pane_shrinks_that_pane_to_a_third() {
+    fn refocusing_small_editor_grows_it_to_two_thirds() {
         let mut mode = PaneLayoutMode::Split;
         let mut active = 0;
-        let mut share = AgentPaneShare::Third;
+        let mut share = AgentPaneShare::Auto;
 
         assert!(press_agent_focus(
             Key::Key1,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            AgentRegionSpan {
-                agent: 100,
-                usable: 300,
-            }
-        ));
-        assert_eq!(share, AgentPaneShare::EditorThird);
-
-        active = 1;
-        assert!(press_agent_focus(
-            Key::Key2,
             false,
             &mut mode,
             &mut active,

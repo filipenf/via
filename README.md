@@ -155,7 +155,7 @@ via agent spawn --id coder --model gpt-5.3-codex-high
 
 **Navigation**
 
-- `Alt+1` focuses the editor. Pressing it again while the editor is already focused switches the editor pane between 50% and 33% of the split: width in a vertical split, height in a horizontal split.
+- `Alt+1` focuses the editor. Pressing it again while the editor is already focused switches the editor between 50% and 2/3 of the split (the agent is then 50% or 1/3): width in a vertical split, height in a horizontal split.
 - `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent). Pressing that shortcut again while the same agent is already focused switches the agent pane between 50% and 33% of the split, on the same axis.
 - `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2 for the first agent, etc.).
 - `Alt+J` toggles the split direction.
@@ -359,8 +359,9 @@ The runtime root is also exposed as `VIA_RUNTIME_ROOT` for scripts. To skip deta
 ## Agent pane width
 
 With a PTY agent, vertical split mode keeps the agent at its minimum width (default 80 columns, up to 100) and gives any
-extra columns to the editor. Focusing a pane that is already focused (see Navigation) switches that pane to 50% or
-33% of the window instead, and further presses alternate between those two sizes. Override the automatic width with:
+extra columns to the editor. Focusing the agent again switches it between 50% and 33% of the window. Focusing
+the editor again switches it between 50% and 2/3, so the agent is 50% or 1/3 (see Navigation). Override the
+automatic width with:
 
 ```sh
 VIA_AGENT_PANE_COLS=60:120 cargo run
