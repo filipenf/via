@@ -1,5 +1,7 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
@@ -21,6 +23,10 @@ use crate::nvim;
 use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
 
 const EVENT_BUFFER_SIZE: usize = 128;
+const SYMBOL_QUERY_DELAY_START: Duration = Duration::from_millis(250);
+const SYMBOL_QUERY_DELAY_MAX: Duration = Duration::from_secs(30);
+const MAX_SYMBOL_QUERY_PENDING: usize = 256;
+const MAX_SYMBOL_QUERY_SEEN: usize = 4_096;
 
 #[derive(Debug, Deserialize)]
 struct AgentToolRequest {
@@ -79,6 +85,16 @@ pub struct Mediator {
     agent_delivery: AgentDelivery,
     /// Event sender retained after `spawn()` so dynamically connected agents can start readers.
     event_sender: Option<EventSender>,
+    symbol_query_pending: HashSet<String>,
+    symbol_query_seen: HashSet<String>,
+    symbol_query_seen_order: VecDeque<String>,
+    symbol_query_inflight_names: HashSet<String>,
+    symbol_query_inflight: usize,
+    symbol_query_delay: Duration,
+    symbol_query_debounce: Option<JoinHandle<()>>,
+    symbol_repo: crate::symbol_cache::ResolvedRepo,
+    symbol_cache_pending: Option<Vec<crate::reference_index::IndexedSymbol>>,
+    symbol_cache_write: Option<JoinHandle<()>>,
 }
 
 #[derive(Clone)]
@@ -100,6 +116,7 @@ pub struct MediatorHandle {
 impl Mediator {
     pub fn new(app: AppContext) -> Self {
         let auto_approve = AutoApprovePolicy::from_config(&app.user.auto_approve);
+        let symbol_repo = crate::symbol_cache::resolve_repo(&app.launch.working_directory);
         let (_events_tx, events_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
         let (ui_commands_tx, _ui_commands_rx) = mpsc::channel(EVENT_BUFFER_SIZE);
 
@@ -114,6 +131,16 @@ impl Mediator {
             acp_runtime: AcpRuntime::new(auto_approve),
             agent_delivery: AgentDelivery::new(),
             event_sender: None,
+            symbol_query_pending: HashSet::new(),
+            symbol_query_seen: HashSet::new(),
+            symbol_query_seen_order: VecDeque::new(),
+            symbol_query_inflight_names: HashSet::new(),
+            symbol_query_inflight: 0,
+            symbol_query_delay: SYMBOL_QUERY_DELAY_START,
+            symbol_query_debounce: None,
+            symbol_repo,
+            symbol_cache_pending: None,
+            symbol_cache_write: None,
         }
     }
 
@@ -155,13 +182,33 @@ impl Mediator {
             );
         self.lsp_handle = Some(lsp_handle.clone());
 
+        let events_for_lsp = events.clone();
         let lsp_clients_forwarder = tokio::spawn(async move {
             while let Some(clients) = lsp_clients_updates.recv().await {
                 debug!(
                     count = clients.len(),
                     "lsp clients updated (not forwarding to agent stdin)"
                 );
-                drop(clients);
+                let _ = events_for_lsp
+                    .send(Event::LspClientsUpdated {
+                        connected: !clients.is_empty(),
+                    })
+                    .await;
+            }
+        });
+
+        let repo = self.symbol_repo.clone();
+        let ui_commands = self.ui_commands.clone();
+        tokio::spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || crate::symbol_cache::load_repo(&repo));
+            match loaded.await {
+                Ok(symbols) if !symbols.is_empty() => {
+                    let _ = ui_commands
+                        .send(UiCommand::SymbolsDiscovered { symbols })
+                        .await;
+                }
+                Ok(_) => {}
+                Err(error) => warn!(%error, "symbol cache load task failed"),
             }
         });
 
@@ -197,6 +244,26 @@ impl Mediator {
                     if let Some(task) = self.in_flight_symbol_open.take() {
                         task.abort();
                     }
+                    if let Some(task) = self.symbol_query_debounce.take() {
+                        task.abort();
+                    }
+                    if let Some(task) = self.symbol_cache_write.take() {
+                        task.abort();
+                    }
+                    if let Some(symbols) = self.symbol_cache_pending.take() {
+                        let repo = self.symbol_repo.clone();
+                        match tokio::task::spawn_blocking(move || {
+                            crate::symbol_cache::store_repo(&repo, &symbols)
+                        })
+                        .await
+                        {
+                            Ok(Err(error)) => {
+                                warn!(%error, "failed to flush symbol cache on shutdown")
+                            }
+                            Err(error) => warn!(%error, "symbol cache flush task failed"),
+                            Ok(Ok(())) => {}
+                        }
+                    }
                     info!("mediator received shutdown");
                     break;
                 }
@@ -215,6 +282,9 @@ impl Mediator {
                     {
                         error!(%error, "failed to open file in Neovim");
                     }
+                }
+                Event::Ui(UiEvent::SymbolCandidates { names }) => {
+                    self.observe_symbol_candidates(names);
                 }
                 Event::Ui(UiEvent::SymbolOpenRequested { symbol }) => {
                     if let Some(task) = self.in_flight_symbol_open.take() {
@@ -294,6 +364,20 @@ impl Mediator {
                         .await;
                 }
                 Event::Agent(event) => debug!(?event, "agent event received"),
+                Event::SymbolQueryDue => self.on_symbol_query_due(),
+                Event::SymbolCacheWriteDue => self.on_symbol_cache_write_due(),
+                Event::LspClientsUpdated { connected } => {
+                    if connected {
+                        self.wake_symbol_queries();
+                    }
+                }
+                Event::SymbolQueryFinished {
+                    query,
+                    symbols,
+                    retry,
+                } => {
+                    self.on_symbol_query_finished(query, symbols, retry);
+                }
                 event => debug!(?event, "mediator event received"),
             }
         }
@@ -553,6 +637,7 @@ impl Mediator {
             }
             EditorEvent::SymbolIndexChanged { symbols } => {
                 debug!(symbols = symbols.len(), "symbol index snapshot received");
+                self.queue_symbol_cache(symbols.clone());
                 self.send_ui_command(UiCommand::SymbolIndexChanged {
                     symbols: symbols.clone(),
                 });
@@ -565,6 +650,165 @@ impl Mediator {
     fn send_ui_command(&self, command: UiCommand) {
         if self.ui_commands.try_send(command).is_err() {
             warn!("ui command channel full or closed; dropped pane update");
+        }
+    }
+
+    fn observe_symbol_candidates(&mut self, names: Vec<String>) {
+        let mut added = false;
+        for name in names {
+            if name.is_empty()
+                || self.symbol_query_seen.contains(&name)
+                || self.symbol_query_inflight_names.contains(&name)
+                || self.symbol_query_pending.contains(&name)
+            {
+                continue;
+            }
+            if self.symbol_query_pending.len() >= MAX_SYMBOL_QUERY_PENDING {
+                continue;
+            }
+            self.symbol_query_pending.insert(name);
+            added = true;
+        }
+        if added && self.symbol_query_inflight == 0 && self.symbol_query_debounce.is_none() {
+            self.schedule_symbol_query();
+        }
+    }
+
+    fn schedule_symbol_cache_write(&mut self) {
+        if let Some(task) = self.symbol_cache_write.take() {
+            task.abort();
+        }
+        let Some(sender) = self.event_sender.clone() else {
+            return;
+        };
+        self.symbol_cache_write = Some(tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = sender.events.send(Event::SymbolCacheWriteDue).await;
+        }));
+    }
+
+    fn queue_symbol_cache(&mut self, symbols: Vec<crate::reference_index::IndexedSymbol>) {
+        if symbols.is_empty() {
+            return;
+        }
+        self.symbol_cache_pending
+            .get_or_insert_with(Vec::new)
+            .extend(symbols);
+        self.schedule_symbol_cache_write();
+    }
+
+    fn on_symbol_cache_write_due(&mut self) {
+        self.symbol_cache_write = None;
+        let Some(symbols) = self.symbol_cache_pending.take() else {
+            return;
+        };
+        let repo = self.symbol_repo.clone();
+        tokio::spawn(async move {
+            let write = tokio::task::spawn_blocking(move || {
+                crate::symbol_cache::store_repo(&repo, &symbols)
+            });
+            match write.await {
+                Ok(Err(error)) => warn!(%error, "failed to persist symbol cache"),
+                Err(error) => warn!(%error, "symbol cache write task failed"),
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+
+    fn schedule_symbol_query(&mut self) {
+        let Some(sender) = self.event_sender.clone() else {
+            return;
+        };
+        let delay = self.symbol_query_delay;
+        self.symbol_query_debounce = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = sender.events.send(Event::SymbolQueryDue).await;
+        }));
+    }
+
+    fn wake_symbol_queries(&mut self) {
+        self.symbol_query_delay = SYMBOL_QUERY_DELAY_START;
+        if self.symbol_query_pending.is_empty() || self.symbol_query_inflight > 0 {
+            return;
+        }
+        if let Some(task) = self.symbol_query_debounce.take() {
+            task.abort();
+        }
+        self.schedule_symbol_query();
+    }
+
+    fn remember_symbol_query(&mut self, name: String) {
+        if !self.symbol_query_seen.insert(name.clone()) {
+            return;
+        }
+        self.symbol_query_seen_order.push_back(name);
+        while self.symbol_query_seen_order.len() > MAX_SYMBOL_QUERY_SEEN {
+            if let Some(old) = self.symbol_query_seen_order.pop_front() {
+                self.symbol_query_seen.remove(&old);
+            }
+        }
+    }
+
+    fn on_symbol_query_due(&mut self) {
+        self.symbol_query_debounce = None;
+        self.pump_symbol_queries();
+    }
+
+    fn pump_symbol_queries(&mut self) {
+        let Some(lsp) = self.lsp_handle.clone() else {
+            return;
+        };
+        let Some(sender) = self.event_sender.clone() else {
+            return;
+        };
+        while self.symbol_query_inflight < 2 {
+            let Some(query) = self.symbol_query_pending.iter().next().cloned() else {
+                break;
+            };
+            self.symbol_query_pending.remove(&query);
+            self.symbol_query_inflight_names.insert(query.clone());
+            self.symbol_query_inflight += 1;
+            let lsp = lsp.clone();
+            let sender = sender.clone();
+            tokio::spawn(async move {
+                let outcome = crate::symbol_cache::query_workspace(&lsp, &query).await;
+                let retry = outcome.is_none();
+                let _ = sender
+                    .events
+                    .send(Event::SymbolQueryFinished {
+                        query,
+                        symbols: outcome.unwrap_or_default(),
+                        retry,
+                    })
+                    .await;
+            });
+        }
+    }
+
+    fn on_symbol_query_finished(
+        &mut self,
+        query: String,
+        symbols: Vec<crate::reference_index::IndexedSymbol>,
+        retry: bool,
+    ) {
+        self.symbol_query_inflight = self.symbol_query_inflight.saturating_sub(1);
+        self.symbol_query_inflight_names.remove(&query);
+        if retry {
+            self.symbol_query_pending.insert(query);
+            if self.symbol_query_inflight == 0 && self.symbol_query_debounce.is_none() {
+                self.schedule_symbol_query();
+                self.symbol_query_delay = (self.symbol_query_delay * 2).min(SYMBOL_QUERY_DELAY_MAX);
+            }
+            return;
+        }
+        self.symbol_query_delay = SYMBOL_QUERY_DELAY_START;
+        self.remember_symbol_query(query);
+        if !symbols.is_empty() {
+            self.queue_symbol_cache(symbols.clone());
+            self.send_ui_command(UiCommand::SymbolsDiscovered { symbols });
+        }
+        if !self.symbol_query_pending.is_empty() && self.symbol_query_inflight < 2 {
+            self.pump_symbol_queries();
         }
     }
 
@@ -680,9 +924,12 @@ impl Mediator {
 }
 
 impl EventSender {
-    pub fn try_send(&self, event: Event) {
+    pub fn try_send(&self, event: Event) -> bool {
         if self.events.try_send(event).is_err() {
             debug!("mediator is not accepting events");
+            false
+        } else {
+            true
         }
     }
 

@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::{HashSet, VecDeque};
 use std::ffi::OsString;
 use std::path::Path;
 use std::rc::Rc;
@@ -18,6 +19,7 @@ use crate::pty::{OutputNotifier, PtySession, TerminalSize};
 
 use super::config::{TerminalMetrics, TerminalTheme};
 use super::font::FontRenderer;
+use super::input::Modifiers;
 use super::layout::PaneRect;
 use super::links::{
     Osc8Tracker, ReferenceContext, ReferenceTarget, reference_spans_from_row_ctx,
@@ -32,6 +34,9 @@ pub(super) struct TerminalPane {
     pub(super) title: &'static str,
     view: TerminalView,
     pty: Option<Rc<RefCell<PtySession>>>,
+    seen_symbol_queries: HashSet<String>,
+    seen_symbol_query_order: VecDeque<String>,
+    row_fingerprints: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,14 +55,6 @@ pub(super) enum PaneMouseButton {
     WheelDown,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct PaneMouseModifiers {
-    pub(super) ctrl: bool,
-    pub(super) shift: bool,
-    pub(super) alt: bool,
-    pub(super) super_key: bool,
-}
-
 impl TerminalPane {
     pub(super) fn new(
         title: &'static str,
@@ -72,7 +69,59 @@ impl TerminalPane {
             title,
             view,
             pty: None,
+            seen_symbol_queries: HashSet::new(),
+            seen_symbol_query_order: VecDeque::new(),
+            row_fingerprints: Vec::new(),
         })
+    }
+
+    /// Symbol-like names on the visible screen that have not been reported yet.
+    ///
+    /// Reads the terminal grid directly. The render-state row iterator consumes
+    /// dirty tracking, so walking it once per row only sees the first row.
+    pub(super) fn take_new_symbol_queries(&mut self) -> Vec<String> {
+        let mut fresh = Vec::new();
+        let rows = self.view.size.rows as usize;
+        if self.row_fingerprints.len() != rows {
+            self.row_fingerprints.resize(rows, u64::MAX);
+        }
+        for row in 0..rows {
+            let text = self.view.viewport_row_text(row);
+            let fingerprint = row_fingerprint(&text);
+            if self.row_fingerprints[row] == fingerprint {
+                continue;
+            }
+            self.row_fingerprints[row] = fingerprint;
+            for name in crate::reference_index::symbol_query_candidates(&text) {
+                if self.remember_symbol_query(&name) {
+                    fresh.push(name);
+                }
+            }
+        }
+        fresh
+    }
+
+    fn remember_symbol_query(&mut self, name: &str) -> bool {
+        const MAX_SEEN: usize = 4_096;
+        if !self.seen_symbol_queries.insert(name.to_string()) {
+            return false;
+        }
+        self.seen_symbol_query_order.push_back(name.to_string());
+        while self.seen_symbol_query_order.len() > MAX_SEEN {
+            if let Some(old) = self.seen_symbol_query_order.pop_front() {
+                self.seen_symbol_queries.remove(&old);
+            }
+        }
+        true
+    }
+
+    pub(super) fn forget_symbol_queries(&mut self, names: &[String]) {
+        for name in names {
+            self.seen_symbol_queries.remove(name);
+            self.seen_symbol_query_order
+                .retain(|existing| existing != name);
+        }
+        self.row_fingerprints.clear();
     }
 
     pub(super) fn spawn<I, S, N>(
@@ -144,6 +193,7 @@ impl TerminalPane {
         metrics: TerminalMetrics,
     ) -> Option<TerminalSize> {
         let size = self.view.resize_with_metrics(width, height, metrics)?;
+        self.row_fingerprints.clear();
 
         if let Some(pty) = &self.pty {
             if let Err(error) = pty.borrow_mut().resize(size) {
@@ -179,7 +229,7 @@ impl TerminalPane {
         button: Option<PaneMouseButton>,
         x: usize,
         y: usize,
-        modifiers: PaneMouseModifiers,
+        modifiers: Modifiers,
         any_button_pressed: bool,
     ) -> Result<bool> {
         let payload =
@@ -452,7 +502,7 @@ impl TerminalView {
         button: Option<PaneMouseButton>,
         x: usize,
         y: usize,
-        modifiers: PaneMouseModifiers,
+        modifiers: Modifiers,
         any_button_pressed: bool,
     ) -> Result<Vec<u8>> {
         let mut encoder = mouse::Encoder::new().context("failed to create mouse encoder")?;
@@ -761,6 +811,36 @@ impl TerminalView {
             .and_then(|span| reference_target_from_uri(&span.uri, working_directory))
     }
 
+    /// Visible row text from the terminal grid, without touching render state.
+    fn viewport_row_text(&self, row: usize) -> String {
+        let cols = self.size.cols as usize;
+        let mut text = String::with_capacity(cols);
+        for col in 0..cols {
+            let point = Point::Viewport(PointCoordinate {
+                x: col as u16,
+                y: row as u32,
+            });
+            let ch = self
+                .terminal
+                .grid_ref(point)
+                .ok()
+                .and_then(|grid_ref| grid_ref.cell().ok())
+                .and_then(|cell| {
+                    if cell.has_text().ok()? {
+                        cell.codepoint()
+                            .ok()
+                            .and_then(char::from_u32)
+                            .filter(|ch| *ch != '\0')
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or(' ');
+            text.push(ch);
+        }
+        text
+    }
+
     fn row_text(&mut self, row: usize) -> Option<String> {
         let snapshot = self.render_state.update(&self.terminal).ok()?;
         let cols = snapshot.cols().ok()? as usize;
@@ -834,7 +914,16 @@ fn drain_pty_output(
     drained_chunks
 }
 
-fn mouse_modifiers(modifiers: PaneMouseModifiers) -> vt_key::Mods {
+fn row_fingerprint(text: &str) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn mouse_modifiers(modifiers: Modifiers) -> vt_key::Mods {
     let mut mods = vt_key::Mods::empty();
     if modifiers.ctrl {
         mods |= vt_key::Mods::CTRL;
@@ -1133,6 +1222,35 @@ mod tests {
             view.set_reference_cues_enabled(false, ReferenceContext::cwd_only(Path::new("/repo")))
         );
         assert!(view.cue_spans.is_empty());
+    }
+
+    #[test]
+    fn symbol_queries_read_every_visible_row() {
+        let mut pane = TerminalPane::new(
+            "agent",
+            40,
+            4,
+            TerminalMetrics {
+                cell_width: 1,
+                cell_height: 1,
+                baseline: 0,
+            },
+            &test_theme(),
+        )
+        .expect("test pane");
+        pane.view
+            .process(b"hello\r\nsee SyncWorkflow here\r\n", true);
+
+        let names = pane.take_new_symbol_queries();
+        assert!(names.iter().any(|name| name == "SyncWorkflow"), "{names:?}");
+        assert!(pane.take_new_symbol_queries().is_empty());
+
+        pane.forget_symbol_queries(&names);
+        assert!(
+            pane.take_new_symbol_queries()
+                .iter()
+                .any(|name| name == "SyncWorkflow")
+        );
     }
 
     #[test]

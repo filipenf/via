@@ -17,6 +17,7 @@ mod plugin;
 mod pty;
 mod reference_index;
 mod session;
+mod symbol_cache;
 mod task_delivery;
 mod task_store;
 #[cfg(test)]

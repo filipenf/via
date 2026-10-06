@@ -8,6 +8,21 @@ pub enum Event {
     Editor(EditorEvent),
     Agent(AgentEvent),
     Shutdown,
+    /// Debounce elapsed; start queued workspace-symbol queries.
+    SymbolQueryDue,
+    /// One background `workspace/symbol` query finished.
+    SymbolQueryFinished {
+        query: String,
+        symbols: Vec<crate::reference_index::IndexedSymbol>,
+        /// No language server was connected; try this query again later.
+        retry: bool,
+    },
+    /// Debounce elapsed; write the latest open-buffer symbols to the repo cache.
+    SymbolCacheWriteDue,
+    /// Neovim reported its language-server client list.
+    LspClientsUpdated {
+        connected: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -18,6 +33,11 @@ pub enum UiEvent {
     },
     SymbolOpenRequested {
         symbol: String,
+    },
+    /// Symbol-like tokens observed in agent output. The mediator resolves them
+    /// with `workspace/symbol` in the background.
+    SymbolCandidates {
+        names: Vec<String>,
     },
     ReviewRequested,
     AgentPromptSubmitted {
@@ -133,6 +153,10 @@ pub enum UiCommand {
     },
     /// Updated open-buffer document-symbol index for Ctrl-held cue scoring.
     SymbolIndexChanged {
+        symbols: Vec<crate::reference_index::IndexedSymbol>,
+    },
+    /// Workspace-symbol hits to merge into the repo cache layer.
+    SymbolsDiscovered {
         symbols: Vec<crate::reference_index::IndexedSymbol>,
     },
 }

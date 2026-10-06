@@ -33,10 +33,30 @@ pub struct LspClientInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CapabilitiesSummary {
+    #[serde(deserialize_with = "deserialize_capability")]
     pub definition: bool,
+    #[serde(deserialize_with = "deserialize_capability")]
     pub references: bool,
+    #[serde(deserialize_with = "deserialize_capability")]
     pub hover: bool,
+    #[serde(deserialize_with = "deserialize_capability")]
     pub document_symbol: bool,
+    /// `workspace/symbol`. Missing on older Neovim bridges.
+    /// Servers often send a `{ resolveProvider }` object instead of a bool.
+    #[serde(default, deserialize_with = "deserialize_capability")]
+    pub workspace_symbol: bool,
+}
+
+fn deserialize_capability<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(match value {
+        serde_json::Value::Bool(enabled) => enabled,
+        serde_json::Value::Null => false,
+        _ => true,
+    })
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -100,6 +120,16 @@ impl LspBridgeHandle {
     /// The agent can use this to discover available language servers and their capabilities.
     pub async fn clients(&self) -> Vec<LspClientInfo> {
         self.state.lock().await.clients.clone()
+    }
+
+    pub async fn workspace_symbol(
+        &self,
+        query: &str,
+        client_id: Option<i32>,
+    ) -> Result<serde_json::Value> {
+        let params = serde_json::json!({ "query": query });
+        self.send_request("workspace/symbol", params, client_id)
+            .await
     }
 
     async fn send_request(
@@ -318,6 +348,28 @@ mod tests {
     use std::time::Duration;
     use tokio::net::UnixStream;
     use tokio::time::timeout;
+
+    #[test]
+    fn capability_object_counts_as_enabled() {
+        let raw = r#"{
+            "id": 1,
+            "name": "rust_analyzer",
+            "root": "/repo",
+            "languages": ["rust"],
+            "capabilities_summary": {
+                "definition": true,
+                "references": { "workDoneProgress": true },
+                "hover": false,
+                "documentSymbol": true,
+                "workspaceSymbol": { "resolveProvider": true }
+            }
+        }"#;
+        let info: LspClientInfo = serde_json::from_str(raw).unwrap();
+        assert!(info.capabilities_summary.workspace_symbol);
+        assert!(info.capabilities_summary.references);
+        assert!(info.capabilities_summary.document_symbol);
+        assert!(!info.capabilities_summary.hover);
+    }
 
     #[tokio::test]
     async fn roundtrip_definition_request() {

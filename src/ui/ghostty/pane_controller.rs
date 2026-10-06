@@ -9,7 +9,7 @@ use super::input::{
     try_clipboard_paste,
 };
 use super::links::{ReferenceContext, ReferenceTarget};
-use super::pane::{PaneMouseAction, PaneMouseButton, PaneMouseModifiers, TerminalPane};
+use super::pane::{PaneMouseAction, PaneMouseButton, TerminalPane};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum PaneRole {
@@ -316,7 +316,7 @@ impl TerminalPaneController {
                     Some(button),
                     local_x,
                     local_y,
-                    pane_mouse_modifiers(modifiers),
+                    modifiers,
                     true,
                 )?;
                 Ok(PaneEventOutcome {
@@ -359,7 +359,6 @@ impl TerminalPaneController {
             PaneMouseButton::WheelDown
         };
         let count = steps.unsigned_abs().min(64);
-        let modifiers = pane_mouse_modifiers(modifiers);
         let mut dirty = false;
 
         for _ in 0..count {
@@ -415,7 +414,7 @@ impl TerminalPaneController {
             Some(button),
             local_x,
             local_y,
-            pane_mouse_modifiers(modifiers),
+            modifiers,
             self.mouse.held_button.is_some(),
         )?;
 
@@ -550,15 +549,6 @@ fn pane_mouse_button(button: MouseButton) -> Option<PaneMouseButton> {
         MouseButton::Middle => Some(PaneMouseButton::Middle),
         MouseButton::Right => Some(PaneMouseButton::Right),
         _ => None,
-    }
-}
-
-fn pane_mouse_modifiers(modifiers: Modifiers) -> PaneMouseModifiers {
-    PaneMouseModifiers {
-        ctrl: modifiers.ctrl,
-        shift: modifiers.shift,
-        alt: modifiers.alt,
-        super_key: modifiers.super_key,
     }
 }
 

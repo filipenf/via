@@ -638,6 +638,13 @@ end, {
   nargs = "?",
 })
 
+local function capability_enabled(value)
+  if type(value) == "table" then
+    return true
+  end
+  return value == true
+end
+
 local function get_client_info(client)
   if not client then return nil end
   local caps = client.server_capabilities or {}
@@ -647,10 +654,11 @@ local function get_client_info(client)
     root = client.config and client.config.root_dir or "",
     languages = client.config and client.config.filetypes or {},
     capabilities_summary = {
-      definition = caps.definitionProvider or false,
-      references = caps.referencesProvider or false,
-      hover = caps.hoverProvider or false,
-      documentSymbol = caps.documentSymbolProvider or false,
+      definition = capability_enabled(caps.definitionProvider),
+      references = capability_enabled(caps.referencesProvider),
+      hover = capability_enabled(caps.hoverProvider),
+      documentSymbol = capability_enabled(caps.documentSymbolProvider),
+      workspaceSymbol = capability_enabled(caps.workspaceSymbolProvider),
     },
   }
 end
@@ -686,9 +694,19 @@ handle_lsp_request = function(msg)
       lsp_notify({ type = "lsp_response", request_id = req_id, result = result })
     end
   end
-  local ok, req_err = pcall(client.request, client, method, params, handler, 0)
+  local bufnr = 0
+  if type(method) == "string" and method:sub(1, 10) == "workspace/" then
+    bufnr = nil
+  end
+  local ok, requested, req_err = pcall(client.request, client, method, params, handler, bufnr)
   if not ok then
-    lsp_notify({ type = "lsp_response", request_id = req_id, error = tostring(req_err) })
+    lsp_notify({ type = "lsp_response", request_id = req_id, error = tostring(requested) })
+  elseif not requested then
+    lsp_notify({
+      type = "lsp_response",
+      request_id = req_id,
+      error = tostring(req_err or "lsp request rejected"),
+    })
   end
 end
 

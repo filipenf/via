@@ -47,9 +47,9 @@ use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers};
 use layout::{
-    AgentPaneShare, PaneLayoutMode, PaneRect, PaneSplitDirection, SplitLayout, SplitLayoutOptions,
-    adjust_pane_indices_after_removal, agent_region_span, focus_nvim_after_agent_reference,
-    handle_layout_shortcuts, vertical_split_fits,
+    AgentPaneShare, PaneLayoutMode, PaneLayoutState, PaneRect, PaneSplitDirection, SplitLayout,
+    SplitLayoutOptions, adjust_pane_indices_after_removal, agent_region_span,
+    focus_nvim_after_agent_reference, handle_layout_shortcuts, vertical_split_fits,
 };
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
@@ -148,10 +148,7 @@ struct WinitGhosttyApp {
     acp_modal: AcpModalQueue,
     /// Control-plane bridges for PTY-hosted `via --acp-tui` panes (keyed by agent id).
     acp_tui_bridges: HashMap<String, AcpTuiBridge>,
-    active_pane: usize,
-    pane_layout_mode: PaneLayoutMode,
-    pane_split_direction: PaneSplitDirection,
-    agent_pane_share: AgentPaneShare,
+    layout_state: PaneLayoutState,
     /// Split was auto-collapsed because the window is too narrow; restore on widen.
     split_collapsed_for_width: bool,
     layout: SplitLayout,
@@ -181,6 +178,20 @@ impl AppPane {
 
     fn is_agent_terminal(&self) -> bool {
         matches!(self, Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { .. }))
+    }
+
+    fn take_new_symbol_queries(&mut self) -> Vec<String> {
+        let Self::Terminal(pane) = self;
+        if matches!(pane.role(), PaneRole::AgentTerminal { .. }) {
+            pane.take_new_symbol_queries()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn forget_symbol_queries(&mut self, names: &[String]) {
+        let Self::Terminal(pane) = self;
+        pane.forget_symbol_queries(names);
     }
 
     fn agent_id_matches(&self, want: &str) -> bool {
@@ -411,6 +422,7 @@ impl WinitGhosttyApp {
             SplitLayoutOptions::unbounded(),
         );
 
+        let file_index = ReferenceIndex::default();
         Ok(Self {
             app: ui.app,
             events: ui.events,
@@ -430,10 +442,12 @@ impl WinitGhosttyApp {
             review_active: false,
             acp_modal: AcpModalQueue::new(),
             acp_tui_bridges: HashMap::new(),
-            active_pane: 0,
-            pane_layout_mode: PaneLayoutMode::Split,
-            pane_split_direction,
-            agent_pane_share: AgentPaneShare::Auto,
+            layout_state: PaneLayoutState {
+                mode: PaneLayoutMode::Split,
+                split_direction: pane_split_direction,
+                active_pane: 0,
+                agent_share: AgentPaneShare::Auto,
+            },
             split_collapsed_for_width: false,
             layout,
             width: INITIAL_WIDTH,
@@ -448,7 +462,7 @@ impl WinitGhosttyApp {
             last_arrow_repeat_at: None,
             next_theme_poll_at: Instant::now(),
             error: None,
-            file_index: ReferenceIndex::default(),
+            file_index,
         })
     }
 
@@ -512,8 +526,8 @@ impl WinitGhosttyApp {
                 {
                     // A narrow window may have collapsed the split onto the editor.
                     // Keys should follow the pane that is actually visible.
-                    if self.pane_layout_mode == PaneLayoutMode::Split {
-                        self.active_pane = index;
+                    if self.layout_state.mode == PaneLayoutMode::Split {
+                        self.layout_state.active_pane = index;
                     }
                 }
             } else {
@@ -702,12 +716,7 @@ impl WinitGhosttyApp {
         self.panes.remove(index);
         self.close_acp_tui_bridge(id);
 
-        adjust_pane_indices_after_removal(
-            &mut self.pane_layout_mode,
-            &mut self.active_pane,
-            index,
-            self.panes.len(),
-        );
+        adjust_pane_indices_after_removal(&mut self.layout_state, index, self.panes.len());
         self.acp_modal.remove_agent(id);
 
         self.relayout();
@@ -766,12 +775,7 @@ impl WinitGhosttyApp {
         let mut removed_any = false;
         for index in pty_remove.into_iter().rev() {
             self.panes.remove(index);
-            adjust_pane_indices_after_removal(
-                &mut self.pane_layout_mode,
-                &mut self.active_pane,
-                index,
-                self.panes.len(),
-            );
+            adjust_pane_indices_after_removal(&mut self.layout_state, index, self.panes.len());
             removed_any = true;
         }
 
@@ -960,8 +964,11 @@ impl WinitGhosttyApp {
     fn resize_terminals(&mut self, width: usize, height: usize) {
         self.width = width;
         self.height = height;
-        self.pane_split_direction =
-            PaneSplitDirection::adjust_for_window_resize(self.pane_split_direction, width, height);
+        self.layout_state.split_direction = PaneSplitDirection::adjust_for_window_resize(
+            self.layout_state.split_direction,
+            width,
+            height,
+        );
         if ensure_buffer_size(
             &mut self.buffer,
             width,
@@ -978,7 +985,7 @@ impl WinitGhosttyApp {
         SplitLayoutOptions {
             cell_width: self.terminal_config.metrics.cell_width,
             agent_pane_cols: self.app.user.agent_pane_col_limits(),
-            agent_share: self.agent_pane_share,
+            agent_share: self.layout_state.agent_share,
         }
     }
 
@@ -989,7 +996,7 @@ impl WinitGhosttyApp {
 
         let fits = match (
             self.app.user.agent_pane_col_limits(),
-            self.pane_split_direction,
+            self.layout_state.split_direction,
         ) {
             (Some((agent_min, _)), PaneSplitDirection::Vertical) => vertical_split_fits(
                 self.width,
@@ -999,17 +1006,17 @@ impl WinitGhosttyApp {
             _ => true,
         };
 
-        if self.pane_layout_mode == PaneLayoutMode::Split && !fits {
-            self.pane_layout_mode = PaneLayoutMode::PaneMaximized(0);
+        if self.layout_state.mode == PaneLayoutMode::Split && !fits {
+            self.layout_state.mode = PaneLayoutMode::PaneMaximized(0);
             self.split_collapsed_for_width = true;
             return;
         }
 
-        if self.pane_layout_mode == PaneLayoutMode::PaneMaximized(0)
+        if self.layout_state.mode == PaneLayoutMode::PaneMaximized(0)
             && self.split_collapsed_for_width
             && fits
         {
-            self.pane_layout_mode = PaneLayoutMode::Split;
+            self.layout_state.mode = PaneLayoutMode::Split;
             self.split_collapsed_for_width = false;
         }
     }
@@ -1025,8 +1032,8 @@ impl WinitGhosttyApp {
             self.width,
             self.height,
             self.panes.len().max(1),
-            self.pane_layout_mode,
-            self.pane_split_direction,
+            self.layout_state.mode,
+            self.layout_state.split_direction,
             self.split_layout_options(),
         );
         if new_layout == self.layout {
@@ -1269,20 +1276,16 @@ impl WinitGhosttyApp {
         }
         let agent_span = agent_region_span(
             &self.layout,
-            self.pane_split_direction,
+            self.layout_state.split_direction,
             self.width,
             self.height,
         );
         let layout_shortcut_consumed = handle_layout_shortcuts(
             &pressed_keys,
-            self.modifiers.alt,
-            self.modifiers.shift,
+            self.modifiers,
             event.repeat,
             self.panes.len(),
-            &mut self.pane_layout_mode,
-            &mut self.pane_split_direction,
-            &mut self.active_pane,
-            &mut self.agent_pane_share,
+            &mut self.layout_state,
             agent_span,
         );
         if layout_shortcut_consumed {
@@ -1291,7 +1294,7 @@ impl WinitGhosttyApp {
             self.dirty = true;
             self.force_redraw = true;
         }
-        let Some(active_pane) = self.panes.get_mut(self.active_pane) else {
+        let Some(active_pane) = self.panes.get_mut(self.layout_state.active_pane) else {
             return Ok(());
         };
         let outcome = active_pane.handle_key_event(
@@ -1378,8 +1381,7 @@ impl WinitGhosttyApp {
 
     fn open_nvim_review(&mut self) {
         self.review_active = false;
-        self.pane_layout_mode = PaneLayoutMode::PaneMaximized(0);
-        self.active_pane = 0;
+        self.layout_state.focus_maximized_editor();
         self.relayout();
         self.events.try_send(Event::Ui(UiEvent::ReviewRequested));
     }
@@ -1402,7 +1404,7 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let Some(active_pane) = self.panes.get_mut(self.active_pane) else {
+        let Some(active_pane) = self.panes.get_mut(self.layout_state.active_pane) else {
             return Ok(());
         };
         let outcome = active_pane.handle_text_commit(text, self.modifiers)?;
@@ -1533,7 +1535,7 @@ impl WinitGhosttyApp {
             return Ok(());
         };
 
-        if pane_index != self.active_pane || pane_index >= self.panes.len() {
+        if pane_index != self.layout_state.active_pane || pane_index >= self.panes.len() {
             return Ok(());
         }
 
@@ -1566,8 +1568,7 @@ impl WinitGhosttyApp {
     }
 
     fn focus_nvim_after_reference_navigation(&mut self) {
-        let focus =
-            focus_nvim_after_agent_reference(&mut self.pane_layout_mode, &mut self.active_pane);
+        let focus = focus_nvim_after_agent_reference(&mut self.layout_state);
         if focus.relayout_needed {
             self.relayout();
         } else if focus.focus_changed {
@@ -1582,8 +1583,11 @@ impl WinitGhosttyApp {
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
         // rather than being silently swallowed.
         self.output_notifier.clear();
-        for pane in self.panes.iter_mut() {
+        let mut symbol_names = Vec::new();
+        let mut symbol_sources = Vec::new();
+        for (index, pane) in self.panes.iter_mut().enumerate() {
             if let Some(chunks) = pane.drain_agent_output_chunks() {
+                let drained = !chunks.is_empty();
                 for chunk in &chunks {
                     if let Ok(text) = std::str::from_utf8(chunk) {
                         self.events
@@ -1592,9 +1596,40 @@ impl WinitGhosttyApp {
                             )));
                     }
                 }
-                self.dirty |= !chunks.is_empty();
+                self.dirty |= drained;
+                if drained {
+                    let before = symbol_names.len();
+                    symbol_names.extend(pane.take_new_symbol_queries());
+                    if symbol_names.len() != before {
+                        symbol_sources.push(index);
+                    }
+                }
             } else {
-                self.dirty |= pane.drain_output();
+                let drained = pane.drain_output();
+                self.dirty |= drained;
+                if drained {
+                    let before = symbol_names.len();
+                    symbol_names.extend(pane.take_new_symbol_queries());
+                    if symbol_names.len() != before {
+                        symbol_sources.push(index);
+                    }
+                }
+            }
+        }
+        let queued: Vec<String> = symbol_names
+            .iter()
+            .filter(|name| !self.file_index.contains_symbol(name))
+            .cloned()
+            .collect();
+        if !queued.is_empty()
+            && !self.events.try_send(Event::Ui(UiEvent::SymbolCandidates {
+                names: queued.clone(),
+            }))
+        {
+            // The names were marked seen before the send. Put them back so the
+            // next drain can try again instead of dropping them for the session.
+            for index in symbol_sources {
+                self.panes[index].forget_symbol_queries(&queued);
             }
         }
         if let Some(review_pane) = &mut self.review_pane {
@@ -1646,15 +1681,15 @@ impl WinitGhosttyApp {
     }
 
     fn set_active_pane(&mut self, pane_index: usize) {
-        if self.active_pane != pane_index {
-            self.active_pane = pane_index;
+        if self.layout_state.active_pane != pane_index {
+            self.layout_state.active_pane = pane_index;
             self.dirty = true;
             self.force_redraw = true;
         }
     }
 
     fn show_pane_focus_chrome(&self) -> bool {
-        matches!(self.pane_layout_mode, PaneLayoutMode::Split) && self.panes.len() > 1
+        matches!(self.layout_state.mode, PaneLayoutMode::Split) && self.panes.len() > 1
     }
 
     fn first_agent_terminal_mut(&mut self) -> Option<&mut TerminalPaneController> {
@@ -1717,7 +1752,7 @@ impl WinitGhosttyApp {
                     self.width,
                     self.height,
                     self.layout.pane(index),
-                    index == self.active_pane,
+                    index == self.layout_state.active_pane,
                     self.force_redraw,
                     redraw_chrome,
                     &mut self.damage,
@@ -1831,8 +1866,8 @@ impl WinitGhosttyApp {
 
                     if let Some(i) = idx {
                         if focus_agent {
-                            if matches!(self.pane_layout_mode, PaneLayoutMode::PaneMaximized(_)) {
-                                self.pane_layout_mode = PaneLayoutMode::PaneMaximized(i);
+                            if matches!(self.layout_state.mode, PaneLayoutMode::PaneMaximized(_)) {
+                                self.layout_state.mode = PaneLayoutMode::PaneMaximized(i);
                             }
                             self.set_active_pane(i);
                         }
@@ -1983,6 +2018,12 @@ impl WinitGhosttyApp {
                 }
                 UiCommand::SymbolIndexChanged { symbols } => {
                     self.file_index.set_symbols(symbols);
+                    if self.modifiers.ctrl {
+                        self.handle_modifiers_changed();
+                    }
+                }
+                UiCommand::SymbolsDiscovered { symbols } => {
+                    self.file_index.merge_cached_symbols(symbols);
                     if self.modifiers.ctrl {
                         self.handle_modifiers_changed();
                     }
@@ -2668,148 +2709,137 @@ mod tests {
         assert_eq!(agent_layout.pane(0).height, 0);
     }
 
-    fn press_layout_shortcut(
-        pressed_keys: &[Key],
-        alt: bool,
-        shift: bool,
-        pane_count: usize,
-        mode: &mut PaneLayoutMode,
-        split_direction: &mut PaneSplitDirection,
-        active_pane: &mut usize,
-    ) -> bool {
-        let mut share = AgentPaneShare::Auto;
-        handle_layout_shortcuts(
-            pressed_keys,
+    fn shortcut_modifiers(alt: bool, shift: bool) -> Modifiers {
+        Modifiers {
             alt,
             shift,
+            ..Modifiers::default()
+        }
+    }
+
+    fn press_layout_shortcut(
+        pressed_keys: &[Key],
+        modifiers: Modifiers,
+        pane_count: usize,
+        layout: &mut PaneLayoutState,
+    ) -> bool {
+        handle_layout_shortcuts(
+            pressed_keys,
+            modifiers,
             false,
             pane_count,
-            mode,
-            split_direction,
-            active_pane,
-            &mut share,
+            layout,
             layout::AgentRegionSpan::unknown(),
         )
     }
 
+    fn test_layout_state(
+        mode: PaneLayoutMode,
+        split_direction: PaneSplitDirection,
+        active_pane: usize,
+    ) -> PaneLayoutState {
+        PaneLayoutState {
+            mode,
+            split_direction,
+            active_pane,
+            agent_share: AgentPaneShare::Auto,
+        }
+    }
+
     #[test]
     fn maps_alt_number_shortcuts_to_active_panes() {
-        let mut mode = PaneLayoutMode::PaneMaximized(1);
-        let mut split_direction = PaneSplitDirection::Vertical;
-        let mut active_pane = 1;
+        let mut layout = test_layout_state(
+            PaneLayoutMode::PaneMaximized(1),
+            PaneSplitDirection::Vertical,
+            1,
+        );
 
         assert!(press_layout_shortcut(
             &[Key::Key1],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
         assert!(press_layout_shortcut(
             &[Key::Key2],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 1);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 1);
     }
 
     #[test]
     fn maps_alt_shift_number_shortcuts_to_layout_modes() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut split_direction = PaneSplitDirection::Vertical;
-        let mut active_pane = 1;
+        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1);
 
         assert!(press_layout_shortcut(
             &[Key::Key1],
-            true,
-            true,
+            shortcut_modifiers(true, true),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::PaneMaximized(0));
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(0));
+        assert_eq!(layout.active_pane, 0);
         assert!(press_layout_shortcut(
             &[Key::Key2],
-            true,
-            true,
+            shortcut_modifiers(true, true),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::PaneMaximized(1));
-        assert_eq!(active_pane, 1);
+        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(1));
+        assert_eq!(layout.active_pane, 1);
     }
 
     #[test]
     fn maps_alt_arrow_shortcuts_to_active_panes() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut split_direction = PaneSplitDirection::Vertical;
-        let mut active_pane = 1;
+        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1);
 
         assert!(press_layout_shortcut(
             &[Key::Left],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
         assert!(press_layout_shortcut(
             &[Key::Right],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 1);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 1);
     }
 
     #[test]
     fn maps_alt_shift_3_shortcut_to_split_direction_toggle() {
-        let mut mode = PaneLayoutMode::PaneMaximized(1);
-        let mut split_direction = PaneSplitDirection::Vertical;
-        let mut active_pane = 0;
+        let mut layout = test_layout_state(
+            PaneLayoutMode::PaneMaximized(1),
+            PaneSplitDirection::Vertical,
+            0,
+        );
 
         assert!(press_layout_shortcut(
             &[Key::J],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(split_direction, PaneSplitDirection::Horizontal);
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.split_direction, PaneSplitDirection::Horizontal);
+        assert_eq!(layout.active_pane, 0);
         assert!(press_layout_shortcut(
             &[Key::J],
-            true,
-            false,
+            shortcut_modifiers(true, false),
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active_pane
+            &mut layout
         ));
-        assert_eq!(split_direction, PaneSplitDirection::Vertical);
+        assert_eq!(layout.split_direction, PaneSplitDirection::Vertical);
     }
 
     #[test]

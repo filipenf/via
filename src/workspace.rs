@@ -324,7 +324,7 @@ fn ensure_workspace_meta(workspace: &Workspace) -> Result<()> {
     write_atomic_json(&path, &meta)
 }
 
-fn sanitize_path_segment(value: &str) -> String {
+pub(crate) fn sanitize_path_segment(value: &str) -> String {
     if value.is_empty() {
         return String::new();
     }

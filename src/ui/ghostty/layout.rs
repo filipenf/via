@@ -1,4 +1,4 @@
-use super::input::Key;
+use super::input::{Key, Modifiers};
 use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
 use tracing::info;
 
@@ -116,6 +116,34 @@ pub enum PaneLayoutMode {
 pub(super) enum PaneSplitDirection {
     Vertical,
     Horizontal,
+}
+
+/// Mutable split state: which pane is focused, how the window is divided, and
+/// how much of the split the agent region takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneLayoutState {
+    pub(super) mode: PaneLayoutMode,
+    pub(super) split_direction: PaneSplitDirection,
+    pub(super) active_pane: usize,
+    pub(super) agent_share: AgentPaneShare,
+}
+
+impl PaneLayoutState {
+    /// Show the editor fullscreen and focus it.
+    pub(super) fn focus_maximized_editor(&mut self) {
+        self.mode = PaneLayoutMode::PaneMaximized(0);
+        self.active_pane = 0;
+    }
+
+    /// Build a state for the focus benchmark. Split direction and agent share stay at defaults.
+    pub fn with_focus(mode: PaneLayoutMode, active_pane: usize) -> Self {
+        Self {
+            mode,
+            split_direction: PaneSplitDirection::Vertical,
+            active_pane,
+            agent_share: AgentPaneShare::Auto,
+        }
+    }
 }
 
 fn clearly_taller_than_wide(width: usize, height: usize) -> bool {
@@ -304,31 +332,27 @@ impl SplitLayout {
 }
 pub(super) fn handle_layout_shortcuts(
     pressed_keys: &[Key],
-    alt: bool,
-    shift: bool,
+    modifiers: Modifiers,
     repeat: bool,
     pane_count: usize,
-    mode: &mut PaneLayoutMode,
-    split_direction: &mut PaneSplitDirection,
-    active_pane: &mut usize,
-    agent_share: &mut AgentPaneShare,
+    layout: &mut PaneLayoutState,
     agent_span: AgentRegionSpan,
 ) -> bool {
-    if !alt {
+    if !modifiers.alt {
         return false;
     }
 
     // Alt+J (without Shift) toggles the split direction (replaces the old Alt+Shift+3).
     for key in pressed_keys {
-        if alt && !shift && *key == Key::J {
-            *mode = PaneLayoutMode::Split;
-            *split_direction = split_direction.toggled();
+        if !modifiers.shift && *key == Key::J {
+            layout.mode = PaneLayoutMode::Split;
+            layout.split_direction = layout.split_direction.toggled();
             return true;
         }
     }
 
     for key in pressed_keys {
-        if shift {
+        if modifiers.shift {
             let Some(next_mode) = pane_layout_shortcut(*key) else {
                 continue;
             };
@@ -346,17 +370,17 @@ pub(super) fn handle_layout_shortcuts(
                 }
             }
 
-            *mode = next_mode;
+            layout.mode = next_mode;
             if let Some(next_active_pane) = focused_pane_for_layout(next_mode) {
-                *active_pane = next_active_pane;
+                layout.active_pane = next_active_pane;
             }
             return true;
         }
 
         if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
             if next_active_pane < pane_count {
-                *mode = PaneLayoutMode::Split;
-                *active_pane = next_active_pane;
+                layout.mode = PaneLayoutMode::Split;
+                layout.active_pane = next_active_pane;
                 return true;
             }
         }
@@ -380,19 +404,22 @@ pub(super) fn handle_layout_shortcuts(
                 }
                 continue;
             }
-            if pane_count >= 2 && *mode == PaneLayoutMode::Split && *active_pane == target {
+            if pane_count >= 2
+                && layout.mode == PaneLayoutMode::Split
+                && layout.active_pane == target
+            {
                 if !repeat {
                     let side = if target == 0 {
                         RefocusSide::Editor
                     } else {
                         RefocusSide::Agent
                     };
-                    *agent_share = agent_share.after_refocus(side, agent_span);
+                    layout.agent_share = layout.agent_share.after_refocus(side, agent_span);
                 }
                 return true;
             }
-            *mode = PaneLayoutMode::Split;
-            *active_pane = target;
+            layout.mode = PaneLayoutMode::Split;
+            layout.active_pane = target;
             return true;
         }
     }
@@ -424,21 +451,22 @@ fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
 
 /// Keep `active_pane` and `PaneMaximized` indices valid after removing a pane.
 pub(super) fn adjust_pane_indices_after_removal(
-    mode: &mut PaneLayoutMode,
-    active_pane: &mut usize,
+    layout: &mut PaneLayoutState,
     removed_index: usize,
     remaining_pane_count: usize,
 ) {
-    if *active_pane > removed_index {
-        *active_pane -= 1;
+    if layout.active_pane > removed_index {
+        layout.active_pane -= 1;
     }
-    *active_pane = (*active_pane).min(remaining_pane_count.saturating_sub(1));
+    layout.active_pane = layout
+        .active_pane
+        .min(remaining_pane_count.saturating_sub(1));
 
-    if let PaneLayoutMode::PaneMaximized(i) = mode {
-        if *i == removed_index {
-            *mode = PaneLayoutMode::Split;
-        } else if *i > removed_index {
-            *i -= 1;
+    if let PaneLayoutMode::PaneMaximized(i) = layout.mode {
+        if i == removed_index {
+            layout.mode = PaneLayoutMode::Split;
+        } else if i > removed_index {
+            layout.mode = PaneLayoutMode::PaneMaximized(i - 1);
         }
     }
 }
@@ -452,18 +480,16 @@ pub struct FocusNvimAfterReference {
 /// Focus the Neovim pane after navigating from a Shift+click on a file or symbol in the
 /// agent pane. When the agent was fullscreen, switch to fullscreen Neovim; otherwise keep
 /// the split layout and only change the active pane.
-pub fn focus_nvim_after_agent_reference(
-    mode: &mut PaneLayoutMode,
-    active_pane: &mut usize,
-) -> FocusNvimAfterReference {
+pub fn focus_nvim_after_agent_reference(layout: &mut PaneLayoutState) -> FocusNvimAfterReference {
     // Any maximized agent pane counts as "agent maximized" for this transition.
-    let was_agent_max = matches!(mode, PaneLayoutMode::PaneMaximized(i) if *i != 0);
+    let was_agent_max = matches!(layout.mode, PaneLayoutMode::PaneMaximized(i) if i != 0);
     let relayout_needed = was_agent_max;
+    let focus_changed = layout.active_pane != 0;
     if relayout_needed {
-        *mode = PaneLayoutMode::PaneMaximized(0);
+        layout.focus_maximized_editor();
+    } else {
+        layout.active_pane = 0;
     }
-    let focus_changed = *active_pane != 0;
-    *active_pane = 0;
     FocusNvimAfterReference {
         relayout_needed,
         focus_changed,
@@ -691,39 +717,36 @@ mod tests {
 
     #[test]
     fn reference_navigation_from_agent_fullscreen_maximizes_nvim() {
-        let mut mode = PaneLayoutMode::PaneMaximized(1);
-        let mut active_pane = 1;
+        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
 
-        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+        let focus = focus_nvim_after_agent_reference(&mut layout);
 
-        assert_eq!(mode, PaneLayoutMode::PaneMaximized(0));
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(0));
+        assert_eq!(layout.active_pane, 0);
         assert!(focus.relayout_needed);
         assert!(focus.focus_changed);
     }
 
     #[test]
     fn reference_navigation_from_split_keeps_split_and_focuses_nvim() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active_pane = 1;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Auto);
 
-        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+        let focus = focus_nvim_after_agent_reference(&mut layout);
 
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
         assert!(!focus.relayout_needed);
         assert!(focus.focus_changed);
     }
 
     #[test]
     fn reference_navigation_when_nvim_already_active_in_split() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active_pane = 0;
+        let mut layout = test_layout(PaneLayoutMode::Split, 0, AgentPaneShare::Auto);
 
-        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active_pane);
+        let focus = focus_nvim_after_agent_reference(&mut layout);
 
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active_pane, 0);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
         assert!(!focus.relayout_needed);
         assert!(!focus.focus_changed);
     }
@@ -774,40 +797,36 @@ mod tests {
 
     #[test]
     fn focus_nvim_from_agent_split_only_changes_active_pane() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 1;
-        let focus = focus_nvim_after_agent_reference(&mut mode, &mut active);
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active, 0);
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Auto);
+        let focus = focus_nvim_after_agent_reference(&mut layout);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
         assert!(!focus.relayout_needed);
         assert!(focus.focus_changed);
     }
 
     #[test]
     fn adjust_pane_indices_after_removal_decrements_maximized_index() {
-        let mut mode = PaneLayoutMode::PaneMaximized(2);
-        let mut active = 2;
-        adjust_pane_indices_after_removal(&mut mode, &mut active, 0, 2);
-        assert_eq!(mode, PaneLayoutMode::PaneMaximized(1));
-        assert_eq!(active, 1);
+        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(2), 2, AgentPaneShare::Auto);
+        adjust_pane_indices_after_removal(&mut layout, 0, 2);
+        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(1));
+        assert_eq!(layout.active_pane, 1);
     }
 
     #[test]
     fn adjust_pane_indices_after_removal_resets_split_when_maximized_pane_removed() {
-        let mut mode = PaneLayoutMode::PaneMaximized(1);
-        let mut active = 1;
-        adjust_pane_indices_after_removal(&mut mode, &mut active, 1, 1);
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active, 0);
+        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
+        adjust_pane_indices_after_removal(&mut layout, 1, 1);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 0);
     }
 
     #[test]
     fn adjust_pane_indices_after_removal_shifts_active_pane_down() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 2;
-        adjust_pane_indices_after_removal(&mut mode, &mut active, 0, 2);
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active, 1);
+        let mut layout = test_layout(PaneLayoutMode::Split, 2, AgentPaneShare::Auto);
+        adjust_pane_indices_after_removal(&mut layout, 0, 2);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 1);
     }
 
     fn options_with_share(agent_share: AgentPaneShare) -> SplitLayoutOptions {
@@ -884,241 +903,172 @@ mod tests {
         assert_eq!(layout.pane(1).height, 100);
     }
 
+    fn alt_held() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        }
+    }
+
+    fn test_layout(
+        mode: PaneLayoutMode,
+        active_pane: usize,
+        agent_share: AgentPaneShare,
+    ) -> PaneLayoutState {
+        PaneLayoutState {
+            mode,
+            split_direction: PaneSplitDirection::Vertical,
+            active_pane,
+            agent_share,
+        }
+    }
+
     fn press_agent_focus(
         key: Key,
         repeat: bool,
-        mode: &mut PaneLayoutMode,
-        active_pane: &mut usize,
-        agent_share: &mut AgentPaneShare,
+        layout: &mut PaneLayoutState,
         agent_span: AgentRegionSpan,
     ) -> bool {
-        let mut split_direction = PaneSplitDirection::Vertical;
-        handle_layout_shortcuts(
-            &[key],
-            true,
-            false,
-            repeat,
-            3,
-            mode,
-            &mut split_direction,
-            active_pane,
-            agent_share,
-            agent_span,
-        )
+        handle_layout_shortcuts(&[key], alt_held(), repeat, 3, layout, agent_span)
     }
 
     #[test]
     fn refocusing_agent_toggles_share_between_half_and_third() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 1;
-        let mut share = AgentPaneShare::Auto;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Auto);
         let half_span = AgentRegionSpan {
             agent: 150,
             usable: 300,
         };
 
-        assert!(press_agent_focus(
-            Key::Key2,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            half_span
-        ));
-        assert_eq!(active, 1);
-        assert_eq!(share, AgentPaneShare::Third);
+        assert!(press_agent_focus(Key::Key2, false, &mut layout, half_span));
+        assert_eq!(layout.active_pane, 1);
+        assert_eq!(layout.agent_share, AgentPaneShare::Third);
 
-        assert!(press_agent_focus(
-            Key::Key2,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            half_span
-        ));
-        assert_eq!(share, AgentPaneShare::Half);
+        assert!(press_agent_focus(Key::Key2, false, &mut layout, half_span));
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
 
-        assert!(press_agent_focus(
-            Key::Key2,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            half_span
-        ));
-        assert_eq!(share, AgentPaneShare::Third);
+        assert!(press_agent_focus(Key::Key2, false, &mut layout, half_span));
+        assert_eq!(layout.agent_share, AgentPaneShare::Third);
     }
 
     #[test]
     fn refocus_from_narrow_auto_share_grows_to_half() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 1;
-        let mut share = AgentPaneShare::Auto;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Auto);
         let narrow = AgentRegionSpan {
             agent: 80,
             usable: 240,
         };
 
-        assert!(press_agent_focus(
-            Key::Key2,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            narrow
-        ));
-        assert_eq!(share, AgentPaneShare::Half);
+        assert!(press_agent_focus(Key::Key2, false, &mut layout, narrow));
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
 
     #[test]
     fn focusing_a_different_agent_does_not_change_share() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 1;
-        let mut share = AgentPaneShare::Third;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Third);
 
         assert!(press_agent_focus(
             Key::Key3,
             false,
-            &mut mode,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan::unknown()
         ));
-        assert_eq!(active, 2);
-        assert_eq!(share, AgentPaneShare::Third);
+        assert_eq!(layout.active_pane, 2);
+        assert_eq!(layout.agent_share, AgentPaneShare::Third);
     }
 
     #[test]
     fn refocus_while_maximized_restores_split_without_resizing() {
-        let mut mode = PaneLayoutMode::PaneMaximized(1);
-        let mut active = 1;
-        let mut share = AgentPaneShare::Auto;
+        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
 
         assert!(press_agent_focus(
             Key::Key2,
             false,
-            &mut mode,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan {
                 agent: 300,
                 usable: 300,
             }
         ));
-        assert_eq!(mode, PaneLayoutMode::Split);
-        assert_eq!(active, 1);
-        assert_eq!(share, AgentPaneShare::Auto);
+        assert_eq!(layout.mode, PaneLayoutMode::Split);
+        assert_eq!(layout.active_pane, 1);
+        assert_eq!(layout.agent_share, AgentPaneShare::Auto);
     }
 
     #[test]
     fn key_repeat_on_focused_agent_does_not_toggle_share() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 1;
-        let mut share = AgentPaneShare::Half;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Half);
 
         assert!(press_agent_focus(
             Key::Key2,
             true,
-            &mut mode,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan::unknown()
         ));
-        assert_eq!(share, AgentPaneShare::Half);
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
 
     #[test]
     fn arrow_focus_does_not_change_agent_share() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut split_direction = PaneSplitDirection::Vertical;
-        let mut active = 1;
-        let mut share = AgentPaneShare::Half;
+        let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Half);
 
         assert!(handle_layout_shortcuts(
             &[Key::Right],
-            true,
-            false,
+            alt_held(),
             false,
             2,
-            &mut mode,
-            &mut split_direction,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan::unknown(),
         ));
-        assert_eq!(active, 1);
-        assert_eq!(share, AgentPaneShare::Half);
+        assert_eq!(layout.active_pane, 1);
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
 
     #[test]
     fn refocusing_editor_toggles_editor_between_half_and_third() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 0;
-        let mut share = AgentPaneShare::Half;
+        let mut layout = test_layout(PaneLayoutMode::Split, 0, AgentPaneShare::Half);
         let half_span = AgentRegionSpan {
             agent: 150,
             usable: 300,
         };
 
-        assert!(press_agent_focus(
-            Key::Key1,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            half_span
-        ));
-        assert_eq!(active, 0);
-        assert_eq!(share, AgentPaneShare::Third);
+        assert!(press_agent_focus(Key::Key1, false, &mut layout, half_span));
+        assert_eq!(layout.active_pane, 0);
+        assert_eq!(layout.agent_share, AgentPaneShare::Third);
 
-        assert!(press_agent_focus(
-            Key::Key1,
-            false,
-            &mut mode,
-            &mut active,
-            &mut share,
-            half_span
-        ));
-        assert_eq!(share, AgentPaneShare::Half);
+        assert!(press_agent_focus(Key::Key1, false, &mut layout, half_span));
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
 
     #[test]
     fn refocusing_large_editor_moves_it_to_half() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 0;
-        let mut share = AgentPaneShare::Auto;
+        let mut layout = test_layout(PaneLayoutMode::Split, 0, AgentPaneShare::Auto);
 
         assert!(press_agent_focus(
             Key::Key1,
             false,
-            &mut mode,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan {
                 agent: 80,
                 usable: 240,
             }
         ));
-        assert_eq!(share, AgentPaneShare::Half);
+        assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
 
     #[test]
     fn refocusing_small_editor_grows_it_to_two_thirds() {
-        let mut mode = PaneLayoutMode::Split;
-        let mut active = 0;
-        let mut share = AgentPaneShare::Auto;
+        let mut layout = test_layout(PaneLayoutMode::Split, 0, AgentPaneShare::Auto);
 
         assert!(press_agent_focus(
             Key::Key1,
             false,
-            &mut mode,
-            &mut active,
-            &mut share,
+            &mut layout,
             AgentRegionSpan {
                 agent: 200,
                 usable: 300,
             }
         ));
-        assert_eq!(share, AgentPaneShare::Third);
+        assert_eq!(layout.agent_share, AgentPaneShare::Third);
     }
 }

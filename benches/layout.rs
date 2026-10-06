@@ -1,7 +1,7 @@
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 
 use via::ui::ghostty::layout::{
-    FocusNvimAfterReference, MIN_EDITOR_PANE_COLS, PaneLayoutMode, SplitLayout,
+    FocusNvimAfterReference, MIN_EDITOR_PANE_COLS, PaneLayoutMode, PaneLayoutState, SplitLayout,
     focus_nvim_after_agent_reference, trailing_pane_cols, vertical_split_fits,
     vertical_split_layout,
 };
@@ -61,11 +61,13 @@ fn bench_layout(c: &mut Criterion) {
 
     c.bench_function("layout/focus_after_reference", |b| {
         b.iter(|| {
-            let mut mode = black_box(PaneLayoutMode::PaneMaximized(1));
-            let mut active = black_box(1usize);
+            let mut layout = PaneLayoutState::with_focus(
+                black_box(PaneLayoutMode::PaneMaximized(1)),
+                black_box(1usize),
+            );
             let r: FocusNvimAfterReference =
-                focus_nvim_after_agent_reference(black_box(&mut mode), black_box(&mut active));
-            black_box((mode, active, r))
+                focus_nvim_after_agent_reference(black_box(&mut layout));
+            black_box((layout, r))
         })
     });
 }

@@ -20,6 +20,14 @@ pub struct SymbolLoc {
     pub path: PathBuf,
     pub line: u32,
     pub kind: u32,
+    /// Cached hints whose file is absent in this checkout must not open an empty buffer.
+    pub require_file: bool,
+}
+
+enum SymbolLookup {
+    Unique(FileTarget),
+    Ambiguous,
+    Absent,
 }
 
 /// Snapshot of known files + open-buffer symbols for Ctrl-held cue scoring and click resolution.
@@ -32,7 +40,10 @@ pub struct ReferenceIndex {
     pub basenames: HashMap<String, Vec<PathBuf>>,
     pub vcs_working_tree: HashSet<PathBuf>,
     pub vcs_branch: HashSet<PathBuf>,
+    /// Combined lookup map: open-buffer symbols layered over the repo cache.
     pub symbols_by_name: HashMap<String, Vec<SymbolLoc>>,
+    buffer_symbols: HashMap<String, Vec<SymbolLoc>>,
+    cached_symbols: HashMap<String, Vec<SymbolLoc>>,
 }
 
 impl ReferenceIndex {
@@ -74,23 +85,37 @@ impl ReferenceIndex {
         self.basenames = basenames;
     }
 
-    /// Replace symbol map; preserve existing file paths.
+    /// Replace open-buffer symbols; preserve the repo symbol cache and file paths.
     pub fn set_symbols(&mut self, symbols: impl IntoIterator<Item = IndexedSymbol>) {
-        let mut symbols_by_name: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
-        for sym in symbols {
-            let loc = SymbolLoc {
-                path: sym.path,
-                line: sym.line,
-                kind: sym.kind,
-            };
-            let entry = symbols_by_name.entry(sym.name).or_default();
-            if !entry.iter().any(|existing| {
-                existing.path == loc.path && existing.line == loc.line && existing.kind == loc.kind
-            }) {
-                entry.push(loc);
+        self.buffer_symbols = group_symbols(symbols, false);
+        self.rebuild_symbol_maps();
+    }
+
+    /// Merge repo-cache hints. A later open-buffer snapshot for the same path wins.
+    pub fn merge_cached_symbols(&mut self, symbols: impl IntoIterator<Item = IndexedSymbol>) {
+        for (name, locs) in group_symbols(symbols, true) {
+            let entry = self.cached_symbols.entry(name).or_default();
+            for loc in locs {
+                if !entry
+                    .iter()
+                    .any(|existing| existing.path == loc.path && existing.line == loc.line)
+                {
+                    entry.push(loc);
+                }
             }
         }
-        self.symbols_by_name = symbols_by_name;
+        self.rebuild_symbol_maps();
+    }
+
+    fn rebuild_symbol_maps(&mut self) {
+        let mut combined = self.cached_symbols.clone();
+        for (name, locs) in &self.buffer_symbols {
+            let entry = combined.entry(name.clone()).or_default();
+            let buffer_paths: HashSet<&PathBuf> = locs.iter().map(|loc| &loc.path).collect();
+            entry.retain(|existing| !buffer_paths.contains(&existing.path));
+            entry.extend(locs.iter().cloned());
+        }
+        self.symbols_by_name = combined;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -318,8 +343,10 @@ impl ReferenceIndex {
 
     /// Whether a scanned token should become a symbol cue.
     ///
-    /// Shape-qualified tokens (`::` / `#`) always cue. Bare identifiers cue only when
-    /// present in the index and strong enough (length ≥ 3, `_`, or qualified with `.`/`::`/`#`).
+    /// These shapes always cue, including when the defining file is not open:
+    /// `::` / `#`, a `.` that is not a filename, and mixed-case identifiers
+    /// (`SyncWorkflow`). Other bare identifiers cue only when present in the
+    /// index and strong enough (length ≥ 3, `_`, or qualified).
     pub fn should_cue_symbol_token(&self, token: &str) -> bool {
         if looks_like_scanned_symbol_shape(token) {
             return true;
@@ -362,22 +389,163 @@ impl ReferenceIndex {
     }
 
     /// Resolve an indexed symbol to a FileTarget when unique; otherwise None.
+    ///
+    /// A single qualifier (`SourceKind.ACTIVE`, `Foo::bar`) tries the member, then the
+    /// head, when the full string is not itself indexed. An ambiguous member stays unresolved
+    /// so the caller can open a symbol picker instead of jumping to the type.
     pub fn file_target_for_symbol(&self, name: &str) -> Option<FileTarget> {
-        let loc = self.unique_symbol(name)?;
-        Some(FileTarget {
-            path: loc.path.clone(),
-            line: Some(loc.line),
-        })
+        match self.usable_symbol_target(name) {
+            SymbolLookup::Unique(target) => return Some(target),
+            SymbolLookup::Ambiguous => return None,
+            SymbolLookup::Absent => {}
+        }
+        let (head, member) = qualified_symbol_parts(name)?;
+        if symbol_token_is_strong(member) {
+            match self.usable_symbol_target(member) {
+                SymbolLookup::Unique(target) => return Some(target),
+                SymbolLookup::Ambiguous => return None,
+                SymbolLookup::Absent => {}
+            }
+        }
+        if symbol_token_is_strong(head) {
+            if let SymbolLookup::Unique(target) = self.usable_symbol_target(head) {
+                return Some(target);
+            }
+        }
+        None
+    }
+
+    /// Locations whose file must exist are ignored when it does not, so one stale
+    /// cache hit does not make a live location look ambiguous.
+    fn usable_symbol_target(&self, name: &str) -> SymbolLookup {
+        let Some(locs) = self.symbols_by_name.get(name) else {
+            return SymbolLookup::Absent;
+        };
+        let usable: Vec<&SymbolLoc> = locs
+            .iter()
+            .filter(|loc| !loc.require_file || loc.path.is_file())
+            .collect();
+        match usable.as_slice() {
+            [] => SymbolLookup::Absent,
+            [loc] => loc_to_file_target(loc)
+                .map(SymbolLookup::Unique)
+                .unwrap_or(SymbolLookup::Absent),
+            _ => SymbolLookup::Ambiguous,
+        }
+    }
+
+    /// Workspace-symbol query for a token that did not resolve to a unique location.
+    ///
+    /// Prefers an indexed member (`ACTIVE`) or head (`SourceKind`) over the raw
+    /// qualified string, which document-symbol indexes do not store.
+    pub fn symbol_open_query<'a>(&'a self, token: &'a str) -> &'a str {
+        if self.contains_symbol(token) {
+            return token;
+        }
+        let Some((head, member)) = qualified_symbol_parts(token) else {
+            return token;
+        };
+        if symbol_token_is_strong(member) && self.contains_symbol(member) {
+            return member;
+        }
+        if symbol_token_is_strong(head) && self.contains_symbol(head) {
+            return head;
+        }
+        token
     }
 }
 
+fn loc_to_file_target(loc: &SymbolLoc) -> Option<FileTarget> {
+    if loc.require_file && !loc.path.is_file() {
+        return None;
+    }
+    Some(FileTarget {
+        path: loc.path.clone(),
+        line: Some(loc.line),
+    })
+}
+
+fn group_symbols(
+    symbols: impl IntoIterator<Item = IndexedSymbol>,
+    require_file: bool,
+) -> HashMap<String, Vec<SymbolLoc>> {
+    let mut grouped: HashMap<String, Vec<SymbolLoc>> = HashMap::new();
+    for sym in symbols {
+        let loc = SymbolLoc {
+            path: sym.path,
+            line: sym.line,
+            kind: sym.kind,
+            require_file,
+        };
+        let entry = grouped.entry(sym.name).or_default();
+        if !entry.iter().any(|existing| {
+            existing.path == loc.path && existing.line == loc.line && existing.kind == loc.kind
+        }) {
+            entry.push(loc);
+        }
+    }
+    grouped
+}
+
 pub fn token_has_file_shape(token: &str) -> bool {
-    token.contains('/')
-        || token.contains('\\')
-        || token.contains('.')
-        || token
-            .rsplit_once(':')
-            .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+    if token.contains('/') || token.contains('\\') {
+        return true;
+    }
+    let path = token_path_part(token);
+    if looks_like_dotted_filename(path) {
+        return true;
+    }
+    // `README:10` has no extension, but a trailing line number is still a file cue.
+    // Dotted qualifiers (`SourceKind.ACTIVE:3`) are not.
+    path != token && !path.contains('.')
+}
+
+/// A `.` names a file when the last segment looks like an extension (`constants.py`),
+/// not a symbol qualifier (`SourceKind.ACTIVE`, `obj.method_name`).
+fn looks_like_dotted_filename(path: &str) -> bool {
+    let Some((stem, ext)) = path.rsplit_once('.') else {
+        return false;
+    };
+    if ext.is_empty() {
+        return false;
+    }
+    // Dotfiles: `.env`, `.gitignore`.
+    if stem.is_empty() {
+        return ext
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    }
+    if !is_extension_shaped(ext) {
+        return false;
+    }
+    // `AGENTS.md` / `my_module.py` / `MyClass.java`: a code-like stem is still a file when
+    // the suffix is a short extension. `MyClass.method` (a longer lowercase word) stays a symbol.
+    if stem_looks_like_code_qualifier(stem) && !extension_applies_to_code_like_stem(ext) {
+        return false;
+    }
+    true
+}
+
+fn is_extension_shaped(ext: &str) -> bool {
+    (1..=8).contains(&ext.len())
+        && ext
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+}
+
+fn stem_looks_like_code_qualifier(stem: &str) -> bool {
+    stem.split('.')
+        .any(|seg| seg.chars().any(|c| c.is_ascii_uppercase() || c == '_'))
+}
+
+fn extension_applies_to_code_like_stem(ext: &str) -> bool {
+    // 1–4 lowercase characters covers `py`, `rs`, `java`, `toml`, `lock`.
+    // Longer suffixes are filenames only when they are known types, so `method` is not one.
+    ext.len() <= 4
+        || matches!(
+            ext,
+            "astro" | "cmake" | "gradle" | "graphql" | "proto" | "svelte"
+        )
 }
 
 const ASCII_ELLIPSIS: &str = "...";
@@ -447,9 +615,112 @@ pub fn symbol_token_is_strong(token: &str) -> bool {
     looks_like_qualified_symbol(token)
 }
 
-/// Cold-index shape rule matching historical `looks_like_scanned_symbol` (`::` or `#`).
-fn looks_like_scanned_symbol_shape(token: &str) -> bool {
-    token.contains("::") || token.contains('#')
+/// Cold-index shape: `::` / `#`, a `.` qualifier that is not a filename, or a
+/// mixed-case identifier (`SyncWorkflow`, `parseXML`).
+pub(crate) fn looks_like_scanned_symbol_shape(token: &str) -> bool {
+    if token_has_file_shape(token) {
+        return false;
+    }
+    if token.contains("::") || token.contains('#') {
+        return true;
+    }
+    if token.contains('.') {
+        return true;
+    }
+    looks_like_mixed_case_identifier(token)
+}
+
+/// Pascal/camel case: an uppercase letter after the first character, and a lowercase letter.
+///
+/// Sentence case (`Workflow`) and all-caps (`API`) stay out so prose is not underlined.
+/// Those still cue when the open-buffer index contains them.
+fn looks_like_mixed_case_identifier(token: &str) -> bool {
+    let mut has_lower = false;
+    let mut has_internal_upper = false;
+    for (index, ch) in token.chars().enumerate() {
+        if ch.is_ascii_lowercase() {
+            has_lower = true;
+        } else if index > 0 && ch.is_ascii_uppercase() {
+            has_internal_upper = true;
+        }
+    }
+    has_lower && has_internal_upper
+}
+
+/// Tokens worth a background `workspace/symbol` query.
+///
+/// Mixed-case, qualified, and snake_case identifiers. Plain words and filenames
+/// are left out so agent prose does not turn into a query per word.
+pub fn symbol_query_candidates(text: &str) -> Vec<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if !is_symbol_query_char(chars[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < chars.len() && is_symbol_query_char(chars[index]) {
+            index += 1;
+        }
+        let raw: String = chars[start..index].iter().collect();
+        let token = raw.trim_matches(['.', ':', '#']).to_string();
+        if is_symbol_query_candidate(&token) && seen.insert(token.clone()) {
+            out.push(token);
+        }
+    }
+    out
+}
+
+pub fn is_symbol_query_candidate(token: &str) -> bool {
+    if token.is_empty() || token_has_file_shape(token) {
+        return false;
+    }
+    let starts = token
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_');
+    if !starts {
+        return false;
+    }
+    if !token
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '#'))
+    {
+        return false;
+    }
+    if looks_like_scanned_symbol_shape(token) {
+        return true;
+    }
+    token.contains('_') && symbol_token_is_strong(token)
+}
+
+fn is_symbol_query_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | ':' | '.' | '#')
+}
+
+/// One `Head.Member` / `Head::Member` / `Head#Member` pair. Deeper paths stay intact.
+fn qualified_symbol_parts(name: &str) -> Option<(&str, &str)> {
+    for sep in ["::", ".", "#"] {
+        let Some((head, member)) = name.split_once(sep) else {
+            continue;
+        };
+        if head.is_empty()
+            || member.is_empty()
+            || contains_qualifier_sep(head)
+            || contains_qualifier_sep(member)
+        {
+            continue;
+        }
+        return Some((head, member));
+    }
+    None
+}
+
+fn contains_qualifier_sep(name: &str) -> bool {
+    name.contains("::") || name.contains('.') || name.contains('#')
 }
 
 fn looks_like_qualified_symbol(token: &str) -> bool {
@@ -693,6 +964,72 @@ mod tests {
     }
 
     #[test]
+    fn mixed_case_identifier_cues_without_open_buffer_index() {
+        let idx = ReferenceIndex::default();
+        assert!(idx.should_cue_symbol_token("SyncWorkflow"));
+        assert!(idx.should_cue_symbol_token("parseXML"));
+        assert!(!idx.should_cue_symbol_token("Workflow"));
+        assert!(!idx.should_cue_symbol_token("workflow"));
+        assert!(!idx.should_cue_symbol_token("API"));
+        assert!(!idx.should_cue_symbol_token("get_collector_statuses"));
+    }
+
+    #[test]
+    fn symbol_query_candidates_skip_plain_words_and_filenames() {
+        let names = symbol_query_candidates(
+            "when SyncWorkflow calls get_collector_statuses see src/main.rs and Workflow",
+        );
+        assert_eq!(
+            names,
+            vec![
+                "SyncWorkflow".to_string(),
+                "get_collector_statuses".to_string()
+            ]
+        );
+        assert!(!is_symbol_query_candidate("Workflow"));
+        assert!(!is_symbol_query_candidate("collectors"));
+        assert!(is_symbol_query_candidate("SourceKind.ACTIVE"));
+    }
+
+    #[test]
+    fn buffer_symbols_keep_every_definition_in_the_same_file() {
+        let mut idx = ReferenceIndex::default();
+        idx.merge_cached_symbols([symbol("new", "/repo/src/lib.rs", 3)]);
+        idx.set_symbols([
+            symbol("new", "/repo/src/lib.rs", 10),
+            symbol("new", "/repo/src/lib.rs", 40),
+        ]);
+        assert!(idx.unique_symbol("new").is_none());
+        assert_eq!(
+            idx.symbols_by_name.get("new").map(|locs| locs.len()),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn stale_cache_hit_does_not_hide_a_live_location() {
+        let file = std::env::temp_dir().join(format!("via-symbol-live-{}", std::process::id()));
+        std::fs::write(&file, "fn sync() {}\n").unwrap();
+        let mut idx = ReferenceIndex::default();
+        idx.merge_cached_symbols([
+            symbol("SyncWorkflow", "/no/such/via-symbol.py", 1),
+            symbol("SyncWorkflow", file.to_str().unwrap(), 4),
+        ]);
+        let target = idx.file_target_for_symbol("SyncWorkflow").unwrap();
+        assert_eq!(target.path, file);
+        let _ = std::fs::remove_file(&file);
+    }
+
+    #[test]
+    fn buffer_symbol_refresh_keeps_cached_names() {
+        let mut idx = ReferenceIndex::default();
+        idx.merge_cached_symbols([symbol("SyncWorkflow", "/repo/src/sync.py", 4)]);
+        idx.set_symbols([symbol("parse_event", "/repo/src/main.rs", 10)]);
+        assert!(idx.contains_symbol("SyncWorkflow"));
+        assert!(idx.contains_symbol("parse_event"));
+    }
+
+    #[test]
     fn short_indexed_name_without_strength_does_not_cue() {
         let mut idx = ReferenceIndex::default();
         idx.set_symbols([symbol("ab", "/repo/src/main.rs", 10)]);
@@ -833,5 +1170,59 @@ mod tests {
             truncated_query_from("...foo\u{2026}bar"),
             Some("foo\u{2026}bar")
         );
+    }
+
+    #[test]
+    fn dotted_symbol_qualifier_is_not_a_filename() {
+        assert!(!token_has_file_shape("SourceKind.ACTIVE"));
+        assert!(!token_has_file_shape("WidgetKind.PRIMARY"));
+        assert!(!token_has_file_shape("MyClass.method"));
+        assert!(!token_has_file_shape("obj.method_name"));
+        assert!(token_has_file_shape("constants.py"));
+        assert!(token_has_file_shape("my_module.py"));
+        assert!(token_has_file_shape("AGENTS.md"));
+        assert!(token_has_file_shape("MyClass.java"));
+        assert!(token_has_file_shape("unknown.rs"));
+        assert!(token_has_file_shape("src/new_file.rs"));
+        assert!(token_has_file_shape(".gitignore"));
+        assert!(token_has_file_shape("README:10"));
+    }
+
+    #[test]
+    fn dotted_symbol_cues_without_a_file_index_hit() {
+        let idx = ReferenceIndex::default();
+        assert!(idx.should_cue_symbol_token("SourceKind.ACTIVE"));
+        assert!(!idx.should_cue_file_token("SourceKind.ACTIVE"));
+        assert!(idx.should_cue_file_token("constants.py"));
+        assert!(!idx.should_cue_symbol_token("constants.py"));
+    }
+
+    #[test]
+    fn qualified_symbol_resolves_unique_indexed_member() {
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([symbol("ACTIVE", "/repo/pkg/types.py", 22)]);
+        let target = idx.file_target_for_symbol("SourceKind.ACTIVE").unwrap();
+        assert_eq!(target.path, PathBuf::from("/repo/pkg/types.py"));
+        assert_eq!(target.line, Some(22));
+    }
+
+    #[test]
+    fn qualified_symbol_falls_back_to_unique_head() {
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([symbol("SourceKind", "/repo/pkg/types.py", 13)]);
+        let target = idx.file_target_for_symbol("SourceKind.ACTIVE").unwrap();
+        assert_eq!(target.line, Some(13));
+    }
+
+    #[test]
+    fn ambiguous_qualified_member_stays_a_symbol_query() {
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([
+            symbol("ACTIVE", "/repo/a.py", 1),
+            symbol("ACTIVE", "/repo/b.py", 2),
+            symbol("SourceKind", "/repo/types.py", 13),
+        ]);
+        assert!(idx.file_target_for_symbol("SourceKind.ACTIVE").is_none());
+        assert_eq!(idx.symbol_open_query("SourceKind.ACTIVE"), "ACTIVE");
     }
 }

@@ -529,11 +529,11 @@ fn symbol_reference_spans(row: &str, ctx: ReferenceContext<'_>) -> Vec<SymbolRef
             continue;
         }
 
-        let target = match ctx
-            .file_index
-            .and_then(|idx| idx.file_target_for_symbol(&token))
-        {
-            Some(file) => ReferenceTarget::File(file),
+        let target = match ctx.file_index {
+            Some(idx) => match idx.file_target_for_symbol(&token) {
+                Some(file) => ReferenceTarget::File(file),
+                None => ReferenceTarget::Symbol(idx.symbol_open_query(&token).to_string()),
+            },
             None => ReferenceTarget::Symbol(token),
         };
 
@@ -754,12 +754,7 @@ fn narrow_call_wrapped_file_path(token: &str) -> Option<(usize, usize, String)> 
 }
 
 fn looks_like_file_reference(token: &str) -> bool {
-    token.contains('/')
-        || token.contains('\\')
-        || token.contains('.')
-        || token
-            .rsplit_once(':')
-            .is_some_and(|(_, line)| line.parse::<u32>().is_ok())
+    crate::reference_index::token_has_file_shape(token)
 }
 
 fn is_file_reference_char(ch: char) -> bool {
@@ -829,7 +824,7 @@ fn looks_like_symbol(token: &str) -> bool {
 }
 
 fn looks_like_scanned_symbol(token: &str) -> bool {
-    looks_like_symbol(token) && (token.contains("::") || token.contains('#'))
+    looks_like_symbol(token) && crate::reference_index::looks_like_scanned_symbol_shape(token)
 }
 
 fn is_symbol_char(ch: char) -> bool {
@@ -1190,5 +1185,88 @@ mod tests {
         let target =
             reference_target_from_row("symbol Foo::bar_baz here", 9, Path::new("/repo")).unwrap();
         assert_eq!(target, ReferenceTarget::Symbol("Foo::bar_baz".to_string()));
+    }
+
+    #[test]
+    fn mixed_case_workspace_symbol_cues_when_defining_file_is_closed() {
+        use crate::reference_index::ReferenceIndex;
+
+        let idx = ReferenceIndex::default();
+        let row = "when the collector list is empty, SyncWorkflow logs and returns";
+        let col = char_column(row, "SyncWorkflow");
+
+        assert_eq!(
+            reference_target_from_row_ctx(
+                row,
+                col,
+                ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+            ),
+            Some(ReferenceTarget::Symbol("SyncWorkflow".to_string()))
+        );
+        assert_eq!(
+            reference_target_from_row(row, col, Path::new("/repo")),
+            Some(ReferenceTarget::Symbol("SyncWorkflow".to_string()))
+        );
+    }
+
+    #[test]
+    fn sentence_case_word_is_not_a_symbol_cue() {
+        let row = "Workflow logs the skip and returns";
+        let col = char_column(row, "Workflow");
+        assert!(reference_target_from_row(row, col, Path::new("/repo")).is_none());
+    }
+
+    #[test]
+    fn dotted_enum_member_is_a_symbol_not_a_file() {
+        let row = "stored the collector as SourceKind.ACTIVE already";
+        let col = char_column(row, "SourceKind");
+
+        assert_eq!(
+            reference_target_from_row(row, col, Path::new("/repo")),
+            Some(ReferenceTarget::Symbol("SourceKind.ACTIVE".to_string()))
+        );
+    }
+
+    #[test]
+    fn dotted_filename_stays_a_file_beside_a_symbol() {
+        let row = "see constants.py and SourceKind.ACTIVE";
+        let file_col = char_column(row, "constants");
+        let symbol_col = char_column(row, "SourceKind");
+
+        assert!(matches!(
+            reference_target_from_row(row, file_col, Path::new("/repo")),
+            Some(ReferenceTarget::File(target)) if target.path.ends_with("constants.py")
+        ));
+        assert_eq!(
+            reference_target_from_row(row, symbol_col, Path::new("/repo")),
+            Some(ReferenceTarget::Symbol("SourceKind.ACTIVE".to_string()))
+        );
+    }
+
+    #[test]
+    fn indexed_dotted_member_opens_the_definition_file() {
+        use crate::reference_index::{IndexedSymbol, ReferenceIndex};
+
+        let mut idx = ReferenceIndex::default();
+        idx.set_symbols([IndexedSymbol {
+            name: "ACTIVE".to_string(),
+            kind: 22,
+            path: PathBuf::from("/repo/pkg/types.py"),
+            line: 22,
+        }]);
+        let row = "collector as SourceKind.ACTIVE already";
+        let col = char_column(row, "ACTIVE");
+
+        assert_eq!(
+            reference_target_from_row_ctx(
+                row,
+                col,
+                ReferenceContext::new(Path::new("/repo"), Some(&idx)),
+            ),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/repo/pkg/types.py"),
+                line: Some(22),
+            }))
+        );
     }
 }
