@@ -757,6 +757,179 @@ fn looks_like_file_reference(token: &str) -> bool {
     crate::reference_index::token_has_file_shape(token)
 }
 
+/// A row that fills the screen and breaks a path or URL mid-token continues on
+/// the next row, even when the program inserted a newline instead of soft-wrapping.
+///
+/// `carried_prefix` is the reference token from earlier rows when `row` itself is
+/// only the middle of that token (no `/` or scheme on this row alone).
+pub(super) fn row_continues_reference(
+    row: &str,
+    next: &str,
+    cols: usize,
+    carried_prefix: &str,
+) -> bool {
+    if cols == 0 {
+        return false;
+    }
+
+    let row_chars: Vec<char> = row.chars().take(cols).collect();
+    if row_chars.len() < cols {
+        return false;
+    }
+    let last = row_chars[cols - 1];
+    if !is_path_continuation_char(last) {
+        return false;
+    }
+
+    let Some(next_first) = next.chars().next() else {
+        return false;
+    };
+    if !is_path_continuation_char(next_first) {
+        return false;
+    }
+
+    let tail = trailing_reference_token(&row_chars);
+    let token = if tail.chars().count() == cols {
+        format!("{carried_prefix}{tail}")
+    } else {
+        tail
+    };
+    if !trailing_token_is_path_or_url(&token) {
+        return false;
+    }
+    if next_starts_separate_reference(next, trailing_token_is_url(&token)) {
+        return false;
+    }
+    // A finished name at the margin stays separate from the next sentence.
+    // A break inside an extension (`guide.m` / `d`) or a host (`example.co` / `m`)
+    // still joins, because that next row is not a new word.
+    if token_looks_finished(&token) && next_is_new_clause(next) {
+        return false;
+    }
+    true
+}
+
+/// Whether `rows[prev]` continues onto `rows[prev + 1]` across a hard newline.
+pub(super) fn rows_hard_wrap_continues(rows: &[String], prev: usize, cols: usize) -> bool {
+    let Some(next) = rows.get(prev + 1) else {
+        return false;
+    };
+    let Some(row) = rows.get(prev) else {
+        return false;
+    };
+    let carried = carried_reference_prefix(rows, prev, cols);
+    row_continues_reference(row, next, cols, &carried)
+}
+
+fn is_path_continuation_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric()
+        || matches!(
+            ch,
+            '/' | '\\' | '.' | '_' | '-' | ':' | '~' | '@' | '+' | '%' | '?' | '&' | '=' | '#'
+        )
+}
+
+fn trailing_reference_token(chars: &[char]) -> String {
+    let mut start = chars.len();
+    while start > 0 && is_path_continuation_char(chars[start - 1]) {
+        start -= 1;
+    }
+    chars[start..].iter().collect()
+}
+
+fn trailing_token_is_path_or_url(tail: &str) -> bool {
+    tail.contains('/')
+        || tail.contains('\\')
+        || tail.starts_with("http://")
+        || tail.starts_with("https://")
+}
+
+fn trailing_token_is_url(tail: &str) -> bool {
+    tail.contains("://")
+}
+
+fn carried_reference_prefix(rows: &[String], row: usize, cols: usize) -> String {
+    let mut parts = Vec::new();
+    let mut index = row;
+    while index > 0 {
+        index -= 1;
+        let chars: Vec<char> = rows[index].chars().take(cols).collect();
+        let tail = trailing_reference_token(&chars);
+        let fills = chars.len() == cols && tail.chars().count() == cols;
+        parts.push(tail);
+        if !fills {
+            break;
+        }
+    }
+    parts.reverse();
+    parts.concat()
+}
+
+fn next_starts_separate_reference(next: &str, tail_is_url: bool) -> bool {
+    let next = next.trim_end();
+    if next.starts_with("http://") || next.starts_with("https://") {
+        return true;
+    }
+    if next.starts_with('~') || next.starts_with("./") || next.starts_with("../") {
+        return true;
+    }
+    (next.starts_with('/') || next.starts_with('\\')) && !tail_is_url
+}
+
+/// A new sentence or a second path entry, not the rest of the token.
+///
+/// Trailing spaces are padding, so a row that is only `ml` still continues
+/// `page.ht`. `It covers` and `2 files changed` do not.
+fn next_is_new_clause(next: &str) -> bool {
+    let chars: Vec<char> = next.trim_end().chars().collect();
+    if chars.is_empty() {
+        return false;
+    }
+    if chars[0].is_ascii_digit() {
+        let mut index = 0;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            index += 1;
+        }
+        return chars.get(index).is_some_and(|ch| ch.is_whitespace());
+    }
+    if !chars[0].is_ascii_alphabetic() {
+        return false;
+    }
+    let mut index = 0;
+    while index < chars.len() && chars[index].is_ascii_alphabetic() {
+        index += 1;
+    }
+    let word_len = index;
+    let Some(boundary) = chars.get(index).copied() else {
+        return false;
+    };
+    if !(boundary.is_whitespace() || matches!(boundary, ',' | ';' | '!' | '?')) {
+        return false;
+    }
+    chars[0].is_ascii_uppercase() || word_len >= 3
+}
+
+fn token_looks_finished(token: &str) -> bool {
+    if token.ends_with('/') || token.ends_with('\\') {
+        return true;
+    }
+    let segment = token.rsplit(['/', '\\']).next().unwrap_or(token);
+    let segment = match segment.rsplit_once(':') {
+        Some((path, last)) if !last.is_empty() && last.chars().all(|ch| ch.is_ascii_digit()) => {
+            path
+        }
+        _ => segment,
+    };
+    let Some((_, ext)) = segment.rsplit_once('.') else {
+        return !segment.is_empty();
+    };
+    let ext = ext.trim_end_matches('.');
+    ext.len() >= 2
+        && ext
+            .chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+}
+
 fn is_file_reference_char(ch: char) -> bool {
     ch.is_alphanumeric()
         || matches!(
@@ -1225,6 +1398,103 @@ mod tests {
             reference_target_from_row(row, col, Path::new("/repo")),
             Some(ReferenceTarget::Symbol("SourceKind.ACTIVE".to_string()))
         );
+    }
+
+    #[test]
+    fn margin_newline_continues_a_path_broken_mid_token() {
+        let path = "/tmp/session-aaaa/work-acme-app/ab12cd39-2468-4897-8a35-3cd50857e336/notes/setup-guide.md";
+        let cols = path.find("ab12cd3").unwrap() + "ab12cd3".len();
+        let (head, tail) = path.split_at(cols);
+        let row = format!("{head:cols$}");
+        assert!(row_continues_reference(&row, tail, cols, ""));
+    }
+
+    #[test]
+    fn margin_newline_does_not_continue_a_finished_filename() {
+        let cols = 24;
+        let row = format!("{:>cols$}", "/tmp/notes/guide.md");
+        assert!(!row_continues_reference(
+            &row,
+            "It covers the rest",
+            cols,
+            ""
+        ));
+    }
+
+    #[test]
+    fn short_line_newline_does_not_continue_a_path() {
+        assert!(!row_continues_reference(
+            "/tmp/one/file.md",
+            "/tmp/two/file.md",
+            40,
+            ""
+        ));
+    }
+
+    #[test]
+    fn margin_newline_joins_a_split_extension() {
+        let cols = 20;
+        let row = format!("{:>cols$}", "/tmp/notes/guide.m");
+        assert!(row_continues_reference(&row, "d. It covers", cols, ""));
+        assert!(row_continues_reference(
+            &format!("{:>cols$}", "/tmp/page.ht"),
+            "ml/index",
+            cols,
+            ""
+        ));
+        assert!(row_continues_reference(
+            &format!("{:>cols$}", "/tmp/lib.r"),
+            "s:12",
+            cols,
+            ""
+        ));
+    }
+
+    #[test]
+    fn margin_newline_joins_a_split_url_host() {
+        let cols = 22;
+        let row = format!("{:>cols$}", "https://example.co");
+        assert!(row_continues_reference(&row, "m/docs/page", cols, ""));
+    }
+
+    #[test]
+    fn margin_newline_leaves_a_finished_directory_and_bare_name() {
+        let cols = 16;
+        assert!(!row_continues_reference(
+            &format!("{:>cols$}", "/tmp/dir/"),
+            "Next step is here",
+            cols,
+            ""
+        ));
+        assert!(!row_continues_reference(
+            &format!("{:>cols$}", "/usr/bin/env"),
+            "Then run it",
+            cols,
+            ""
+        ));
+    }
+
+    #[test]
+    fn margin_newline_does_not_join_a_following_path() {
+        let cols = 32;
+        let row = format!("{:>cols$}", "/tmp/a/guide.md");
+        assert!(!row_continues_reference(&row, "/tmp/b/x.rs", cols, ""));
+        assert!(!row_continues_reference(&row, "./foo.rs", cols, ""));
+        assert!(!row_continues_reference(&row, "~/bar.rs", cols, ""));
+        assert!(!row_continues_reference(&row, "2 files changed", cols, ""));
+    }
+
+    #[test]
+    fn margin_newline_joins_a_third_row_of_a_url() {
+        let cols = 16;
+        let row0 = "https://x.io/a?t".to_string();
+        let row1 = "oken=abcdefghijk".to_string();
+        let row2 = "klmn/rest".to_string();
+        assert_eq!(row0.len(), cols);
+        assert_eq!(row1.len(), cols);
+        assert!(!row_continues_reference(&row1, &row2, cols, ""));
+        assert!(row_continues_reference(&row1, &row2, cols, &row0));
+        assert!(rows_hard_wrap_continues(&[row0, row1, row2], 1, cols));
     }
 
     #[test]

@@ -23,7 +23,7 @@ use super::input::Modifiers;
 use super::layout::PaneRect;
 use super::links::{
     Osc8Tracker, ReferenceContext, ReferenceTarget, reference_spans_from_row_ctx,
-    reference_target_from_row_ctx, reference_target_from_uri,
+    reference_target_from_row_ctx, reference_target_from_uri, rows_hard_wrap_continues,
 };
 use super::render::{CueSpan, DamageRect, SelectionRange, draw_pane_focus_chrome, draw_screen};
 
@@ -614,7 +614,8 @@ impl TerminalView {
 
     fn visible_reference_spans(&mut self, ctx: ReferenceContext<'_>) -> Vec<CueSpan> {
         let mut spans = Vec::new();
-        for row in 0..self.size.rows as usize {
+        let rows = self.size.rows as usize;
+        for row in 0..rows {
             for span in self
                 .hyperlink_tracker
                 .links()
@@ -630,22 +631,27 @@ impl TerminalView {
                     });
                 }
             }
+        }
 
-            let Some(row_text) = self.row_text(row) else {
-                continue;
-            };
-            for span in reference_spans_from_row_ctx(&row_text, ctx) {
-                let cue = CueSpan {
-                    row,
-                    start_col: span.start,
-                    end_col: span.end,
-                };
-                if !spans.iter().any(|existing| contains_span(*existing, cue)) {
-                    spans.retain(|existing| !contains_span(cue, *existing));
-                    spans.push(cue);
+        // Wrapped rows are one logical line. Scanning each visual row alone
+        // treats a path split mid-token as a truncated name.
+        if let Some(texts) = self.snapshot_row_texts() {
+            let cols = self.size.cols as usize;
+            let flags = self.soft_wrap_flags(texts.len());
+            let mut row = 0;
+            while row < texts.len() {
+                let (start, end) = logical_line_bounds_from(&texts, &flags, row, cols);
+                let text = join_logical_rows(&texts, start, end, cols);
+                let row_count = end - start + 1;
+                for span in reference_spans_from_row_ctx(&text, ctx) {
+                    for cue in cues_for_joined_span(start, cols, row_count, span.start, span.end) {
+                        push_reference_cue(&mut spans, cue);
+                    }
                 }
+                row = end.saturating_add(1);
             }
         }
+
         spans.sort_by_key(|span| (span.row, span.start_col, span.end_col));
         spans.dedup();
         spans
@@ -793,8 +799,67 @@ impl TerminalView {
             return Some(target);
         }
 
-        let row_text = self.row_text(row)?;
-        reference_target_from_row_ctx(&row_text, column, ctx)
+        let texts = self.snapshot_row_texts()?;
+        if row >= texts.len() {
+            return None;
+        }
+        let cols = self.size.cols as usize;
+        let flags = self.soft_wrap_flags(texts.len());
+        let (start, end) = logical_line_bounds_from(&texts, &flags, row, cols);
+        let text = join_logical_rows(&texts, start, end, cols);
+        let joined_column = (row - start) * cols + column;
+        reference_target_from_row_ctx(&text, joined_column, ctx)
+    }
+
+    /// `(wrapped, wrap_continuation)` for a viewport row.
+    fn row_soft_wrap(&self, row: usize) -> (bool, bool) {
+        let point = Point::Viewport(PointCoordinate {
+            x: 0,
+            y: row as u32,
+        });
+        let Ok(grid_ref) = self.terminal.grid_ref(point) else {
+            return (false, false);
+        };
+        let Ok(term_row) = grid_ref.row() else {
+            return (false, false);
+        };
+        (
+            term_row.is_wrapped().unwrap_or(false),
+            term_row.is_wrap_continuation().unwrap_or(false),
+        )
+    }
+
+    fn soft_wrap_flags(&self, rows: usize) -> Vec<(bool, bool)> {
+        (0..rows).map(|row| self.row_soft_wrap(row)).collect()
+    }
+
+    /// Every visible row, read from one render snapshot.
+    fn snapshot_row_texts(&mut self) -> Option<Vec<String>> {
+        let snapshot = self.render_state.update(&self.terminal).ok()?;
+        let cols = snapshot.cols().ok()? as usize;
+        let mut row_iter = self.rows.update(&snapshot).ok()?;
+        let mut texts = Vec::new();
+
+        while let Some(row_ref) = row_iter.next() {
+            let mut cell_iter = self.cells.update(row_ref).ok()?;
+            let mut text = String::with_capacity(cols);
+            let mut col = 0usize;
+
+            while let Some(cell_ref) = cell_iter.next() {
+                if col >= cols {
+                    break;
+                }
+                text.push(first_grapheme(cell_ref).unwrap_or(' '));
+                col += 1;
+            }
+
+            if col < cols {
+                text.extend(std::iter::repeat_n(' ', cols - col));
+            }
+            texts.push(text);
+        }
+
+        Some(texts)
     }
 
     fn hyperlink_target_at(
@@ -840,43 +905,93 @@ impl TerminalView {
         }
         text
     }
+}
 
-    fn row_text(&mut self, row: usize) -> Option<String> {
-        let snapshot = self.render_state.update(&self.terminal).ok()?;
-        let cols = snapshot.cols().ok()? as usize;
-        let mut row_iter = self.rows.update(&snapshot).ok()?;
-
-        let mut row_ref = None;
-        for _ in 0..=row {
-            row_ref = row_iter.next();
-            row_ref?;
-        }
-
-        let mut cell_iter = self.cells.update(row_ref?).ok()?;
-        let mut text = String::with_capacity(cols);
-        let mut col = 0usize;
-
-        while let Some(cell_ref) = cell_iter.next() {
-            if col >= cols {
-                break;
-            }
-
-            text.push(first_grapheme(cell_ref).unwrap_or(' '));
-            col += 1;
-        }
-
-        if col < cols {
-            text.extend(std::iter::repeat_n(' ', cols - col));
-        }
-
-        Some(text)
+/// Inclusive bounds of the wrapped line that contains `row`.
+///
+/// Soft-wrap flags cover terminal wrap. A program can also insert a newline
+/// exactly at the right margin and split a path mid-token.
+fn logical_line_bounds_from(
+    texts: &[String],
+    flags: &[(bool, bool)],
+    row: usize,
+    cols: usize,
+) -> (usize, usize) {
+    let rows = texts.len();
+    if rows == 0 || row >= rows {
+        return (row, row);
     }
+
+    let mut start = row;
+    while start > 0
+        && (flags.get(start).is_some_and(|(_, cont)| *cont)
+            || rows_hard_wrap_continues(texts, start - 1, cols))
+    {
+        start -= 1;
+    }
+
+    let mut end = start;
+    while end + 1 < rows
+        && (flags.get(end).is_some_and(|(wrapped, _)| *wrapped)
+            || rows_hard_wrap_continues(texts, end, cols))
+    {
+        end += 1;
+    }
+    (start, end)
+}
+
+fn join_logical_rows(texts: &[String], start: usize, end: usize, cols: usize) -> String {
+    let mut text = String::new();
+    for row in texts.iter().take(end + 1).skip(start) {
+        text.extend(row.chars().take(cols));
+    }
+    text
 }
 
 fn contains_span(container: CueSpan, contained: CueSpan) -> bool {
     container.row == contained.row
         && container.start_col <= contained.start_col
         && container.end_col >= contained.end_col
+}
+
+fn push_reference_cue(spans: &mut Vec<CueSpan>, cue: CueSpan) {
+    if spans.iter().any(|existing| contains_span(*existing, cue)) {
+        return;
+    }
+    spans.retain(|existing| !contains_span(cue, *existing));
+    spans.push(cue);
+}
+
+/// Split a span in joined logical-line text back into per-row cue ranges.
+fn cues_for_joined_span(
+    start_row: usize,
+    cols: usize,
+    row_count: usize,
+    span_start: usize,
+    span_end: usize,
+) -> Vec<CueSpan> {
+    if cols == 0 || span_start >= span_end {
+        return Vec::new();
+    }
+
+    let mut cues = Vec::new();
+    for index in 0..row_count {
+        let row_begin = index * cols;
+        let row_end = row_begin + cols;
+        if span_end <= row_begin || span_start >= row_end {
+            continue;
+        }
+        let start_col = span_start.saturating_sub(row_begin);
+        let end_col = (span_end - row_begin).min(cols);
+        if start_col < end_col {
+            cues.push(CueSpan {
+                row: start_row + index,
+                start_col,
+                end_col,
+            });
+        }
+    }
+    cues
 }
 
 fn drain_pty_output(
@@ -1156,6 +1271,170 @@ mod tests {
             Some(ReferenceTarget::File(FileTarget {
                 path: PathBuf::from("/repo/src/lib.rs"),
                 line: Some(9),
+            }))
+        );
+    }
+
+    #[test]
+    fn reference_lookup_joins_soft_wrapped_file_path() {
+        let cols = 20usize;
+        let mut view = test_view_with_size(cols, 6);
+        let path = "/tmp/work/notes/setup-guide.md";
+        assert!(path.len() > cols);
+        view.process(path.as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let expected = ReferenceTarget::File(FileTarget {
+            path: PathBuf::from(path),
+            line: None,
+        });
+        let rows_used = path.len().div_ceil(cols);
+        assert!(rows_used >= 2);
+
+        assert_eq!(view.reference_at(0, 0, ctx), Some(expected.clone()));
+        assert_eq!(view.reference_at(0, cols - 1, ctx), Some(expected.clone()));
+        assert_eq!(view.reference_at(1, 0, ctx), Some(expected.clone()));
+
+        let last_row = rows_used - 1;
+        let last_col = path.len() - last_row * cols;
+        assert_eq!(
+            view.reference_at(last_row, last_col - 1, ctx),
+            Some(expected)
+        );
+        if last_col < cols {
+            assert_eq!(view.reference_at(last_row, last_col, ctx), None);
+        }
+
+        assert!(view.set_reference_cues_enabled(true, ctx));
+        assert!(
+            view.cue_spans
+                .iter()
+                .any(|span| { span.row == 0 && span.start_col == 0 && span.end_col == cols })
+        );
+        assert!(view.cue_spans.iter().any(|span| {
+            span.row == last_row && span.start_col == 0 && span.end_col == last_col
+        }));
+    }
+
+    #[test]
+    fn reference_lookup_keeps_line_number_across_soft_wrap() {
+        let cols = 20usize;
+        let mut view = test_view_with_size(cols, 6);
+        let spec = "/tmp/work/notes/setup-guide.md:42";
+        assert!(spec.len() > cols);
+        view.process(spec.as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let expected = ReferenceTarget::File(FileTarget {
+            path: PathBuf::from("/tmp/work/notes/setup-guide.md"),
+            line: Some(42),
+        });
+        assert_eq!(view.reference_at(0, cols - 1, ctx), Some(expected.clone()));
+        assert_eq!(view.reference_at(1, 0, ctx), Some(expected));
+    }
+
+    #[test]
+    fn reference_lookup_joins_soft_wrapped_url() {
+        let cols = 24usize;
+        let mut view = test_view_with_size(cols, 4);
+        let url = "https://example.com/a/very/long/resource";
+        assert!(url.len() > cols);
+        view.process(url.as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let expected = ReferenceTarget::Url(url.to_string());
+        assert_eq!(view.reference_at(0, 0, ctx), Some(expected.clone()));
+        assert_eq!(view.reference_at(1, 0, ctx), Some(expected));
+    }
+
+    #[test]
+    fn reference_lookup_joins_path_split_by_newline_at_margin() {
+        let path = "/tmp/session-aaaa/work-acme-app/ab12cd39-2468-4897-8a35-3cd50857e336/notes/setup-guide.md";
+        let cols = path.find("ab12cd3").unwrap() + "ab12cd3".len();
+        let mut view = test_view_with_size(cols, 4);
+        let (head, tail) = path.split_at(cols);
+        assert!(head.ends_with("ab12cd3"), "{head}");
+        assert!(tail.starts_with("9-2468"), "{tail}");
+        view.process(format!("{head}\r\n{tail}").as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let expected = ReferenceTarget::File(FileTarget {
+            path: PathBuf::from(path),
+            line: None,
+        });
+        assert_eq!(view.reference_at(0, cols - 1, ctx), Some(expected.clone()));
+        assert_eq!(view.reference_at(1, 0, ctx), Some(expected.clone()));
+        let notes = tail.find("notes").unwrap();
+        assert_eq!(view.reference_at(1, notes, ctx), Some(expected));
+    }
+
+    #[test]
+    fn reference_lookup_does_not_join_full_width_path_list() {
+        let cols = 32usize;
+        let mut view = test_view_with_size(cols, 3);
+        let first = format!("{:>cols$}", "/tmp/a/guide.md");
+        let second = "/tmp/b/x.rs";
+        assert_eq!(first.len(), cols);
+        view.process(format!("{first}\r\n{second}").as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let path_col = first.find("/tmp").unwrap();
+        assert_eq!(
+            view.reference_at(0, path_col, ctx),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/tmp/a/guide.md"),
+                line: None,
+            }))
+        );
+        assert_eq!(
+            view.reference_at(1, 0, ctx),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/tmp/b/x.rs"),
+                line: None,
+            }))
+        );
+    }
+
+    #[test]
+    fn reference_lookup_does_not_glue_finished_filename_to_next_sentence() {
+        let cols = 24usize;
+        let mut view = test_view_with_size(cols, 3);
+        let path = "/tmp/notes/guide.md";
+        assert!(path.len() < cols);
+        let line = format!("{path:>cols$}");
+        assert_eq!(line.len(), cols);
+        view.process(format!("{line}\r\nIt covers the rest").as_bytes(), true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        let path_col = line.find("/tmp").unwrap();
+        assert_eq!(
+            view.reference_at(0, path_col, ctx),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from(path),
+                line: None,
+            }))
+        );
+        assert_eq!(view.reference_at(1, 0, ctx), None);
+    }
+
+    #[test]
+    fn reference_lookup_does_not_join_paths_split_by_newline() {
+        let mut view = test_view_with_size(40, 4);
+        view.process(b"/tmp/one/file.md\r\n/tmp/two/file.md", true);
+
+        let ctx = ReferenceContext::cwd_only(Path::new("/repo"));
+        assert_eq!(
+            view.reference_at(0, 0, ctx),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/tmp/one/file.md"),
+                line: None,
+            }))
+        );
+        assert_eq!(
+            view.reference_at(1, 0, ctx),
+            Some(ReferenceTarget::File(FileTarget {
+                path: PathBuf::from("/tmp/two/file.md"),
+                line: None,
             }))
         );
     }
