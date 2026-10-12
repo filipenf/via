@@ -50,10 +50,22 @@ pub(super) enum PaneCommand {
 #[derive(Default)]
 struct MouseState {
     held_button: Option<PaneMouseButton>,
+    /// Owner latched at press: App means the gesture was claimed by the
+    /// program (forwarded), Local means via-local selection/reference.
+    /// Motion/release follow the latched owner instead of re-deciding per
+    /// event, so mid-gesture DECSET/mode changes and Shift/Ctrl flips cannot
+    /// split a press from its release or steal a drag.
+    drag_owner: Option<DragOwner>,
     /// Carried-over fractional scroll input. Pixel-precise devices (touchpads, hi-res wheels) send
     /// many small deltas per notch; we accumulate them and only emit whole wheel steps so programs
     /// (and local scrollback) move one line per notch instead of a burst per event.
     scroll_accumulator: f32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DragOwner {
+    App,
+    Local,
 }
 
 /// Raw scroll units that make up one wheel step (one line / one notch). Winit `LineDelta` is scaled
@@ -122,6 +134,11 @@ impl TerminalPaneController {
     #[cfg(test)]
     fn held_button_for_test(&self) -> Option<PaneMouseButton> {
         self.mouse.held_button
+    }
+
+    #[cfg(test)]
+    fn drag_owner_for_test(&self) -> Option<DragOwner> {
+        self.mouse.drag_owner
     }
 
     pub(super) fn handle_terminal_key(
@@ -295,7 +312,7 @@ impl TerminalPaneController {
                 self.forward_terminal_mouse_input(state, button, local_x, local_y, modifiers)
             }
             PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
-                Ok(self.handle_local_mouse_input(state, button, local_x, local_y, modifiers, ctx))
+                self.handle_app_aware_mouse_input(state, button, local_x, local_y, modifiers, ctx)
             }
         }
     }
@@ -326,7 +343,56 @@ impl TerminalPaneController {
                 })
             }
             PaneRole::Editor | PaneRole::AgentTerminal { .. } => {
-                if self.mouse.held_button != Some(PaneMouseButton::Left) {
+                let Some(button) = self.mouse.held_button else {
+                    return Ok(PaneEventOutcome::default());
+                };
+                match self.mouse.drag_owner {
+                    Some(DragOwner::App) => {
+                        let forwarded = self.pane.forward_mouse_event(
+                            PaneMouseAction::Motion,
+                            Some(button),
+                            local_x,
+                            local_y,
+                            modifiers,
+                            true,
+                        )?;
+                        // App-owned drag stays App even if the program turned
+                        // mouse reporting off mid-gesture: there is no local
+                        // anchor (press was forwarded), so there is nothing to
+                        // fall back to.
+                        return Ok(PaneEventOutcome {
+                            dirty: forwarded,
+                            force_redraw: false,
+                            command: None,
+                        });
+                    }
+                    Some(DragOwner::Local) => {
+                        // Local drag stays local even if the program enabled
+                        // mouse reporting mid-gesture, so the selection is
+                        // never stolen and the release still copies.
+                    }
+                    None => {
+                        // Legacy state (should not happen): keep the old
+                        // forward-then-fallback shape, minus the Shift bypass
+                        // which is now latched at press.
+                        let forwarded = self.pane.forward_mouse_event(
+                            PaneMouseAction::Motion,
+                            Some(button),
+                            local_x,
+                            local_y,
+                            modifiers,
+                            true,
+                        )?;
+                        if forwarded {
+                            return Ok(PaneEventOutcome {
+                                dirty: true,
+                                force_redraw: false,
+                                command: None,
+                            });
+                        }
+                    }
+                }
+                if button != PaneMouseButton::Left {
                     return Ok(PaneEventOutcome::default());
                 }
                 let metrics = self.pane.metrics();
@@ -425,7 +491,19 @@ impl TerminalPaneController {
         })
     }
 
-    fn handle_local_mouse_input(
+    /// Editor and agent panes forward mouse events to the running program
+    /// (Neovim tabs, agent TUI clicks, ...) whenever it enabled mouse
+    /// reporting (e.g. `DECSET 1000` + SGR `1006`, same signal the wheel path
+    /// already uses). Only when the program did not claim the event do we fall
+    /// back to via-local selection / Ctrl-click reference handling.
+    ///
+    /// The gesture owner is latched at press: motion and release follow
+    /// `drag_owner` instead of re-deciding per event, so Shift/Ctrl flips or
+    /// DECSET changes mid-gesture cannot orphan a release or steal a drag.
+    /// Shift bypasses application mouse so users can always drag-select; Ctrl
+    /// on an agent pane still prefers reference navigation when a reference
+    /// exists under the cursor.
+    fn handle_app_aware_mouse_input(
         &mut self,
         state: ElementState,
         button: MouseButton,
@@ -433,36 +511,172 @@ impl TerminalPaneController {
         local_y: usize,
         modifiers: Modifiers,
         ctx: ReferenceContext<'_>,
+    ) -> Result<PaneEventOutcome> {
+        let Some(pane_button) = pane_mouse_button(button) else {
+            return Ok(PaneEventOutcome::default());
+        };
+        let is_down = state == ElementState::Pressed;
+
+        if !is_down {
+            return self.handle_app_aware_mouse_release(pane_button, local_x, local_y, modifiers);
+        }
+
+        // Press: latch the owner.
+        if modifiers.shift {
+            return Ok(self.local_press(pane_button, local_x, local_y, modifiers, ctx));
+        }
+
+        // Ctrl-click reference navigation wins when a reference exists; the
+        // single lookup feeds the command directly so release/motion stay
+        // Local via the latched owner. Otherwise the click still belongs to
+        // the application (or to local selection).
+        if pane_button == PaneMouseButton::Left
+            && matches!(self.role, PaneRole::AgentTerminal { .. })
+            && modifiers.ctrl
+        {
+            let metrics = self.pane.metrics();
+            if let Some(target) = self.pane.reference_at(
+                local_y / metrics.cell_height,
+                local_x / metrics.cell_width,
+                ctx,
+            ) {
+                self.mouse.held_button = Some(PaneMouseButton::Left);
+                self.mouse.drag_owner = Some(DragOwner::Local);
+                let mut outcome = PaneEventOutcome::default();
+                outcome.dirty = true;
+                outcome.command = Some(command_from_reference_target(target));
+                return Ok(outcome);
+            }
+        }
+
+        let forwarded = self.pane.forward_mouse_event(
+            PaneMouseAction::Press,
+            Some(pane_button),
+            local_x,
+            local_y,
+            modifiers,
+            true,
+        )?;
+        if forwarded {
+            self.mouse.held_button = Some(pane_button);
+            self.mouse.drag_owner = Some(DragOwner::App);
+            let mut dirty = true;
+            dirty |= self.pane.clear_selection();
+            return Ok(PaneEventOutcome {
+                dirty,
+                force_redraw: false,
+                command: None,
+            });
+        }
+
+        Ok(self.local_press(pane_button, local_x, local_y, modifiers, ctx))
+    }
+
+    /// Release follows the owner latched at press. App-owned releases are
+    /// always forwarded (even with Shift held, so the program sees button-up)
+    /// and clear the gesture even when the program already turned mouse
+    /// reporting off. Local-owned releases copy the selection. Releases with
+    /// no latched gesture are spurious and send nothing.
+    fn handle_app_aware_mouse_release(
+        &mut self,
+        button: PaneMouseButton,
+        local_x: usize,
+        local_y: usize,
+        modifiers: Modifiers,
+    ) -> Result<PaneEventOutcome> {
+        let Some(held) = self.mouse.held_button else {
+            return Ok(PaneEventOutcome::default());
+        };
+        if held != button {
+            return Ok(PaneEventOutcome::default());
+        }
+        match self.mouse.drag_owner {
+            Some(DragOwner::App) => {
+                let forwarded = self.pane.forward_mouse_event(
+                    PaneMouseAction::Release,
+                    Some(button),
+                    local_x,
+                    local_y,
+                    modifiers,
+                    false,
+                )?;
+                self.mouse.held_button = None;
+                self.mouse.drag_owner = None;
+                let mut dirty = forwarded;
+                dirty |= self.pane.clear_selection();
+                Ok(PaneEventOutcome {
+                    dirty,
+                    force_redraw: false,
+                    command: None,
+                })
+            }
+            Some(DragOwner::Local) => {
+                self.mouse.held_button = None;
+                self.mouse.drag_owner = None;
+                Ok(PaneEventOutcome {
+                    dirty: if button == PaneMouseButton::Left {
+                        self.pane.copy_selection_to_clipboard()
+                    } else {
+                        false
+                    },
+                    force_redraw: false,
+                    command: None,
+                })
+            }
+            None => {
+                // No owner (should not happen): fall back to a forward attempt
+                // so Review-style callers still deliver button-up, then clear.
+                let forwarded = self.pane.forward_mouse_event(
+                    PaneMouseAction::Release,
+                    Some(button),
+                    local_x,
+                    local_y,
+                    modifiers,
+                    false,
+                )?;
+                self.mouse.held_button = None;
+                Ok(PaneEventOutcome {
+                    dirty: forwarded,
+                    force_redraw: false,
+                    command: None,
+                })
+            }
+        }
+    }
+
+    /// Local press path: latches `Local`, starts a selection unless this is a
+    /// Ctrl reference click (which resolves the reference with one lookup).
+    /// Non-Left presses are ignored without touching the latched gesture so a
+    /// stray button cannot clobber an in-progress Left drag.
+    fn local_press(
+        &mut self,
+        button: PaneMouseButton,
+        local_x: usize,
+        local_y: usize,
+        modifiers: Modifiers,
+        ctx: ReferenceContext<'_>,
     ) -> PaneEventOutcome {
-        if button != MouseButton::Left {
+        if button != PaneMouseButton::Left {
             return PaneEventOutcome::default();
         }
-
-        let is_down = state == ElementState::Pressed;
-        let just_pressed = is_down && self.mouse.held_button != Some(PaneMouseButton::Left);
-        let just_released = !is_down && self.mouse.held_button == Some(PaneMouseButton::Left);
-        if is_down {
-            self.mouse.held_button = Some(PaneMouseButton::Left);
-        } else {
-            self.mouse.held_button = None;
+        // A repeated press without an intervening release carries no new
+        // gesture; keep the latched owner.
+        if self.mouse.held_button == Some(PaneMouseButton::Left) {
+            return PaneEventOutcome::default();
         }
+        self.mouse.held_button = Some(PaneMouseButton::Left);
+        self.mouse.drag_owner = Some(DragOwner::Local);
 
         let mut outcome = PaneEventOutcome::default();
-        if just_pressed {
-            let is_reference_click =
-                matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.ctrl;
-            if !is_reference_click {
-                outcome.dirty |= self.start_selection(local_x, local_y);
-            }
-            if is_reference_click {
-                outcome.dirty |=
-                    self.forward_reference_click(local_x, local_y, ctx, &mut outcome.command);
-            }
+        let is_reference_click =
+            matches!(self.role, PaneRole::AgentTerminal { .. }) && modifiers.ctrl;
+        if !is_reference_click {
+            outcome.dirty |= self.start_selection(local_x, local_y);
         }
-        if just_released {
-            outcome.dirty |= self.pane.copy_selection_to_clipboard();
+        if is_reference_click {
+            outcome.dirty |=
+                self.forward_reference_click(local_x, local_y, ctx, &mut outcome.command);
         }
-
         outcome
     }
 
@@ -479,6 +693,9 @@ impl TerminalPaneController {
         ctx: ReferenceContext<'_>,
         command: &mut Option<PaneCommand>,
     ) -> bool {
+        // Single lookup per click: the press path that already resolved the
+        // target builds the command via `command_from_reference_target`
+        // instead of calling back here.
         let metrics = self.pane.metrics();
         let row = local_y / metrics.cell_height;
         let column = local_x / metrics.cell_width;
@@ -510,6 +727,30 @@ impl TerminalPaneController {
                 *command = Some(PaneCommand::UrlOpenRequested { url });
                 true
             }
+        }
+    }
+}
+
+fn command_from_reference_target(target: ReferenceTarget) -> PaneCommand {
+    match target {
+        ReferenceTarget::File(target) => {
+            info!(
+                path = %target.path.display(),
+                line = ?target.line,
+                "file reference ctrl-clicked"
+            );
+            PaneCommand::OpenRequested {
+                path: target.path,
+                line: target.line,
+            }
+        }
+        ReferenceTarget::Symbol(symbol) => {
+            info!(symbol = %symbol, "symbol reference ctrl-clicked");
+            PaneCommand::SymbolOpenRequested { symbol }
+        }
+        ReferenceTarget::Url(url) => {
+            info!(%url, "url reference ctrl-clicked");
+            PaneCommand::UrlOpenRequested { url }
         }
     }
 }
@@ -1039,6 +1280,436 @@ mod tests {
             assert!(outcome.dirty);
             assert!(!outcome.force_redraw);
         }
+    }
+
+    #[test]
+    fn editor_forwards_click_when_mouse_reporting_is_enabled() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(outcome.dirty);
+        assert!(outcome.command.is_none());
+        assert_eq!(pane.held_button_for_test(), Some(PaneMouseButton::Left));
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert!(release.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn editor_falls_back_to_selection_without_mouse_reporting() {
+        let mut pane = test_controller(PaneRole::Editor);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(outcome.dirty);
+        assert_eq!(pane.held_button_for_test(), Some(PaneMouseButton::Left));
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+
+        // Drag without mouse reporting updates the local selection.
+        let motion = pane
+            .handle_mouse_motion(3 * test_metrics().cell_width, 0, Modifiers::default())
+            .unwrap();
+        assert!(motion.dirty);
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+    }
+
+    #[test]
+    fn agent_forwards_click_when_mouse_reporting_is_enabled() {
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+            command: None,
+            acp_tui: false,
+        });
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(outcome.dirty);
+        assert!(outcome.command.is_none());
+        // Owner proves the program claimed the press; local selection is also dirty.
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+    }
+
+    #[test]
+    fn right_click_forwards_and_release_clears_when_mouse_reporting_is_enabled() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let press = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Right,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert!(press.dirty);
+        assert_eq!(pane.held_button_for_test(), Some(PaneMouseButton::Right));
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Right,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert!(release.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn non_left_press_without_mouse_reporting_leaves_gesture_alone() {
+        let mut pane = test_controller(PaneRole::Editor);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Right,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(!outcome.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn spurious_release_sends_nothing() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(!release.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn shift_click_bypasses_mouse_reporting_for_selection() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        // Shift means local selection even though the program owns the mouse.
+        assert!(outcome.dirty);
+        assert!(outcome.command.is_none());
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+
+        let motion = pane
+            .handle_mouse_motion(
+                3 * test_metrics().cell_width,
+                0,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+            )
+            .unwrap();
+        assert!(motion.dirty);
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+    }
+
+    #[test]
+    fn app_press_then_shift_release_still_delivers_button_up() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        pane.handle_mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            test_metrics().cell_width,
+            0,
+            Modifiers::default(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        )
+        .unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+
+        // Owner is latched at press, so the release still goes to the program
+        // (with Shift as a modifier) instead of switching to local copy.
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert!(release.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn shift_press_then_plain_release_stays_local() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        pane.handle_mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            test_metrics().cell_width,
+            0,
+            Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        )
+        .unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+
+        // No orphan release is forwarded to the program; the gesture stays
+        // local even though Shift was lifted before button-up. A forwarded
+        // release is dirty; the Local point-selection copy is not.
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                3 * test_metrics().cell_width,
+                0,
+                Modifiers::default(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+        assert!(release.command.is_none());
+        assert!(!release.dirty);
+    }
+
+    #[test]
+    fn ctrl_reference_click_wins_over_mouse_reporting() {
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+            command: None,
+            acp_tui: false,
+        });
+        pane.process_for_test(b"open src/main.rs:42", true);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+        let x = 6 * test_metrics().cell_width;
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                x,
+                0,
+                ctrl_modifiers(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            outcome.command,
+            Some(PaneCommand::OpenRequested { .. })
+        ));
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+    }
+
+    #[test]
+    fn ctrl_reference_release_does_not_forward_orphan() {
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+            command: None,
+            acp_tui: false,
+        });
+        pane.process_for_test(b"open src/main.rs:42", true);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", true);
+        let x = 6 * test_metrics().cell_width;
+
+        pane.handle_mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            x,
+            0,
+            ctrl_modifiers(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        )
+        .unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+
+        // Motion and release stay Local: no press was ever forwarded, so the
+        // program must not see motion/button-up for this gesture. No anchor
+        // was set (reference clicks don't select), so Local motion/release
+        // are not dirty while a 1002 forward would be.
+        let motion = pane.handle_mouse_motion(x, 0, ctrl_modifiers()).unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+        assert!(!motion.dirty);
+
+        let release = pane
+            .handle_mouse_input(
+                ElementState::Released,
+                MouseButton::Left,
+                x,
+                0,
+                ctrl_modifiers(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+        assert!(release.command.is_none());
+        assert!(!release.dirty);
+        assert_eq!(pane.held_button_for_test(), None);
+        assert_eq!(pane.drag_owner_for_test(), None);
+    }
+
+    #[test]
+    fn ctrl_click_without_reference_forwards_when_mouse_reporting_is_enabled() {
+        let mut pane = test_controller(PaneRole::AgentTerminal {
+            id: "agent".to_string(),
+            label: "agent".to_string(),
+            command: None,
+            acp_tui: false,
+        });
+        pane.process_for_test(b"plain text here", true);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1006h", true);
+
+        let outcome = pane
+            .handle_mouse_input(
+                ElementState::Pressed,
+                MouseButton::Left,
+                test_metrics().cell_width,
+                0,
+                ctrl_modifiers(),
+                ReferenceContext::cwd_only(Path::new("/repo")),
+            )
+            .unwrap();
+
+        assert!(outcome.command.is_none());
+        assert!(outcome.dirty);
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+    }
+
+    #[test]
+    fn drag_motion_forwards_when_mouse_reporting_is_enabled() {
+        let mut pane = test_controller(PaneRole::Editor);
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", true);
+        pane.handle_mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            0,
+            0,
+            Modifiers::default(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        )
+        .unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+
+        let motion = pane
+            .handle_mouse_motion(10, 10, Modifiers::default())
+            .unwrap();
+        assert!(motion.dirty);
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::App));
+    }
+
+    #[test]
+    fn local_drag_stays_local_when_mouse_reporting_turns_on_mid_gesture() {
+        let mut pane = test_controller(PaneRole::Editor);
+
+        pane.handle_mouse_input(
+            ElementState::Pressed,
+            MouseButton::Left,
+            0,
+            0,
+            Modifiers::default(),
+            ReferenceContext::cwd_only(Path::new("/repo")),
+        )
+        .unwrap();
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
+
+        // Program enables drag reporting mid-gesture: the latched Local owner
+        // wins, so the event is never forwarded. A same-cell motion is not
+        // dirty on the Local path (anchor == focus) but is dirty as a 1002
+        // forward, so !dirty proves the gesture stayed local.
+        pane.process_for_test(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", true);
+        let motion = pane
+            .handle_mouse_motion(0, 0, Modifiers::default())
+            .unwrap();
+        assert!(!motion.dirty);
+        assert_eq!(pane.drag_owner_for_test(), Some(DragOwner::Local));
     }
 
     fn test_controller(role: PaneRole) -> TerminalPaneController {
