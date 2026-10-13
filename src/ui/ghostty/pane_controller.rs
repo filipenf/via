@@ -548,10 +548,11 @@ impl TerminalPaneController {
             ) {
                 self.mouse.held_button = Some(PaneMouseButton::Left);
                 self.mouse.drag_owner = Some(DragOwner::Local);
-                let mut outcome = PaneEventOutcome::default();
-                outcome.dirty = true;
-                outcome.command = Some(command_from_reference_target(target));
-                return Ok(outcome);
+                return Ok(PaneEventOutcome {
+                    dirty: true,
+                    force_redraw: false,
+                    command: Some(command_from_reference_target(target)),
+                });
             }
         }
 

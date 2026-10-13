@@ -530,6 +530,258 @@ t.it("open_task_body: refocuses existing float instead of opening a duplicate", 
   vim.fn.delete(path)
 end)
 
+--- Run callbacks queued with vim.schedule (cwd pin, jump relocation).
+local function flush_scheduled()
+  local done = false
+  vim.schedule(function()
+    done = true
+  end)
+  vim.wait(1000, function()
+    return done
+  end)
+end
+
+local function normalize_dir(dir)
+  local abs = vim.fn.fnamemodify(dir, ":p")
+  if #abs > 1 and abs:sub(-1) == "/" then
+    abs = abs:sub(1, -2)
+  end
+  return abs
+end
+
+t.it("open_task_body: task popup disables diagnostics", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task", "hello" }, path)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("diag1")
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
+  local float_win = vim.fn.bufwinid(bufnr)
+  local function enabled()
+    return vim.diagnostic.is_enabled({ bufnr = bufnr })
+  end
+  t.eq(false, enabled(), "diagnostics must be off for the task popup")
+  vim.diagnostic.enable(true, { bufnr = bufnr })
+  vim.api.nvim_exec_autocmds("LspAttach", {
+    buffer = bufnr,
+    data = { client_id = 0 },
+  })
+  t.eq(false, enabled(), "LspAttach must not turn diagnostics back on")
+  vim.api.nvim_win_close(float_win, true)
+  flush_scheduled()
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(path)
+end)
+
+t.it("open_task_body: task popup keeps the project directory", function()
+  local mod = t.load_tasks_module()
+  local project = vim.fn.tempname()
+  local elsewhere = vim.fn.tempname()
+  vim.fn.mkdir(project, "p")
+  vim.fn.mkdir(elsewhere, "p")
+  local path = elsewhere .. "/task.md"
+  vim.fn.writefile({ "# Task" }, path)
+  local saved = vim.fn.getcwd()
+  local group = vim.api.nvim_create_augroup("ViaTaskCwdTest", { clear = true })
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    callback = function(ev)
+      local name = vim.api.nvim_buf_get_name(ev.buf)
+      if name == "" then
+        return
+      end
+      local dir = vim.fn.fnamemodify(name, ":p:h")
+      vim.cmd("lcd " .. vim.fn.fnameescape(dir))
+    end,
+  })
+
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local task_dir = normalize_dir(vim.fn.fnamemodify(abs, ":h"))
+  local float_win
+  local ok, err = pcall(function()
+    vim.cmd("cd " .. vim.fn.fnameescape(project))
+    local project_dir = normalize_dir(vim.fn.getcwd())
+    mod.run = function()
+      return path .. "\n", 0
+    end
+    mod.open_task_body("cwd1")
+    local bufnr = vim.fn.bufnr(abs, false)
+    float_win = vim.fn.bufwinid(bufnr)
+    t.eq(project_dir, normalize_dir(vim.fn.getcwd()), "float must stay on the project directory")
+    t.neq(task_dir, normalize_dir(vim.fn.getcwd()), "float must not stay on the task file directory")
+    t.eq(project_dir, normalize_dir(vim.fn.getcwd(-1)), "global cwd must stay on the project")
+    vim.cmd("doautocmd BufEnter")
+    flush_scheduled()
+    t.eq(project_dir, normalize_dir(vim.fn.getcwd()), "BufEnter must not stick the task directory")
+  end)
+
+  pcall(vim.api.nvim_del_augroup_by_id, group)
+  if float_win and vim.api.nvim_win_is_valid(float_win) then
+    vim.api.nvim_win_close(float_win, true)
+  end
+  flush_scheduled()
+  vim.cmd("cd " .. vim.fn.fnameescape(saved))
+  vim.fn.delete(project, "rf")
+  vim.fn.delete(elsewhere, "rf")
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+t.it("open_task_body: gf closes the popup and opens in the regular window", function()
+  local mod = t.load_tasks_module()
+  local project = vim.fn.tempname()
+  local elsewhere = vim.fn.tempname()
+  vim.fn.mkdir(project, "p")
+  vim.fn.mkdir(elsewhere, "p")
+  local target = project .. "/target.txt"
+  vim.fn.writefile({ "destination" }, target)
+  local path = elsewhere .. "/task.md"
+  vim.fn.writefile({ "target.txt" }, path)
+  local saved = vim.fn.getcwd()
+  local anchor = vim.api.nvim_get_current_win()
+  local anchor_buf = vim.api.nvim_win_get_buf(anchor)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local target_abs = vim.fn.fnamemodify(target, ":p")
+  local float_win
+  local ok, err = pcall(function()
+    vim.cmd("cd " .. vim.fn.fnameescape(project))
+    mod.run = function()
+      return path .. "\n", 0
+    end
+    mod.open_task_body("gf1")
+    local bufnr = vim.fn.bufnr(abs, false)
+    float_win = vim.fn.bufwinid(bufnr)
+    t.truthy(float_win > 0, "task file should open in a float")
+    vim.cmd("normal! gf")
+    flush_scheduled()
+    t.eq(false, vim.api.nvim_win_is_valid(float_win), "gf must close the popup")
+    t.eq(anchor, vim.api.nvim_get_current_win(), "gf must land in the window under the popup")
+    t.eq("", vim.api.nvim_win_get_config(anchor).relative, "destination window must not be a float")
+    t.eq(target_abs, vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(anchor)))
+    t.eq(-1, vim.fn.bufnr(abs, false), "task popup buffer must be wiped after the jump")
+  end)
+
+  if float_win and vim.api.nvim_win_is_valid(float_win) then
+    vim.api.nvim_win_close(float_win, true)
+  end
+  if vim.api.nvim_win_is_valid(anchor) and vim.api.nvim_buf_is_valid(anchor_buf) then
+    vim.api.nvim_win_set_buf(anchor, anchor_buf)
+  end
+  local target_buf = vim.fn.bufnr(target_abs, false)
+  if target_buf > 0 then
+    vim.bo[target_buf].modified = false
+    pcall(vim.api.nvim_buf_delete, target_buf, { force = true })
+  end
+  flush_scheduled()
+  vim.cmd("cd " .. vim.fn.fnameescape(saved))
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(project, "rf")
+  vim.fn.delete(elsewhere, "rf")
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+t.it("open_task_body: gf opens in the main window, not the task board split", function()
+  local mod = t.load_tasks_module()
+  local project = vim.fn.tempname()
+  local elsewhere = vim.fn.tempname()
+  vim.fn.mkdir(project, "p")
+  vim.fn.mkdir(elsewhere, "p")
+  local target = project .. "/target.txt"
+  vim.fn.writefile({ "destination" }, target)
+  local path = elsewhere .. "/task.md"
+  vim.fn.writefile({ "target.txt" }, path)
+  local saved = vim.fn.getcwd()
+  local main = vim.api.nvim_get_current_win()
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if win ~= main and vim.api.nvim_win_is_valid(win) then
+      pcall(vim.api.nvim_win_close, win, true)
+    end
+  end
+  local main_buf = vim.api.nvim_win_get_buf(main)
+  if vim.bo[main_buf].buftype ~= "" then
+    main_buf = vim.api.nvim_create_buf(true, false)
+    vim.api.nvim_win_set_buf(main, main_buf)
+  end
+  vim.cmd("botright 5split")
+  local board_win = vim.api.nvim_get_current_win()
+  local board_buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[board_buf].buftype = "nofile"
+  vim.bo[board_buf].filetype = "via-tasks"
+  vim.api.nvim_win_set_buf(board_win, board_buf)
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local target_abs = vim.fn.fnamemodify(target, ":p")
+  local float_win
+  local ok, err = pcall(function()
+    vim.cmd("cd " .. vim.fn.fnameescape(project))
+    mod.run = function()
+      return path .. "\n", 0
+    end
+    mod.open_task_body("gfmain")
+    local bufnr = vim.fn.bufnr(abs, false)
+    float_win = vim.fn.bufwinid(bufnr)
+    vim.cmd("normal! gf")
+    flush_scheduled()
+    t.eq(false, vim.api.nvim_win_is_valid(float_win), "gf must close the popup")
+    t.eq(main, vim.api.nvim_get_current_win(), "gf must land in the main window")
+    t.eq(target_abs, vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(main)))
+    t.eq(board_buf, vim.api.nvim_win_get_buf(board_win), "task board split must keep the board")
+    t.eq(-1, vim.fn.bufnr(abs, false), "task popup buffer must be wiped after the jump")
+  end)
+
+  if float_win and vim.api.nvim_win_is_valid(float_win) then
+    vim.api.nvim_win_close(float_win, true)
+  end
+  if vim.api.nvim_win_is_valid(board_win) then
+    pcall(vim.api.nvim_win_close, board_win, true)
+  end
+  if vim.api.nvim_win_is_valid(main) and vim.api.nvim_buf_is_valid(main_buf) then
+    vim.api.nvim_win_set_buf(main, main_buf)
+  end
+  local target_buf = vim.fn.bufnr(target_abs, false)
+  if target_buf > 0 then
+    vim.bo[target_buf].modified = false
+    pcall(vim.api.nvim_buf_delete, target_buf, { force = true })
+  end
+  if vim.api.nvim_buf_is_valid(board_buf) then
+    pcall(vim.api.nvim_buf_delete, board_buf, { force = true })
+  end
+  flush_scheduled()
+  vim.cmd("cd " .. vim.fn.fnameescape(saved))
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(project, "rf")
+  vim.fn.delete(elsewhere, "rf")
+  if not ok then
+    error(err, 0)
+  end
+end)
+
+t.it("open_task_body: closing the popup does not replace the underlying buffer", function()
+  local mod = t.load_tasks_module()
+  local path = vim.fn.tempname() .. ".md"
+  vim.fn.writefile({ "# Task", "hello" }, path)
+  local anchor = vim.api.nvim_get_current_win()
+  local anchor_buf = vim.api.nvim_win_get_buf(anchor)
+  mod.run = function()
+    return path .. "\n", 0
+  end
+  mod.open_task_body("close1")
+  local abs = vim.fn.fnamemodify(path, ":p")
+  local bufnr = vim.fn.bufnr(abs, false)
+  local float_win = vim.fn.bufwinid(bufnr)
+  vim.api.nvim_win_close(float_win, true)
+  flush_scheduled()
+  t.eq(anchor_buf, vim.api.nvim_win_get_buf(anchor), "underlying window buffer must be unchanged")
+  t.eq(-1, vim.fn.bufnr(abs, false), "closing the float must wipe the popup buffer")
+  vim.bo[vim.api.nvim_get_current_buf()].modified = false
+  vim.fn.delete(path)
+end)
+
 -- ---------------------------------------------------------------------------
 -- autorefresh (poll_autorefresh / silent_refresh)
 -- ---------------------------------------------------------------------------

@@ -6,6 +6,8 @@
 -- One task per line: via:<id>  STATUS  ASSIGNEE  TITLE. Plain text, greppable.
 -- "Your queue" section filters on assignee=human AND status=review|in_progress.
 -- <CR> opens the task Markdown file in a centered floating editor window.
+-- The popup hides diagnostics, keeps the project directory, and sends jumps
+-- (gf, gd) to the main editing window, not the task-board split.
 -- Buffer-local keys: gR refresh, gn new board, gb switch board, gc create task.
 -- A background autorefresh poll watches `via task list --json` and silently
 -- redraws the board when the store changes. Set `vim.g.via_tasks_autorefresh_ms`
@@ -654,10 +656,295 @@ local function apply_task_markdown_filetype(bufnr)
   vim.bo[bufnr].filetype = "markdown"
 end
 
+-- Distinguishes one popup instance from a later float that reused the same
+-- window id. Closures capture the token; a stale scheduled callback no-ops.
+local task_float_seq = 0
+
+local function normalize_dir(dir)
+  if type(dir) ~= "string" or dir == "" then
+    return ""
+  end
+  local abs = vim.fn.fnamemodify(dir, ":p")
+  if #abs > 1 and abs:sub(-1) == "/" then
+    abs = abs:sub(1, -2)
+  end
+  return abs
+end
+
+local function dirs_match(a, b)
+  return normalize_dir(a) == normalize_dir(b)
+end
+
+local function global_cwd()
+  return vim.fn.getcwd(-1)
+end
+
+--- Hide diagnostics on the task buffer. `enable` is nvim 0.10+; 0.9 used
+--- `disable`. LSP stays attached so `gd` can still jump.
+local function disable_task_diagnostics(bufnr)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  local enable = vim.diagnostic.enable
+  if type(enable) == "function" then
+    enable(false, { bufnr = bufnr })
+    return
+  end
+  local disable = vim.diagnostic.disable
+  if type(disable) == "function" then
+    disable(bufnr)
+  end
+end
+
+local function first_nonfloating_win(exclude)
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if win ~= exclude and vim.api.nvim_win_is_valid(win) then
+      local cfg = vim.api.nvim_win_get_config(win)
+      if cfg.relative == "" then
+        return win
+      end
+    end
+  end
+  return nil
+end
+
+--- Window that should receive jumps out of the popup: the current window when
+--- it is not itself a float, otherwise the first regular window.
+local function anchor_window()
+  local cur = vim.api.nvim_get_current_win()
+  local cfg = vim.api.nvim_win_get_config(cur)
+  if cfg.relative == "" then
+    return cur
+  end
+  return first_nonfloating_win(nil)
+end
+
+local function task_float_token(win)
+  if not vim.api.nvim_win_is_valid(win) then
+    return nil
+  end
+  local ok, value = pcall(vim.api.nvim_win_get_var, win, "via_task_float")
+  if not ok then
+    return nil
+  end
+  return value
+end
+
+local function win_var(win, name)
+  local ok, value = pcall(vim.api.nvim_win_get_var, win, name)
+  if not ok then
+    return nil
+  end
+  return value
+end
+
+--- Put the float back on the directory captured before it opened. Global `:cd`
+--- is undone first; a window-local directory (rooter / 'autochdir') is then
+--- pointed at the project. Skips `chdir` when already correct so DirChanged
+--- does not loop.
+local function pin_task_float_cwd(float_win, project_dir, global_dir)
+  if not vim.api.nvim_win_is_valid(float_win) then
+    return
+  end
+  project_dir = normalize_dir(project_dir)
+  global_dir = normalize_dir(global_dir)
+  if project_dir == "" or global_dir == "" then
+    return
+  end
+  if not dirs_match(global_cwd(), global_dir) then
+    pcall(vim.fn.chdir, global_dir, "global")
+  end
+  vim.api.nvim_win_call(float_win, function()
+    if not dirs_match(vim.fn.getcwd(), project_dir) then
+      pcall(vim.fn.chdir, project_dir, "window")
+    end
+  end)
+end
+
+local function is_floating_win(win)
+  return vim.api.nvim_win_get_config(win).relative ~= ""
+end
+
+--- Ordinary editing window: not a float, and not a utility buffer (the task
+--- board is `nofile`, as are quickfix, help, and terminal windows).
+local function is_main_file_win(win, exclude)
+  if win == exclude or not vim.api.nvim_win_is_valid(win) or is_floating_win(win) then
+    return false
+  end
+  local buf = vim.api.nvim_win_get_buf(win)
+  return vim.bo[buf].buftype == ""
+end
+
+--- Largest ordinary editing window. The task popup is opened from the board
+--- split, so the previous window is that board — not where files should land.
+--- Ties go to the topmost, then leftmost window.
+local function main_file_win(exclude)
+  local best, best_area, best_row, best_col
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if is_main_file_win(win, exclude) then
+      local area = vim.api.nvim_win_get_width(win) * vim.api.nvim_win_get_height(win)
+      local pos = vim.api.nvim_win_get_position(win)
+      local row, col = pos[1], pos[2]
+      local better = not best or area > best_area
+      if best and area == best_area then
+        better = row < best_row or (row == best_row and col < best_col)
+      end
+      if better then
+        best, best_area, best_row, best_col = win, area, row, col
+      end
+    end
+  end
+  return best
+end
+
+--- Window already showing `buf`, when that window is an ordinary editing window.
+local function file_win_showing(buf, exclude)
+  for _, win in ipairs(vim.api.nvim_list_wins()) do
+    if is_main_file_win(win, exclude) and vim.api.nvim_win_get_buf(win) == buf then
+      return win
+    end
+  end
+  return nil
+end
+
+local function jump_target_win(anchor, float_win, dest_buf)
+  local existing = file_win_showing(dest_buf, float_win)
+  if existing then
+    return existing
+  end
+  local main = main_file_win(float_win)
+  if main then
+    return main
+  end
+  if anchor and anchor ~= float_win and vim.api.nvim_win_is_valid(anchor) and not is_floating_win(anchor) then
+    return anchor
+  end
+  return first_nonfloating_win(float_win)
+end
+
+--- Move `dest_buf` out of the popup into a regular window, then close the float.
+local function relocate_task_float_jump(float_win, dest_buf, cursor, anchor_win)
+  if not vim.api.nvim_buf_is_valid(dest_buf) then
+    return
+  end
+  local target = jump_target_win(anchor_win, float_win, dest_buf)
+  if not target then
+    return
+  end
+  local ok = pcall(vim.api.nvim_win_set_buf, target, dest_buf)
+  if not ok then
+    return
+  end
+  pcall(vim.api.nvim_win_set_cursor, target, cursor)
+  if vim.api.nvim_win_is_valid(float_win) then
+    vim.api.nvim_win_close(float_win, true)
+  end
+  if vim.api.nvim_win_is_valid(target) then
+    vim.api.nvim_set_current_win(target)
+  end
+end
+
+--- Diagnostics off, project cwd pinned, and buffer-replacing jumps relocated.
+--- `token` is stored on the window so a scheduled callback from a closed popup
+--- does not act on a reused window id.
+local function arm_task_float(float_win, bufnr, anchor_win, project_dir, global_dir)
+  task_float_seq = task_float_seq + 1
+  local token = task_float_seq
+  vim.api.nvim_win_set_var(float_win, "via_task_float", token)
+  vim.api.nvim_win_set_var(float_win, "via_task_project_dir", project_dir)
+  vim.api.nvim_win_set_var(float_win, "via_task_global_dir", global_dir)
+
+  disable_task_diagnostics(bufnr)
+
+  local group = vim.api.nvim_create_augroup("ViaTaskFloat" .. token, { clear = true })
+
+  local function still_this_float()
+    return vim.api.nvim_win_is_valid(float_win) and task_float_token(float_win) == token
+  end
+
+  vim.api.nvim_create_autocmd("LspAttach", {
+    group = group,
+    buffer = bufnr,
+    callback = function()
+      disable_task_diagnostics(bufnr)
+      vim.schedule(function()
+        disable_task_diagnostics(bufnr)
+      end)
+    end,
+  })
+
+  -- Scheduled so this runs after other BufEnter hooks (rooter, 'autochdir').
+  local function pin_later()
+    vim.schedule(function()
+      if not still_this_float() then
+        return
+      end
+      if vim.api.nvim_get_current_win() ~= float_win then
+        return
+      end
+      pin_task_float_cwd(float_win, project_dir, global_dir)
+    end)
+  end
+
+  vim.api.nvim_create_autocmd("BufEnter", {
+    group = group,
+    buffer = bufnr,
+    callback = pin_later,
+  })
+
+  vim.api.nvim_create_autocmd("DirChanged", {
+    group = group,
+    callback = pin_later,
+  })
+
+  vim.api.nvim_create_autocmd("BufLeave", {
+    group = group,
+    buffer = bufnr,
+    callback = function()
+      vim.schedule(function()
+        if not still_this_float() then
+          return
+        end
+        local shown = vim.api.nvim_win_get_buf(float_win)
+        if shown == bufnr or not vim.api.nvim_buf_is_valid(shown) then
+          return
+        end
+        local cursor = vim.api.nvim_win_get_cursor(float_win)
+        relocate_task_float_jump(float_win, shown, cursor, anchor_win)
+      end)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd("WinClosed", {
+    group = group,
+    pattern = tostring(float_win),
+    callback = function()
+      vim.schedule(function()
+        pcall(vim.api.nvim_del_augroup_by_id, group)
+      end)
+    end,
+  })
+
+  pin_task_float_cwd(float_win, project_dir, global_dir)
+end
+
+local function reapply_task_float(float_win, bufnr)
+  disable_task_diagnostics(bufnr)
+  local project_dir = win_var(float_win, "via_task_project_dir")
+  local global_dir = win_var(float_win, "via_task_global_dir")
+  if type(project_dir) == "string" and type(global_dir) == "string" then
+    pin_task_float_cwd(float_win, project_dir, global_dir)
+  end
+end
+
 --- Open `path` in a centered floating window. Uses `bufadd` + `bufload` so `:w`
 --- persists to disk. The buffer is unlisted and wiped when the window closes
---- (`bufhidden=wipe`). Reopening the same path while its float is visible
---- refocuses the existing window instead of creating a duplicate buffer.
+--- (`bufhidden=wipe`). Diagnostics stay off. The float keeps the working
+--- directory from before it opened, so `gf` / `gd` resolve against the project.
+--- A jump that replaces the float's buffer closes the popup and shows that
+--- buffer in the main editing window (not the task-board split). Reopening the
+--- same path while its float is visible refocuses the existing window instead
+--- of creating a duplicate buffer.
 local function open_task_float(path)
   path = vim.fn.fnamemodify(path, ":p")
 
@@ -669,6 +956,7 @@ local function open_task_float(path)
   local existing_win = task_popup_win(bufnr)
   if existing_win then
     vim.api.nvim_set_current_win(existing_win)
+    reapply_task_float(existing_win, bufnr)
     return
   end
 
@@ -682,8 +970,13 @@ local function open_task_float(path)
   vim.bo[bufnr].bufhidden = "wipe"
   vim.bo[bufnr].swapfile = false
 
+  -- Capture before open: BufEnter during nvim_open_win may cd to the task file.
+  local anchor_win = anchor_window()
+  local project_dir = normalize_dir(vim.fn.getcwd())
+  local global_dir = normalize_dir(global_cwd())
+
   local width, height, row, col = task_float_dims()
-  vim.api.nvim_open_win(bufnr, true, {
+  local float_win = vim.api.nvim_open_win(bufnr, true, {
     relative = "editor",
     width = width,
     height = height,
@@ -694,6 +987,7 @@ local function open_task_float(path)
   })
 
   apply_task_markdown_filetype(bufnr)
+  arm_task_float(float_win, bufnr, anchor_win, project_dir, global_dir)
 end
 
 --- Open the task Markdown file in a centered floating window (<CR> / Ctrl+click
