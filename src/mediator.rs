@@ -19,6 +19,7 @@ use crate::editor::{self, EditorState};
 use crate::event::{AgentEvent, EditorEvent, Event, UiCommand, UiEvent};
 use crate::lsp_bridge;
 use crate::nvim;
+use crate::session;
 
 use crate::config::{ORCHESTRATOR_AGENT_ID, PRIMARY_PTY_AGENT_ID};
 
@@ -141,6 +142,36 @@ impl Mediator {
             symbol_repo,
             symbol_cache_pending: None,
             symbol_cache_write: None,
+        }
+    }
+
+    fn apply_reloaded_config(&mut self, user: crate::config::UserConfig) {
+        let orchestration_enabled = user.orchestration_enabled();
+        if self.app.user.auto_approve != user.auto_approve {
+            self.acp_runtime
+                .set_auto_approve(AutoApprovePolicy::from_config(&user.auto_approve));
+        }
+        let orchestration_changed = self.app.launch.orchestration_enabled != orchestration_enabled;
+        self.app.user = user;
+        if !orchestration_changed {
+            return;
+        }
+        // `via agent spawn` reads the manifest, so the in-memory flag changes
+        // only after that write succeeds. A later reload retries while they differ.
+        match session::set_orchestration_enabled(orchestration_enabled) {
+            Ok(()) => {
+                self.app.launch.orchestration_enabled = orchestration_enabled;
+                info!(
+                    orchestration_enabled,
+                    "updated orchestration availability from via.conf"
+                );
+            }
+            Err(error) => {
+                warn!(
+                    %error,
+                    "failed to persist orchestration flag after config reload; keeping previous value"
+                );
+            }
         }
     }
 
@@ -353,6 +384,9 @@ impl Mediator {
                             }
                         });
                     }
+                }
+                Event::Ui(UiEvent::ConfigReloaded { user }) => {
+                    self.apply_reloaded_config(*user);
                 }
                 Event::Editor(event) => self.apply_editor_event(event).await,
                 Event::Agent(AgentEvent::OutputChunk(chunk)) => {
@@ -1011,6 +1045,7 @@ mod tests {
                 working_directory: PathBuf::from("/tmp"),
                 orchestration_enabled: false,
             },
+            cli_overrides: crate::config::ConfigOverrides::default(),
         }
     }
 
@@ -1372,5 +1407,58 @@ mod tests {
             serde_json::from_str(err.trim_start_matches("@tool_result ").trim()).unwrap();
         assert_eq!(parsed_err["ok"], false);
         assert!(parsed_err["error"].as_str().unwrap().contains("boom"));
+    }
+
+    #[test]
+    fn reloaded_config_updates_auto_approve_and_orchestration() {
+        let _lock = crate::test_support::env_lock();
+        let dir = crate::test_support::temp_dir("mediator-config-reload");
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        struct DataHomeGuard(Option<std::ffi::OsString>);
+        impl Drop for DataHomeGuard {
+            fn drop(&mut self) {
+                // SAFETY: paired with the set below, still under `env_lock`.
+                unsafe {
+                    match self.0.take() {
+                        Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                        None => std::env::remove_var("XDG_DATA_HOME"),
+                    }
+                }
+            }
+        }
+        // SAFETY: serialized by env_lock; `DataHomeGuard` restores it.
+        unsafe { std::env::set_var("XDG_DATA_HOME", &dir) };
+        let _data_home = DataHomeGuard(previous);
+
+        let mut mediator = Mediator::new(test_app());
+        assert!(!mediator.app.launch.orchestration_enabled);
+        let mut user = mediator.app.user.clone();
+        user.agent_command = Some("opencode".to_string());
+        user.auto_approve = crate::config::AutoApproveConfig {
+            commands: vec!["echo".to_string()],
+            kinds: Vec::new(),
+        };
+
+        // No instance manifest yet: other settings apply, the spawn flag stays put.
+        mediator.apply_reloaded_config(user.clone());
+        assert!(!mediator.app.launch.orchestration_enabled);
+        assert_eq!(mediator.app.user.agent_command.as_deref(), Some("opencode"));
+        assert!(mediator.acp_runtime.auto_approve().allows(
+            crate::acp_auto_approve::PermissionContext {
+                command: Some("echo"),
+                tool_kind: None,
+            }
+        ));
+
+        let _session = crate::session::SessionGuard::create(&mediator.app).unwrap();
+        mediator.apply_reloaded_config(user);
+        assert!(mediator.app.launch.orchestration_enabled);
+        let manifest: crate::session::SessionManifest = serde_json::from_str(
+            &std::fs::read_to_string(crate::session::manifest_path()).unwrap(),
+        )
+        .unwrap();
+        assert!(manifest.orchestration_enabled);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

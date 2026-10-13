@@ -83,6 +83,20 @@ pub fn manifest_path() -> PathBuf {
     config::instance_dir(std::process::id()).join(MANIFEST_BASENAME)
 }
 
+/// Rewrite `orchestration_enabled` on this process's instance manifest.
+///
+/// `via agent spawn` reads the flag from the manifest, so a live `via.conf`
+/// reload has to publish the new value for already-running sessions.
+pub fn set_orchestration_enabled(enabled: bool) -> Result<()> {
+    let path = manifest_path();
+    let mut manifest = read_manifest(&path)?;
+    if manifest.orchestration_enabled == enabled {
+        return Ok(());
+    }
+    manifest.orchestration_enabled = enabled;
+    write_atomic_json(&path, &manifest)
+}
+
 impl Drop for SessionGuard {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.instance_dir);
@@ -196,5 +210,61 @@ mod tests {
         let encoded = serde_json::to_string(&manifest).unwrap();
         let decoded: SessionManifest = serde_json::from_str(&encoded).unwrap();
         assert_eq!(manifest, decoded);
+    }
+
+    #[test]
+    fn set_orchestration_enabled_rewrites_manifest() {
+        let _lock = crate::test_support::env_lock();
+        let dir = crate::test_support::temp_dir("session-orch");
+        let _data_home = DataHomeGuard::set(&dir);
+
+        let path = manifest_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let manifest = SessionManifest {
+            pid: std::process::id(),
+            cwd: PathBuf::from("/repo"),
+            nvim_socket: PathBuf::from("/tmp/via-nvim.sock"),
+            editor_socket: PathBuf::from("/tmp/via-editor.sock"),
+            agents_dir: PathBuf::from("/tmp/agents"),
+            orchestration_enabled: false,
+            workspace_id: Some("repo".to_string()),
+            board_id: Some("default".to_string()),
+            started_at_unix: Some(7),
+        };
+        write_atomic_json(&path, &manifest).unwrap();
+
+        set_orchestration_enabled(true).unwrap();
+        let updated = read_manifest(&path).unwrap();
+        assert!(updated.orchestration_enabled);
+        assert_eq!(updated.cwd, manifest.cwd);
+        assert_eq!(updated.board_id.as_deref(), Some("default"));
+        assert_eq!(updated.started_at_unix, Some(7));
+
+        set_orchestration_enabled(true).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    struct DataHomeGuard(Option<std::ffi::OsString>);
+
+    impl DataHomeGuard {
+        fn set(dir: &Path) -> Self {
+            let previous = std::env::var_os("XDG_DATA_HOME");
+            // SAFETY: caller holds `env_lock` for the test.
+            unsafe { std::env::set_var("XDG_DATA_HOME", dir) };
+            Self(previous)
+        }
+    }
+
+    impl Drop for DataHomeGuard {
+        fn drop(&mut self) {
+            // SAFETY: paired with `set`, still under `env_lock`.
+            unsafe {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+                    None => std::env::remove_var("XDG_DATA_HOME"),
+                }
+            }
+        }
     }
 }

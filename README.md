@@ -281,6 +281,14 @@ syntax. Precedence is:
 CLI flags > environment variables > via.conf > built-in defaults
 ```
 
+A running session reloads `via.conf` within about a second after the file changes. The new
+contents must stay the same across two reads, so a save that is still being written is left
+alone. CLI flags and environment variables still override the file. A parse error leaves the
+previous config in place.
+`scroll_sensitivity`, `agent_pane_cols`, `review_backend`, `acp_agent`, `[agents.*]` presets, and
+`[auto_approve]` apply to the live session. `nvim` and `agent` are stored, but the editor and the
+primary agent pane keep the commands they were launched with until via restarts.
+
 Example config:
 
 ```toml

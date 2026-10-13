@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::env;
-use std::path::PathBuf;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result as AnyResult};
 use serde::Deserialize;
+use tracing::warn;
 
 /// Ensures the embedded Lua files are written to disk exactly once per process.
 static LUA_ASSETS_INITIALIZED: OnceLock<()> = OnceLock::new();
@@ -98,7 +100,7 @@ pub struct AutoApproveConfig {
 }
 
 /// Durable / preference surface (`via.conf` + CLI/env preference overrides).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct UserConfig {
     pub nvim_command: String,
     /// Primary interactive agent (always launched as a PTY pane; must not end with `acp`).
@@ -143,6 +145,31 @@ pub struct AppContext {
     pub user: UserConfig,
     pub paths: RuntimePaths,
     pub launch: LaunchContext,
+    /// CLI flags from process start. A `via.conf` reload keeps this layer above the file.
+    pub cli_overrides: ConfigOverrides,
+}
+
+/// Bytes last observed for `via.conf`. `Unread` forces the next poll to resolve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SeenConfigFile {
+    Unread,
+    Absent,
+    Present(Vec<u8>),
+}
+
+/// Watches `via.conf` and re-resolves it against the CLI overrides captured at startup.
+///
+/// A new version is applied only after two polls see the same bytes, so a save
+/// that is still being written is not applied early.
+#[derive(Debug)]
+pub(crate) struct ConfigFileWatcher {
+    path: Option<PathBuf>,
+    cli: ConfigOverrides,
+    /// Last version that was resolved. Starts unread so the first stable sample is resolved.
+    seen: SeenConfigFile,
+    /// Candidate version waiting for a second identical read.
+    pending: Option<SeenConfigFile>,
+    read_error_logged: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -490,28 +517,9 @@ impl RuntimePaths {
 
 impl AppContext {
     pub fn load(cli: ConfigOverrides) -> AnyResult<Self> {
-        let prefs = resolve_user_config(cli)?;
-        let agent_command = prefs.agent_command.clone();
-        if let Some(agent) = agent_command.as_deref() {
-            reject_acp_primary_agent(agent)?;
-        }
-        let orchestration_enabled = agent_command
-            .as_deref()
-            .map(|agent| resolve_agent_launch(agent, prefs.acp_agent.as_deref()).acp)
-            .unwrap_or(false);
-
+        let user = try_user_config(resolve_user_config(cli.clone())?)?;
+        let orchestration_enabled = user.orchestration_enabled();
         let working_directory = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-
-        let user = UserConfig {
-            nvim_command: prefs.nvim_command,
-            agent_command,
-            acp_agent: prefs.acp_agent,
-            agent_pane_cols: prefs.agent_pane_cols,
-            review_backend: prefs.review_backend,
-            scroll_sensitivity: prefs.scroll_sensitivity,
-            agent_presets: merge_agent_presets(prefs.agent_presets),
-            auto_approve: prefs.auto_approve,
-        };
 
         Ok(Self {
             user,
@@ -520,11 +528,35 @@ impl AppContext {
                 working_directory,
                 orchestration_enabled,
             },
+            cli_overrides: cli,
         })
     }
 }
 
+fn try_user_config(prefs: ResolvedPrefs) -> AnyResult<UserConfig> {
+    if let Some(agent) = prefs.agent_command.as_deref() {
+        reject_acp_primary_agent(agent)?;
+    }
+    Ok(UserConfig {
+        nvim_command: prefs.nvim_command,
+        agent_command: prefs.agent_command,
+        acp_agent: prefs.acp_agent,
+        agent_pane_cols: prefs.agent_pane_cols,
+        review_backend: prefs.review_backend,
+        scroll_sensitivity: prefs.scroll_sensitivity,
+        agent_presets: merge_agent_presets(prefs.agent_presets),
+        auto_approve: prefs.auto_approve,
+    })
+}
+
 impl UserConfig {
+    /// True when spawned helpers can launch in ACP form for this user config.
+    pub fn orchestration_enabled(&self) -> bool {
+        self.agent_command
+            .as_deref()
+            .is_some_and(|agent| resolve_agent_launch(agent, self.acp_agent.as_deref()).acp)
+    }
+
     /// Fill missing spawn `role` / `command` from `[agents.<id>]` presets.
     pub fn apply_spawn_preset(
         &self,
@@ -679,11 +711,98 @@ fn config_file_overrides() -> AnyResult<ConfigOverrides> {
         return Ok(ConfigOverrides::default());
     }
 
-    let contents = std::fs::read_to_string(&path)
+    let bytes = std::fs::read(&path)
         .with_context(|| format!("failed to read config file {}", path.display()))?;
-    let config: FileConfig = toml::from_str(&contents)
-        .with_context(|| format!("failed to parse config file {}", path.display()))?;
+    config_overrides_from_bytes(&bytes)
+        .with_context(|| format!("failed to parse config file {}", path.display()))
+}
+
+fn config_overrides_from_bytes(bytes: &[u8]) -> AnyResult<ConfigOverrides> {
+    let contents = std::str::from_utf8(bytes).context("config file is not valid UTF-8")?;
+    let config: FileConfig = toml::from_str(contents).context("failed to parse config file")?;
     Ok(config.into())
+}
+
+fn read_config_file(path: Option<&Path>) -> std::io::Result<SeenConfigFile> {
+    let Some(path) = path else {
+        return Ok(SeenConfigFile::Absent);
+    };
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(SeenConfigFile::Present(bytes)),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(SeenConfigFile::Absent),
+        Err(error) => Err(error),
+    }
+}
+
+impl ConfigFileWatcher {
+    pub(crate) fn new(cli: ConfigOverrides) -> Self {
+        Self::with_path(config_file_path(), cli)
+    }
+
+    pub(crate) fn with_path(path: Option<PathBuf>, cli: ConfigOverrides) -> Self {
+        Self {
+            path,
+            cli,
+            seen: SeenConfigFile::Unread,
+            pending: None,
+            read_error_logged: false,
+        }
+    }
+
+    /// Returns a newly resolved config when the file bytes changed and parsed.
+    ///
+    /// The new bytes must be seen twice in a row. A read or parse error keeps
+    /// the previous config. The same failing bytes are reported once.
+    pub(crate) fn poll(&mut self) -> Option<UserConfig> {
+        let observed = match read_config_file(self.path.as_deref()) {
+            Ok(seen) => {
+                self.read_error_logged = false;
+                seen
+            }
+            Err(error) => {
+                if !self.read_error_logged {
+                    warn!(%error, "failed to read via config file");
+                    self.read_error_logged = true;
+                }
+                return None;
+            }
+        };
+        if observed == self.seen {
+            self.pending = None;
+            return None;
+        }
+        if self.pending.as_ref() != Some(&observed) {
+            self.pending = Some(observed);
+            return None;
+        }
+
+        match self.resolve(&observed) {
+            Ok(user) => {
+                self.seen = observed;
+                self.pending = None;
+                Some(user)
+            }
+            Err(error) => {
+                warn!(%error, "ignored via.conf change");
+                self.seen = observed;
+                self.pending = None;
+                None
+            }
+        }
+    }
+
+    fn resolve(&self, seen: &SeenConfigFile) -> AnyResult<UserConfig> {
+        let file = match seen {
+            SeenConfigFile::Present(bytes) => config_overrides_from_bytes(bytes)?,
+            SeenConfigFile::Absent | SeenConfigFile::Unread => ConfigOverrides::default(),
+        };
+        let env = ConfigOverrides::from_env();
+        try_user_config(resolve_user_config_from_sources(
+            self.cli.clone(),
+            env,
+            file,
+        ))
+    }
 }
 
 fn config_file_path() -> Option<PathBuf> {
@@ -1391,5 +1510,199 @@ model = "composer-2.5"
             err.to_string()
                 .contains("primary agent must be a PTY command")
         );
+    }
+
+    struct ConfigEnvGuard {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl ConfigEnvGuard {
+        fn clear() -> Self {
+            let keys = [
+                "VIA_NVIM",
+                "VIA_AGENT",
+                "VIA_ACP_AGENT",
+                "VIA_AGENT_PANE_COLS",
+                "VIA_REVIEW_BACKEND",
+                "VIA_SCROLL_SENSITIVITY",
+            ];
+            let saved = keys
+                .into_iter()
+                .map(|key| (key, std::env::var_os(key)))
+                .collect();
+            for key in keys {
+                // SAFETY: caller holds `env_lock` for the test.
+                unsafe { std::env::remove_var(key) };
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for ConfigEnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                // SAFETY: paired with `clear`, still under `env_lock`.
+                unsafe {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    fn with_cleared_config_env<T>(f: impl FnOnce() -> T) -> T {
+        let _lock = crate::test_support::env_lock();
+        let _guard = ConfigEnvGuard::clear();
+        f()
+    }
+
+    /// Two polls: the first only records the new bytes, the second resolves them.
+    fn poll_settled(watcher: &mut ConfigFileWatcher) -> Option<UserConfig> {
+        assert!(watcher.poll().is_none());
+        watcher.poll()
+    }
+
+    #[test]
+    fn reload_picks_up_scroll_and_auto_approve_changes() {
+        with_cleared_config_env(|| {
+            let dir = crate::test_support::temp_dir("config-reload");
+            let path = dir.join("via.conf");
+            std::fs::write(
+                &path,
+                "scroll_sensitivity = 2.0\n\n[auto_approve]\ncommands = [\"echo\"]\n",
+            )
+            .unwrap();
+
+            let mut watcher =
+                ConfigFileWatcher::with_path(Some(path.clone()), ConfigOverrides::default());
+            let first = poll_settled(&mut watcher).expect("initial file");
+            assert_eq!(first.scroll_sensitivity, 2.0);
+            assert_eq!(first.auto_approve.commands, vec!["echo".to_string()]);
+            assert!(watcher.poll().is_none());
+
+            std::fs::write(
+                &path,
+                "scroll_sensitivity = 4.0\n\n[auto_approve]\ncommands = [\"echo\", \"printf\"]\n",
+            )
+            .unwrap();
+            let next = poll_settled(&mut watcher).expect("updated file");
+            assert_eq!(next.scroll_sensitivity, 4.0);
+            assert_eq!(
+                next.auto_approve.commands,
+                vec!["echo".to_string(), "printf".to_string()]
+            );
+            assert!(watcher.poll().is_none());
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn reload_keeps_cli_override_above_the_file() {
+        with_cleared_config_env(|| {
+            let dir = crate::test_support::temp_dir("config-reload-cli");
+            let path = dir.join("via.conf");
+            std::fs::write(&path, "agent = \"from-file\"\nscroll_sensitivity = 2.0\n").unwrap();
+            let cli = ConfigOverrides {
+                agent: Some("from-cli".to_string()),
+                ..ConfigOverrides::default()
+            };
+            let mut watcher = ConfigFileWatcher::with_path(Some(path.clone()), cli);
+            let first = poll_settled(&mut watcher).expect("initial file");
+            assert_eq!(first.agent_command.as_deref(), Some("from-cli"));
+            assert_eq!(first.scroll_sensitivity, 2.0);
+
+            std::fs::write(&path, "agent = \"other\"\nscroll_sensitivity = 4.0\n").unwrap();
+            let next = poll_settled(&mut watcher).expect("updated file");
+            assert_eq!(next.agent_command.as_deref(), Some("from-cli"));
+            assert_eq!(next.scroll_sensitivity, 4.0);
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn reload_ignores_invalid_file_until_it_parses() {
+        with_cleared_config_env(|| {
+            let dir = crate::test_support::temp_dir("config-reload-invalid");
+            let path = dir.join("via.conf");
+            std::fs::write(&path, "scroll_sensitivity = 2.0\n").unwrap();
+            let mut watcher =
+                ConfigFileWatcher::with_path(Some(path.clone()), ConfigOverrides::default());
+            assert_eq!(
+                poll_settled(&mut watcher)
+                    .expect("valid")
+                    .scroll_sensitivity,
+                2.0
+            );
+
+            std::fs::write(&path, "scroll_sensitivity = [\n").unwrap();
+            assert!(poll_settled(&mut watcher).is_none());
+            assert!(watcher.poll().is_none());
+
+            std::fs::write(&path, "scroll_sensitivity = 4.0\n").unwrap();
+            assert_eq!(
+                poll_settled(&mut watcher)
+                    .expect("repaired")
+                    .scroll_sensitivity,
+                4.0
+            );
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn reload_falls_back_to_defaults_when_file_disappears() {
+        with_cleared_config_env(|| {
+            let dir = crate::test_support::temp_dir("config-reload-delete");
+            let path = dir.join("via.conf");
+            std::fs::write(&path, "scroll_sensitivity = 2.0\n").unwrap();
+            let mut watcher =
+                ConfigFileWatcher::with_path(Some(path.clone()), ConfigOverrides::default());
+            assert_eq!(
+                poll_settled(&mut watcher)
+                    .expect("present")
+                    .scroll_sensitivity,
+                2.0
+            );
+
+            std::fs::remove_file(&path).unwrap();
+            let next = poll_settled(&mut watcher).expect("deleted");
+            assert_eq!(next.scroll_sensitivity, DEFAULT_SCROLL_SENSITIVITY);
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
+    }
+
+    #[test]
+    fn reload_rejects_acp_primary_agent_and_keeps_waiting_for_a_valid_file() {
+        with_cleared_config_env(|| {
+            let dir = crate::test_support::temp_dir("config-reload-acp");
+            let path = dir.join("via.conf");
+            std::fs::write(&path, "agent = \"opencode\"\nscroll_sensitivity = 2.0\n").unwrap();
+            let mut watcher =
+                ConfigFileWatcher::with_path(Some(path.clone()), ConfigOverrides::default());
+            assert_eq!(
+                poll_settled(&mut watcher)
+                    .expect("pty agent")
+                    .agent_command
+                    .as_deref(),
+                Some("opencode")
+            );
+
+            std::fs::write(&path, "agent = \"opencode acp\"\n").unwrap();
+            assert!(poll_settled(&mut watcher).is_none());
+
+            std::fs::write(&path, "agent = \"opencode\"\nscroll_sensitivity = 5.0\n").unwrap();
+            let next = poll_settled(&mut watcher).expect("repaired");
+            assert_eq!(next.agent_command.as_deref(), Some("opencode"));
+            assert_eq!(next.scroll_sensitivity, 5.0);
+            assert!(next.orchestration_enabled());
+
+            let _ = std::fs::remove_dir_all(dir);
+        });
     }
 }

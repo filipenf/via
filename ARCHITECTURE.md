@@ -255,6 +255,17 @@ Startup wiring is split into three ownership-aligned pieces bundled as
 - **`LaunchContext`** — process launch wiring: working directory and derived
   `orchestration_enabled`.
 
+The GUI polls `via.conf` and applies updates to the live session after the same
+bytes are seen on two polls in a row. That waits out a save that is still
+being written.
+`scroll_sensitivity`, `agent_pane_cols`, `review_backend`, `acp_agent`, spawn
+presets, and `auto_approve` take effect without a restart. `nvim` and `agent`
+update the stored config only; processes that are already running keep their
+launch commands. When `orchestration_enabled` changes, the instance manifest is
+rewritten so `via agent spawn` sees the new value. A parse error leaves the
+previous config in place. CLI flags and environment variables still win over
+the file on each reload.
+
 The primary `agent` command must be a PTY launch (not ending with `acp`).
 `orchestration_enabled` reflects whether spawned helpers can resolve to ACP
 (known-agent table or `acp_agent` override). Spawn presets (`[agents.orchestrator]`,

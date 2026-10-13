@@ -405,6 +405,15 @@ impl AcpRuntime {
         }
     }
 
+    pub fn set_auto_approve(&mut self, auto_approve: AutoApprovePolicy) {
+        self.auto_approve = auto_approve;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn auto_approve(&self) -> &AutoApprovePolicy {
+        &self.auto_approve
+    }
+
     /// Arc handle to the sessions map — used by tests and by the free
     /// [`deliver_if_ready`] function when called from a connect task.
     #[allow(dead_code)]

@@ -63,6 +63,10 @@ pub enum UiEvent {
         agent_id: String,
         action: AcpHandshakeAction,
     },
+    /// `via.conf` changed and parsed. The mediator replaces its user config.
+    ConfigReloaded {
+        user: Box<crate::config::UserConfig>,
+    },
     Resize {
         columns: u16,
         rows: u16,

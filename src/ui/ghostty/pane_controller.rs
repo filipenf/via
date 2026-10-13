@@ -94,6 +94,12 @@ impl TerminalPaneController {
         }
     }
 
+    pub(super) fn set_scroll_sensitivity(&mut self, scroll_sensitivity: f32) {
+        if scroll_sensitivity.is_finite() && scroll_sensitivity > 0.0 {
+            self.scroll_sensitivity = scroll_sensitivity;
+        }
+    }
+
     pub(super) fn role(&self) -> &PaneRole {
         &self.role
     }

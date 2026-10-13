@@ -24,7 +24,9 @@ use crate::acp_tui::{
     AcpTuiBridge, HostToTui, TranscriptKind, TuiToHost, resolve_acp_tui_bin, socket_path_for_agent,
     spawn_env_and_args,
 };
-use crate::config::{AppContext, PRIMARY_PTY_AGENT_ID, ReviewBackend};
+use crate::config::{
+    AppContext, ConfigFileWatcher, PRIMARY_PTY_AGENT_ID, ReviewBackend, UserConfig,
+};
 use crate::event::{AcpHandshakeAction, AcpModalKind, EditorEvent, Event, UiCommand, UiEvent};
 use crate::mediator::EventSender;
 use crate::pty::{CoalescedOutputNotifier, OutputNotifier};
@@ -66,6 +68,7 @@ const REPEATED_ARROW_REDRAW_INTERVAL: Duration = Duration::from_millis(24);
 const INPUT_LAG_WARN_THRESHOLD: Duration = Duration::from_millis(50);
 const RENDER_WARN_THRESHOLD: Duration = Duration::from_millis(30);
 const THEME_POLL_INTERVAL: Duration = Duration::from_millis(750);
+const CONFIG_POLL_INTERVAL: Duration = Duration::from_millis(400);
 
 pub struct GhosttyUi {
     app: AppContext,
@@ -163,6 +166,10 @@ struct WinitGhosttyApp {
     skip_background_drain_once: bool,
     last_arrow_repeat_at: Option<Instant>,
     next_theme_poll_at: Instant,
+    next_config_poll_at: Instant,
+    config_watcher: ConfigFileWatcher,
+    /// Resolved config the mediator has not accepted yet.
+    pending_config_reload: Option<UserConfig>,
     error: Option<anyhow::Error>,
     file_index: ReferenceIndex,
 }
@@ -423,6 +430,7 @@ impl WinitGhosttyApp {
         );
 
         let file_index = ReferenceIndex::default();
+        let config_watcher = ConfigFileWatcher::new(ui.app.cli_overrides.clone());
         Ok(Self {
             app: ui.app,
             events: ui.events,
@@ -461,6 +469,9 @@ impl WinitGhosttyApp {
             skip_background_drain_once: false,
             last_arrow_repeat_at: None,
             next_theme_poll_at: Instant::now(),
+            next_config_poll_at: Instant::now(),
+            config_watcher,
+            pending_config_reload: None,
             error: None,
             file_index,
         })
@@ -1636,6 +1647,7 @@ impl WinitGhosttyApp {
             self.dirty |= review_pane.drain_output();
         }
         self.dirty |= self.reload_theme_if_needed()?;
+        self.reload_config_if_needed();
         self.dirty |= self.forward_ui_commands()?;
         self.dirty |= self.poll_acp_tui_bridges()?;
         self.dirty |= self.flush_pending_agent_write()?;
@@ -1669,6 +1681,78 @@ impl WinitGhosttyApp {
         self.force_redraw = true;
         info!("terminal theme changed; reloaded Ghostty colors");
         Ok(true)
+    }
+
+    fn reload_config_if_needed(&mut self) {
+        let now = Instant::now();
+        if now < self.next_config_poll_at {
+            return;
+        }
+        self.next_config_poll_at = now + CONFIG_POLL_INTERVAL;
+
+        if let Some(user) = self.config_watcher.poll() {
+            self.apply_polled_user_config(user);
+            return;
+        }
+        if let Some(user) = self.pending_config_reload.clone() {
+            self.deliver_config_reload(user);
+        }
+    }
+
+    fn apply_polled_user_config(&mut self, user: UserConfig) {
+        let orchestration_enabled = user.orchestration_enabled();
+        let unchanged =
+            user == self.app.user && orchestration_enabled == self.app.launch.orchestration_enabled;
+        if unchanged {
+            if self.pending_config_reload.is_some() {
+                self.deliver_config_reload(user);
+            }
+            return;
+        }
+
+        if self.app.user.nvim_command != user.nvim_command {
+            info!(
+                command = %user.nvim_command,
+                "nvim command changed in via.conf; restart via to launch the editor with it"
+            );
+        }
+        if self.app.user.agent_command != user.agent_command {
+            info!(
+                command = user.agent_command.as_deref().unwrap_or("(unset)"),
+                "agent command changed in via.conf; restart via to launch the primary pane with it"
+            );
+        }
+        if self.app.user.scroll_sensitivity != user.scroll_sensitivity {
+            let sensitivity = user.scroll_sensitivity;
+            for pane in &mut self.panes {
+                if let Some(pane) = pane.as_terminal_mut() {
+                    pane.set_scroll_sensitivity(sensitivity);
+                }
+            }
+            if let Some(review_pane) = &mut self.review_pane {
+                review_pane.set_scroll_sensitivity(sensitivity);
+            }
+        }
+
+        self.app.user = user.clone();
+        self.app.launch.orchestration_enabled = orchestration_enabled;
+        self.relayout();
+        self.deliver_config_reload(user);
+    }
+
+    fn deliver_config_reload(&mut self, user: UserConfig) {
+        let event = Event::Ui(UiEvent::ConfigReloaded {
+            user: Box::new(user.clone()),
+        });
+        if self.events.try_send(event) {
+            self.pending_config_reload = None;
+            info!("reloaded via.conf");
+            return;
+        }
+        if self.pending_config_reload.is_none() {
+            warn!("config reload is waiting for the mediator");
+        }
+        self.pending_config_reload = Some(user);
     }
 
     fn broadcast_acp_tui_appearance(&mut self) {
@@ -2870,6 +2954,7 @@ mod tests {
                 working_directory: PathBuf::from("/repo"),
                 orchestration_enabled: false,
             },
+            cli_overrides: crate::config::ConfigOverrides::default(),
         };
         let args = nvim_args(&app);
 
