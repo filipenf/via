@@ -37,7 +37,7 @@ pub enum TaskCommand {
     Create {
         /// Task title.
         title: String,
-        /// Optional stable id (auto-generated 4-char opaque id when omitted).
+        /// Optional stable id, at most 16 characters
         #[arg(long)]
         id: Option<String>,
         /// Initial assignee.
@@ -522,7 +522,7 @@ fn task_status_label(status: TaskStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use crate::cli::{Cli, Command};
     use crate::test_support::{temp_dir, write_session_manifest};
@@ -620,6 +620,30 @@ mod tests {
                 && blocked_by.is_empty()
                 && body == "via task subcommands"
         ));
+    }
+
+    #[test]
+    fn task_create_id_help_states_length_limit() {
+        let mut cmd = Cli::command();
+        let create = cmd
+            .find_subcommand_mut("task")
+            .unwrap()
+            .find_subcommand_mut("create")
+            .unwrap();
+        let help = create
+            .get_arguments()
+            .find(|arg| arg.get_id() == "id")
+            .unwrap()
+            .get_help()
+            .unwrap()
+            .to_string();
+        assert!(
+            help.contains(&format!(
+                "at most {} characters",
+                crate::task_store::MAX_TASK_ID_LEN
+            )),
+            "{help}"
+        );
     }
 
     #[test]

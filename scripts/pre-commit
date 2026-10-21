@@ -1,0 +1,16 @@
+#!/bin/sh
+# Blocking CI checks: fmt, clippy, Rust tests, Neovim Lua tests.
+# Release build and benchmarks stay out of the commit path.
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+run() {
+  echo "pre-commit: $*"
+  "$@"
+}
+
+run cargo fmt -- --check
+run ./scripts/test-nvim.sh
+run cargo clippy -- -D warnings
+run cargo test --locked

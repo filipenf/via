@@ -124,6 +124,14 @@ tested directly; board actions and the task-body float are tested with the
 command runner (`M.run`) stubbed, so no real `via` binary or live session is needed.
 CI runs this as the `nvim lua tests` job.
 
+`scripts/pre-commit` runs those checks before a commit: `cargo fmt -- --check`,
+the Neovim Lua tests, `cargo clippy -- -D warnings`, and `cargo test --locked`.
+Enable it once per clone:
+
+```sh
+mise pre-commit
+```
+
 We use:
 
 - `rustfmt.toml` at the root (edition + a few style choices).

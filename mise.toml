@@ -51,3 +51,10 @@ clean = { run = "cargo clean", description = "Remove target/ artifacts" }
 
 # One-time (or refresh) tool installation for the project
 setup = { run = "mise install", description = "Install pinned tools from mise.toml (rust, zig, etc.)" }
+
+# Link scripts/pre-commit into this clone. Once per clone.
+"pre-commit" = { run = """
+mkdir -p .git/hooks
+ln -sfn ../../scripts/pre-commit .git/hooks/pre-commit
+echo "installed .git/hooks/pre-commit -> scripts/pre-commit"
+""", description = "Install the git pre-commit hook (fmt, clippy, tests)" }

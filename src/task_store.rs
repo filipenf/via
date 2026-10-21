@@ -114,6 +114,9 @@ pub fn create_task(tasks_dir: &Path, input: CreateTask) -> Result<Task> {
             if trimmed.is_empty() {
                 bail!("task id must not be empty");
             }
+            if trimmed.chars().count() > MAX_TASK_ID_LEN {
+                bail!("task id must be at most {MAX_TASK_ID_LEN} characters");
+            }
             if task_path(tasks_dir, trimmed).exists() {
                 bail!("task already exists: {trimmed}");
             }
@@ -432,14 +435,17 @@ fn matches_filter(task: &Task, filter: &TaskFilter) -> bool {
 /// Length of auto-generated task ids (base36). Kept short so the Neovim
 /// `:ViaTasks` id column (`via:` + id, width 20) never truncates them.
 const AUTO_TASK_ID_LEN: usize = 4;
+/// Explicit `--id` values must fit that same column (`via:` is 4 characters).
+/// The `via task create --id` help text states this same limit.
+pub(crate) const MAX_TASK_ID_LEN: usize = 16;
 const AUTO_TASK_ID_ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
 const AUTO_TASK_ID_ATTEMPTS: u32 = 64;
 
 /// Allocate a short opaque id that is not already used on this board.
 ///
 /// Ids are 4 base36 characters (~1.6M space). Collisions are resolved by
-/// retrying with a different mix of time/pid/attempt; explicit `--id` values
-/// are unchanged and may still be long human-readable names.
+/// retrying with a different mix of time/pid/attempt. Explicit `--id` values
+/// are checked separately and must be at most [`MAX_TASK_ID_LEN`] characters.
 fn unique_task_id(tasks_dir: &Path) -> Result<String> {
     let mut seed = now_millis()
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
@@ -618,6 +624,46 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("already exists"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn create_rejects_id_longer_than_max() {
+        let dir = temp_dir("long-id");
+        let ok_id = "a".repeat(MAX_TASK_ID_LEN);
+        let task = create_task(
+            &dir,
+            CreateTask {
+                title: "Fits".to_string(),
+                id: Some(format!("  {ok_id}  ")),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(task.id, ok_id);
+
+        let long_id = "b".repeat(MAX_TASK_ID_LEN + 1);
+        let err = create_task(
+            &dir,
+            CreateTask {
+                title: "Too long".to_string(),
+                id: Some(long_id.clone()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: None,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("at most {MAX_TASK_ID_LEN} characters")),
+            "{err}"
+        );
+        assert!(get_task(&dir, &long_id).unwrap().is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 
