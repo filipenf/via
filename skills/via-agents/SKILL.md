@@ -145,7 +145,7 @@ via task list
 via task create "<short title>" -m "<context/summary>"   # auto id like "a3kx"
 via task create "Named milestone" --id task-1
 via task claim task-1   # auto-appends "Claimed by …" (via inserts ---)
-via task update task-1 --append $'### coder\n- Done: reproduced failure\n- Next: implement fix'
+via task update task-1 --append $'- Done: reproduced failure\n- Next: implement fix'
 via task review task-1  # auto-appends handoff-to-human note
 via task done task-1    # auto-appends done note
 ```
@@ -173,11 +173,21 @@ The task body is the shared log for humans and other agents.
 `via task done` append a short `### via` note. You do not need to restate those.
 
 **Manual (you):** use `--append` for progress, blockers, decisions, and review prep.
-Send only the note text — via inserts the `---` separator before each append onto
-an existing body (do not prefix `---` yourself):
+Send only the note body. via inserts the `---` separator and a UTC heading
+`### YYYY-MM-DD HH:MM <author>`. The author is `$VIA_AGENT_ID`, or `--from` when
+you pass it. Do not write the heading or a leading `---` yourself (a leftover
+`###` line is dropped):
 
 ```bash
-via task update <id> --append $'### 2026-07-22 coder\n- Done: reproduced failure.\n- Next: implement fix.\n'
+via task update <id> --append $'- Done: reproduced failure.\n- Next: implement fix.\n'
+```
+
+via writes that as:
+
+```markdown
+### 2026-10-22 19:58 coder
+- Done: reproduced failure.
+- Next: implement fix.
 ```
 
 `-m/--body` still **replaces** the whole body; use it only when rewriting the goal/scope.

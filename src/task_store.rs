@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
-use crate::util::now_millis;
+use crate::util::{format_utc_minute, now_millis};
 
 /// Lifecycle status for a work item.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -330,6 +330,41 @@ pub fn review_task(tasks_dir: &Path, id: &str, by: Option<&str>) -> Result<Task>
 /// progress. The `---` separator is added by [`append_body_text`], not here.
 pub fn lifecycle_note(summary: &str, detail: &str) -> String {
     format!("### via\n- {summary}\n- {detail}")
+}
+
+/// Status note for `via task update --append`.
+///
+/// via owns the heading (`### YYYY-MM-DD HH:MM <author>`, UTC) so callers send
+/// only the note body. A leading `###` line is dropped — after a leading `---`
+/// — so older callers that still send a heading do not produce two.
+pub fn status_note(author: &str, body: &str, at_millis: u64) -> String {
+    let body = strip_leading_heading(&strip_leading_hr(body.trim_start_matches(['\r', '\n'])));
+    let body = body.trim_start_matches(['\r', '\n']);
+    let stamp = format_utc_minute(at_millis);
+    if body.is_empty() {
+        format!("### {stamp} {author}")
+    } else {
+        format!("### {stamp} {author}\n{body}")
+    }
+}
+
+/// Drop one leading `###` line so a caller-supplied heading is not kept next
+/// to the heading [`status_note`] writes.
+fn strip_leading_heading(chunk: &str) -> String {
+    let Some(after) = chunk.strip_prefix("###") else {
+        return chunk.to_string();
+    };
+    match after.find(['\n', '\r']) {
+        Some(i) => {
+            let rest = &after[i..];
+            rest.strip_prefix("\r\n")
+                .or_else(|| rest.strip_prefix('\n'))
+                .or_else(|| rest.strip_prefix('\r'))
+                .unwrap_or(rest)
+                .to_string()
+        }
+        None => String::new(),
+    }
 }
 
 fn write_task(tasks_dir: &Path, task: &Task) -> Result<()> {
@@ -762,6 +797,27 @@ mod tests {
         assert_eq!(
             note,
             "### via\n- Claimed by `coder`\n- status → in_progress"
+        );
+    }
+
+    #[test]
+    fn status_note_stamps_heading_and_drops_caller_heading() {
+        let at = 1_783_693_555_327;
+        assert_eq!(
+            status_note("coder", "- Done: x\n", at),
+            "### 2026-07-10 14:25 coder\n- Done: x\n"
+        );
+        assert_eq!(
+            status_note("coder", "### 2026-07-22 coder\n- Done: x\n", at),
+            "### 2026-07-10 14:25 coder\n- Done: x\n"
+        );
+        assert_eq!(
+            status_note("coder", "---\n### coder\n- Done: x", at),
+            "### 2026-07-10 14:25 coder\n- Done: x"
+        );
+        assert_eq!(
+            status_note("coder", "### coder", at),
+            "### 2026-07-10 14:25 coder"
         );
     }
 

@@ -8,7 +8,7 @@ use crate::session;
 use crate::task_delivery;
 use crate::task_store::{
     CreateTask, Task, TaskFilter, TaskStatus, TaskUpdate, claim_task, create_task, done_task,
-    get_task, list_tasks, review_task, update_task,
+    get_task, list_tasks, review_task, status_note, update_task,
 };
 use crate::workspace::{
     BoardMeta, TasksContext, active_board_id, create_board, list_boards, resolve_tasks_context,
@@ -87,9 +87,12 @@ pub enum TaskCommand {
         #[arg(long, short = 'm', allow_hyphen_values = true)]
         body: Option<String>,
         /// Append a status note to the task body. via inserts a `---` separator
-        /// before the note when the body is non-empty — send only the note text.
+        /// and a `### YYYY-MM-DD HH:MM <author>` heading — send only the note body.
         #[arg(long, allow_hyphen_values = true)]
         append: Option<String>,
+        /// Author stamped on an `--append` note. Defaults to `$VIA_AGENT_ID`, then `unknown`.
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         clear_body: bool,
         #[arg(long)]
@@ -187,6 +190,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             blocked_by,
             body,
             append,
+            from,
             clear_body,
             json,
         } => run_update(UpdateArgs {
@@ -198,6 +202,7 @@ pub fn run(command: TaskCommand) -> Result<()> {
             blocked_by,
             body,
             append,
+            from,
             clear_body,
             json,
         }),
@@ -210,6 +215,20 @@ fn self_id() -> Option<String> {
     std::env::var(agent_bus::VIA_AGENT_ID_ENV)
         .ok()
         .filter(|s| !s.is_empty())
+}
+
+/// Author for an `--append` heading: `--from`, else `$VIA_AGENT_ID`, else `unknown`.
+fn note_author(from: Option<&str>) -> Result<String> {
+    match from {
+        Some(from) => {
+            let trimmed = from.trim();
+            if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+                bail!("--from must be a single non-empty line");
+            }
+            Ok(trimmed.to_string())
+        }
+        None => Ok(self_id().unwrap_or_else(|| "unknown".to_string())),
+    }
 }
 
 fn workspace_cwd() -> Result<PathBuf> {
@@ -413,6 +432,7 @@ struct UpdateArgs {
     blocked_by: Option<Vec<String>>,
     body: Option<String>,
     append: Option<String>,
+    from: Option<String>,
     clear_body: bool,
     json: bool,
 }
@@ -420,6 +440,9 @@ struct UpdateArgs {
 fn run_update(args: UpdateArgs) -> Result<()> {
     if args.clear_assignee && args.assignee.is_some() {
         bail!("pass only one of --assignee and --clear-assignee");
+    }
+    if args.from.is_some() && args.append.is_none() {
+        bail!("--from applies only to --append");
     }
     let body_ops = [args.body.is_some(), args.append.is_some(), args.clear_body]
         .into_iter()
@@ -440,6 +463,15 @@ fn run_update(args: UpdateArgs) -> Result<()> {
         args.body.map(Some)
     };
 
+    let append = match args.append {
+        Some(text) => Some(status_note(
+            &note_author(args.from.as_deref())?,
+            &text,
+            crate::util::now_millis(),
+        )),
+        None => None,
+    };
+
     let ctx = tasks_context()?;
     let previous = get_task(&ctx.tasks_dir, &args.id)?;
     let task = update_task(
@@ -451,7 +483,7 @@ fn run_update(args: UpdateArgs) -> Result<()> {
             assignee: assignee_update,
             blocked_by: args.blocked_by,
             body: body_update,
-            append_body: args.append,
+            append_body: append,
         },
     )?;
     task_delivery::deliver_task_notifications(&task, previous.as_ref(), self_id().as_deref());
@@ -696,8 +728,10 @@ mod tests {
             "task",
             "update",
             "t1",
+            "--from",
+            "coder",
             "--append",
-            "### coder\n- Done: claimed",
+            "- Done: claimed",
         ])
         .unwrap();
         assert!(matches!(
@@ -706,11 +740,12 @@ mod tests {
                 command: TaskCommand::Update {
                     id,
                     append: Some(text),
+                    from: Some(author),
                     body: None,
                     clear_body: false,
                     ..
                 },
-            }) if id == "t1" && text == "### coder\n- Done: claimed"
+            }) if id == "t1" && author == "coder" && text == "- Done: claimed"
         ));
 
         // Status notes often start with `---`; must not be parsed as a flag.
@@ -852,5 +887,133 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("task not found"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn run_update_stamps_append_heading() {
+        let dir = temp_dir("task-append-heading");
+        let manifest_path = write_session_manifest(&dir);
+        let ctx = resolve_tasks_context(&dir).unwrap();
+        create_task(
+            &ctx.tasks_dir,
+            CreateTask {
+                title: "Ship it".to_string(),
+                id: Some("t1".to_string()),
+                assignee: None,
+                blocked_by: vec![],
+                created_by: None,
+                body: Some("Goal: ship".to_string()),
+            },
+        )
+        .unwrap();
+
+        let _env_guard = crate::test_support::env_lock();
+        unsafe {
+            std::env::set_var("VIA_SESSION", &manifest_path);
+            std::env::set_var(agent_bus::VIA_AGENT_ID_ENV, "coder");
+        }
+
+        let stamped = run_update(UpdateArgs {
+            id: "t1".to_string(),
+            title: None,
+            status: None,
+            assignee: None,
+            clear_assignee: false,
+            blocked_by: None,
+            body: None,
+            append: Some("- Done: reproduced failure.".to_string()),
+            from: None,
+            clear_body: false,
+            json: false,
+        });
+
+        let overridden = stamped.and_then(|_| {
+            run_update(UpdateArgs {
+                id: "t1".to_string(),
+                title: None,
+                status: None,
+                assignee: None,
+                clear_assignee: false,
+                blocked_by: None,
+                body: None,
+                append: Some("### 2026-07-22 coder\n- Next: fix.".to_string()),
+                from: Some("reviewer".to_string()),
+                clear_body: false,
+                json: false,
+            })
+        });
+
+        unsafe {
+            std::env::remove_var(agent_bus::VIA_AGENT_ID_ENV);
+        }
+        let unknown = overridden.and_then(|_| {
+            run_update(UpdateArgs {
+                id: "t1".to_string(),
+                title: None,
+                status: None,
+                assignee: None,
+                clear_assignee: false,
+                blocked_by: None,
+                body: None,
+                append: Some("- Blocked.".to_string()),
+                from: None,
+                clear_body: false,
+                json: false,
+            })
+        });
+
+        unsafe {
+            std::env::remove_var("VIA_SESSION");
+        }
+
+        unknown.unwrap();
+        let body = get_task(&ctx.tasks_dir, "t1")
+            .unwrap()
+            .unwrap()
+            .body
+            .unwrap();
+        let chunks: Vec<&str> = body.split("\n---\n").collect();
+        assert_eq!(chunks[0].trim_end(), "Goal: ship");
+        assert_heading(chunks[1], "coder", "- Done: reproduced failure.");
+        assert_heading(chunks[2], "reviewer", "- Next: fix.");
+        assert!(!chunks[2].contains("2026-07-22"));
+        assert_heading(chunks[3], "unknown", "- Blocked.");
+
+        let rejected = run_update(UpdateArgs {
+            id: "t1".to_string(),
+            title: None,
+            status: None,
+            assignee: None,
+            clear_assignee: false,
+            blocked_by: None,
+            body: None,
+            append: None,
+            from: Some("coder".to_string()),
+            clear_body: false,
+            json: false,
+        });
+        assert!(
+            rejected
+                .unwrap_err()
+                .to_string()
+                .contains("--from applies only to --append")
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn assert_heading(chunk: &str, author: &str, note: &str) {
+        let (heading, rest) = chunk.trim_end().split_once('\n').unwrap();
+        let stamp = heading
+            .strip_prefix("### ")
+            .unwrap()
+            .strip_suffix(&format!(" {author}"))
+            .unwrap();
+        assert_eq!(stamp.len(), "YYYY-MM-DD HH:MM".len(), "{heading}");
+        assert_eq!(&stamp[4..5], "-");
+        assert_eq!(&stamp[7..8], "-");
+        assert_eq!(&stamp[10..11], " ");
+        assert_eq!(&stamp[13..14], ":");
+        assert_eq!(rest, note);
     }
 }

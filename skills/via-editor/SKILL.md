@@ -62,9 +62,8 @@ the commands print an error and exit; they do not guess a session.
    ```
 
    - Prefer tasks **already assigned to you** (`via task list`, then claim only if needed).
-   - Claim unassigned work only when your role is expected to pick it up (e.g. coder /
-     orchestrator triage) and nothing is already assigned to you. Reviewers and ad-hoc
-     helpers should not auto-claim the queue.
+   - Claim unassigned work only when your role is expected to pick it up (e.g. coder / orchestrator triage) and nothing
+     is already assigned to you. Reviewers and ad-hoc helpers should not auto-claim the queue.
    - Before large multi-step work with no matching board item, create one with a rich body so progress survives
      handoff/restart:
 
@@ -73,10 +72,9 @@ the commands print an error and exit; they do not guess a session.
      via task claim <id>
      ```
 
-   - While working a task, append **Status updates** with `via task update <id> --append '…'`
-     (does not replace the body). via itself auto-appends notes on claim / assign /
-     review / done — still add your own progress notes. Keep progress on the task, not
-     only in chat.
+   - While working a task, append **Status updates** with `via task update <id> --append '…'` (note body only; via adds
+     a `### YYYY-MM-DD HH:MM <author>` heading and does not replace the body). via itself auto-appends notes on claim /
+     assign / review / done — still add your own progress notes. Keep progress on the task, not only in chat.
 
    Tiny one-line fixes do not need a task. Prefer the board for durable or multi-step work. Full lifecycle guidance
    lives in the **via-agents** skill.
