@@ -33,6 +33,10 @@ and I also test other agents like claude-code and crush.
 - Ctrl+click on a symbol to open the symbol search pane in Neovim with the same focus behavior.
 - Ctrl+click on an external OSC 8 hyperlink to open it in the system browser.
 
+## Demo
+
+https://github.com/user-attachments/assets/a0144cf2-c81e-4f6f-a2e7-99951378b9b2
+
 ## Multi-agent orchestration
 
 The **default** layout is Neovim plus one **interactive PTY agent** (`--agent opencode`). For everyday edits you work in
