@@ -95,9 +95,15 @@ pub enum AgentCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List the models this agent offers over ACP (for `via.conf` / `--model`).
+    Models {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-pub fn run(command: AgentCommand) -> Result<()> {
+pub async fn run(command: AgentCommand, overrides: crate::config::ConfigOverrides) -> Result<()> {
     match command {
         AgentCommand::List { json } => run_list(json),
         AgentCommand::Spawn {
@@ -124,6 +130,7 @@ pub fn run(command: AgentCommand) -> Result<()> {
         } => run_assign(id, role, command, model, message, task, !no_focus),
         AgentCommand::Inbox { json, peek, wait } => run_inbox(json, peek, wait),
         AgentCommand::Whoami { json } => run_whoami(json),
+        AgentCommand::Models { json } => run_models(json, overrides).await,
     }
 }
 
@@ -386,13 +393,100 @@ fn run_inbox(json: bool, peek: bool, wait: Option<u64>) -> Result<()> {
     Ok(())
 }
 
+/// Ask an agent for the models it offers over ACP and print them.
+///
+/// The list comes from the `model` config option in `session/new`, so it shows
+/// exactly the values via will accept — not the agent CLI's own model list, which
+/// can use different names (cursor-agent splits effort tiers into separate slugs).
+async fn run_models(json: bool, overrides: crate::config::ConfigOverrides) -> Result<()> {
+    let Some(agent) = crate::config::resolve_model_query_agent(&overrides)? else {
+        bail!("no agent configured; pass --agent <command> (e.g. --agent opencode)");
+    };
+    let launch = crate::config::resolve_agent_launch(&agent, overrides.acp_agent.as_deref());
+    if !launch.acp {
+        bail!(
+            "'{agent}' has no ACP mapping, so it cannot list models; \
+             set a known agent (opencode, cursor-agent, agent) or pass --acp-agent"
+        );
+    }
+
+    let (models, selected) = fetch_agent_models(&launch.command).await?;
+    if json {
+        let payload = serde_json::json!({
+            "agent": agent,
+            "command": launch.command,
+            "selected": selected,
+            "models": models,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+
+    if models.is_empty() {
+        println!("{}: no models offered over ACP", launch.command);
+        return Ok(());
+    }
+
+    println!("{}: {} model(s) over ACP", launch.command, models.len());
+    println!();
+    let name_width = models
+        .iter()
+        .map(|model| model.name.as_deref().unwrap_or("").chars().count())
+        .max()
+        .unwrap_or(0);
+    for model in models {
+        let name = model.name.as_deref().unwrap_or("-");
+        let marker = if selected.as_deref() == Some(model.value.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        println!(
+            "{marker} {name:<name_width$}  {}",
+            model.value,
+            name_width = name_width
+        );
+    }
+    Ok(())
+}
+
+/// Spawn `command`, run the ACP handshake, and return its model list plus the
+/// currently selected value. The child is killed when the client is dropped.
+async fn fetch_agent_models(
+    command: &str,
+) -> Result<(Vec<crate::acp::ModelChoice>, Option<String>)> {
+    const LIST_TIMEOUT: Duration = Duration::from_secs(90);
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let [program, args @ ..] = tokens.as_slice() else {
+        bail!("empty agent command");
+    };
+    let cwd = std::env::current_dir().context("resolve working directory")?;
+
+    let handshake = async {
+        let mut client = crate::acp::AcpClient::spawn("models", program, args, &[]).await?;
+        client.initialize().await?;
+        let session = client.new_session(&cwd).await?;
+        Ok::<_, anyhow::Error>((session.model_choices(), session.selected_model()))
+    };
+
+    // Some agents are slow to answer `session/new` (cursor-agent takes ~60s), so this
+    // deliberately exceeds the runtime's ACP handshake budget.
+    tokio::time::timeout(LIST_TIMEOUT, handshake)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "'{command}' did not answer the ACP handshake within {}s",
+                LIST_TIMEOUT.as_secs()
+            )
+        })?
+}
+
 fn run_whoami(json: bool) -> Result<()> {
     let session = session::resolve_session()?;
     let id = self_id();
     let role = std::env::var(agent_bus::VIA_AGENT_ROLE_ENV)
         .ok()
         .filter(|s| !s.is_empty());
-
     if json {
         let payload = serde_json::json!({
             "id": id,
@@ -558,5 +652,85 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `via agent models` must report the values ACP exposes, including the
+    /// currently selected one, without needing a running via session.
+    #[tokio::test]
+    async fn models_lists_acp_values_and_selected() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = temp_dir("agent-models");
+        let script = dir.join("mock_agent.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_models","configOptions":[{"id":"model","currentValue":"b-model[effort=high]","options":[{"value":"a-model[effort=low]","name":"A Model"},{"value":"b-model[effort=high]","name":"B Model"}]}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let (models, selected) = fetch_agent_models(script.to_str().unwrap())
+            .await
+            .expect("fetch models");
+
+        assert_eq!(
+            models,
+            vec![
+                crate::acp::ModelChoice {
+                    value: "a-model[effort=low]".to_string(),
+                    name: Some("A Model".to_string()),
+                },
+                crate::acp::ModelChoice {
+                    value: "b-model[effort=high]".to_string(),
+                    name: Some("B Model".to_string()),
+                },
+            ]
+        );
+        assert_eq!(selected.as_deref(), Some("b-model[effort=high]"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An agent without an ACP mapping must be rejected with guidance rather than
+    /// spawned in PTY form (which would hang waiting for JSON-RPC).
+    #[test]
+    fn models_rejects_agent_without_acp_mapping() {
+        let launch = crate::config::resolve_agent_launch("claude", None);
+        assert!(!launch.acp);
+
+        let mapped = crate::config::resolve_agent_launch("opencode", None);
+        assert!(mapped.acp);
+        assert_eq!(mapped.command, "opencode acp");
+    }
+
+    #[test]
+    fn models_resolves_agent_from_override() {
+        let overrides = crate::config::ConfigOverrides {
+            agent: Some("cursor-agent".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::config::resolve_model_query_agent(&overrides)
+                .unwrap()
+                .as_deref(),
+            Some("cursor-agent")
+        );
+
+        let none = crate::config::ConfigOverrides::default();
+        // `via.conf` may supply one; only assert the override path is honoured.
+        let _ = crate::config::resolve_model_query_agent(&none);
     }
 }

@@ -830,6 +830,16 @@ pub fn is_acp_command(command: &str) -> bool {
     command.split_whitespace().last() == Some("acp")
 }
 
+/// Resolve which agent command `via agent models` should query: an explicit
+/// `--agent`, else the configured one. Returns `None` when nothing is configured.
+///
+/// Unlike [`AppContext::load`] this does not require the runtime directory or a
+/// live session, so it works before via has ever been started.
+pub fn resolve_model_query_agent(overrides: &ConfigOverrides) -> AnyResult<Option<String>> {
+    let prefs = resolve_user_config(overrides.clone())?;
+    Ok(prefs.agent_command)
+}
+
 /// Per-instance agent bus directory (`registry.json`, `inbox/<id>/…`).
 pub fn default_agents_dir() -> PathBuf {
     runtime_base_dir().join("agents")

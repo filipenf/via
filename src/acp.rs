@@ -103,6 +103,25 @@ pub struct ModelChoice {
     pub name: Option<String>,
 }
 
+/// A preset model mapped onto an ACP `session/set_config_option` value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedModel {
+    /// The value to send to the agent.
+    pub value: String,
+    /// Set when the preset named an effort tier the agent folded into this entry,
+    /// so the selected effort may differ from the one requested.
+    pub downgraded_tier: Option<String>,
+}
+
+impl ResolvedModel {
+    fn exact(value: impl Into<String>) -> Self {
+        Self {
+            value: value.into(),
+            downgraded_tier: None,
+        }
+    }
+}
+
 fn model_choices_from_options(options: &[ConfigOption]) -> Vec<ModelChoice> {
     options
         .iter()
@@ -148,7 +167,7 @@ impl NewSessionResult {
 
     /// Map a user-facing model slug (e.g. `composer-2.5` from `agent models`) to the
     /// ACP `session/set_config_option` value when the agent exposes a select list.
-    pub fn resolve_model_value(&self, desired: &str) -> Option<String> {
+    pub fn resolve_model_value(&self, desired: &str) -> Option<ResolvedModel> {
         resolve_model_config_value(&self.config_options, desired)
     }
 }
@@ -157,30 +176,40 @@ fn model_option_base(value: &str) -> &str {
     value.split('[').next().unwrap_or(value)
 }
 
+/// Effort tiers that `agent --list-models` appends to a model family slug but that
+/// ACP folds into the `[reasoning_effort=…]` option of a single entry.
+const EFFORT_TIER_SUFFIXES: [&str; 6] = ["-none", "-low", "-medium", "-high", "-xhigh", "-max"];
+
+fn strip_effort_tier(slug: &str) -> Option<(&str, &str)> {
+    EFFORT_TIER_SUFFIXES
+        .iter()
+        .find_map(|suffix| slug.strip_suffix(suffix).map(|base| (base, &suffix[1..])))
+}
+
 /// Resolve a preset slug against `session/new` model options.
-fn resolve_model_config_value(options: &[ConfigOption], desired: &str) -> Option<String> {
+fn resolve_model_config_value(options: &[ConfigOption], desired: &str) -> Option<ResolvedModel> {
     let model_option = options.iter().find(|option| option.id == "model")?;
     let choices = &model_option.options;
     if choices.is_empty() {
-        return Some(desired.to_string());
+        return Some(ResolvedModel::exact(desired));
     }
 
     if choices.iter().any(|choice| choice.value == desired) {
-        return Some(desired.to_string());
+        return Some(ResolvedModel::exact(desired));
     }
 
     if let Some(choice) = choices
         .iter()
         .find(|choice| choice.name.as_deref() == Some(desired))
     {
-        return Some(choice.value.clone());
+        return Some(ResolvedModel::exact(&choice.value));
     }
 
     if let Some(choice) = choices
         .iter()
         .find(|choice| model_option_base(&choice.value) == desired)
     {
-        return Some(choice.value.clone());
+        return Some(ResolvedModel::exact(&choice.value));
     }
 
     let desired_lower = desired.to_ascii_lowercase();
@@ -190,24 +219,105 @@ fn resolve_model_config_value(options: &[ConfigOption], desired: &str) -> Option
             .as_ref()
             .is_some_and(|name| name.to_ascii_lowercase() == desired_lower)
     }) {
-        return Some(choice.value.clone());
+        return Some(ResolvedModel::exact(&choice.value));
     }
 
     if let Some(base) = desired.strip_suffix("-fast") {
         if let Some(choice) = choices.iter().find(|choice| {
             model_option_base(&choice.value) == base && choice.value.contains("fast=true")
         }) {
-            return Some(choice.value.clone());
+            return Some(ResolvedModel::exact(&choice.value));
         }
         if let Some(choice) = choices
             .iter()
             .find(|choice| model_option_base(&choice.value) == base)
         {
-            return Some(choice.value.clone());
+            return Some(ResolvedModel::exact(&choice.value));
         }
     }
 
+    // Some agents (cursor-agent) list one slug per effort tier in their CLI
+    // (`deepseek-v41-flash-1017-max`) but expose a single ACP entry per family with
+    // the effort baked into its option value. Fall back to that family entry and
+    // record the tier that was actually selected so callers can report the change.
+    // `resolve_by_family_slug` only considers entries that actually fold effort into
+    // their value, so agents with bare model ids (opencode) keep erroring instead of
+    // silently resolving to a different model.
+    if let Some((choice, tier)) = resolve_by_family_slug(choices, desired) {
+        return Some(ResolvedModel {
+            value: choice.value.clone(),
+            downgraded_tier: tier.map(|tier| format!("'{desired}' requested effort '{tier}'")),
+        });
+    }
+
     None
+}
+
+/// Last-resort match for the cursor-agent vocabulary mismatch: its CLI splits a
+/// family into per-effort slugs while ACP folds effort into a `[...]` option value.
+///
+/// Only entries with a bracketed parameter section are candidates, because that
+/// bracket is the evidence that this agent folds effort into the value rather than
+/// treating the suffix as part of a distinct model id. Agents whose ids carry no
+/// parameters (e.g. opencode's `opencode/claude-opus-4-8`) never match here, so a
+/// typo keeps failing loudly instead of silently selecting a sibling model.
+///
+/// Drops a trailing `-fast` and effort tier from `desired`, then looks for the
+/// family entry, preferring its fast variant. Both the stripped and the original
+/// name are tried, so a family that genuinely ends in `-max`/`-low` still matches.
+/// The second field is the stripped effort tier, when one was consumed.
+fn resolve_by_family_slug<'a>(
+    choices: &'a [ConfigOptionChoice],
+    desired: &str,
+) -> Option<(&'a ConfigOptionChoice, Option<String>)> {
+    if !choices.iter().any(|choice| choice.value.contains('[')) {
+        return None;
+    }
+    let family = desired.strip_suffix("-fast").unwrap_or(desired);
+    let (tier, candidates): (Option<String>, Vec<&str>) = match strip_effort_tier(family) {
+        Some((base, tier)) => (Some(tier.to_string()), vec![base, family]),
+        None => (None, vec![family]),
+    };
+    candidates.into_iter().find_map(|candidate| {
+        match_family_entry(choices, candidate).map(|choice| (choice, tier.clone()))
+    })
+}
+
+fn match_family_entry<'a>(
+    choices: &'a [ConfigOptionChoice],
+    family: &str,
+) -> Option<&'a ConfigOptionChoice> {
+    let mut matches = choices
+        .iter()
+        .filter(|choice| choice.value.contains('['))
+        .filter(|choice| model_option_base(&choice.value) == family);
+    let first = matches.next()?;
+    let is_fast = |choice: &ConfigOptionChoice| choice.value.contains("fast=true");
+    if is_fast(first) {
+        return Some(first);
+    }
+    matches.find(|choice| is_fast(choice)).or(Some(first))
+}
+
+/// Render the agent's selectable model values for an error message, capped so a
+/// 47-entry list does not swamp the handshake failure modal.
+pub fn describe_model_choices(choices: &[ModelChoice]) -> String {
+    const MAX_LISTED: usize = 12;
+    if choices.is_empty() {
+        return "the agent exposes no model options".to_string();
+    }
+    let mut values: Vec<&str> = choices.iter().map(|choice| choice.value.as_str()).collect();
+    values.sort_unstable();
+    let listed = values
+        .iter()
+        .take(MAX_LISTED)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ");
+    match values.len().saturating_sub(MAX_LISTED) {
+        0 => format!("available models: {listed}"),
+        extra => format!("available models: {listed} (+{extra} more)"),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1061,12 +1171,12 @@ mod tests {
         }"#;
         let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
         assert_eq!(
-            result.resolve_model_value("composer-2.5").as_deref(),
-            Some("composer-2.5[fast=true]")
+            result.resolve_model_value("composer-2.5").map(|m| m.value),
+            Some("composer-2.5[fast=true]".to_string())
         );
         assert_eq!(
-            result.resolve_model_value("gpt-5.3-codex").as_deref(),
-            Some("gpt-5.3-codex[reasoning=medium,fast=false]")
+            result.resolve_model_value("gpt-5.3-codex").map(|m| m.value),
+            Some("gpt-5.3-codex[reasoning=medium,fast=false]".to_string())
         );
         assert_eq!(result.resolve_model_value("unknown-model"), None);
     }
@@ -1083,9 +1193,190 @@ mod tests {
         assert_eq!(
             result
                 .resolve_model_value("opencode/deepseek-v4-flash-free")
+                .map(|m| m.value)
                 .as_deref(),
             Some("opencode/deepseek-v4-flash-free")
         );
+    }
+
+    #[test]
+    fn resolve_model_value_maps_effort_tier_slug_to_family_entry() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "grok-4.7[context=256k,reasoning_effort=high,fast=true]",
+                "options": [
+                    {"value": "grok-4.7[context=256k,reasoning_effort=high,fast=true]", "name": "grok-4.7"},
+                    {"value": "claude-sonnet-5-5[context=300k,reasoning_effort=high]", "name": "claude-sonnet-5-5"},
+                    {"value": "deepseek-v41-flash-1017[reasoning_effort=high]", "name": "deepseek-v41-flash-1017"}
+                ]
+            }]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+
+        // `--list-models` slugs that ACP folds into a single family entry still resolve,
+        // and say which effort the agent actually offers.
+        let deepseek = result
+            .resolve_model_value("deepseek-v41-flash-1017-max")
+            .expect("effort tier slug resolves");
+        assert_eq!(
+            deepseek.value,
+            "deepseek-v41-flash-1017[reasoning_effort=high]"
+        );
+        let note = deepseek.downgraded_tier.expect("tier note recorded");
+        assert!(note.contains("deepseek-v41-flash-1017-max"), "{note}");
+        assert!(note.contains("'max'"), "{note}");
+
+        let sonnet = result
+            .resolve_model_value("claude-sonnet-5-5-xhigh")
+            .expect("xhigh slug resolves");
+        assert_eq!(
+            sonnet.value,
+            "claude-sonnet-5-5[context=300k,reasoning_effort=high]"
+        );
+        assert!(sonnet.downgraded_tier.is_some());
+
+        // Exact and base-name matches stay exact, with no downgrade note.
+        let exact = result
+            .resolve_model_value("claude-sonnet-5-5[context=300k,reasoning_effort=high]")
+            .expect("exact value resolves");
+        assert_eq!(
+            exact.value,
+            "claude-sonnet-5-5[context=300k,reasoning_effort=high]"
+        );
+        assert_eq!(exact.downgraded_tier, None);
+
+        let base = result
+            .resolve_model_value("grok-4.7")
+            .expect("base name resolves");
+        assert_eq!(
+            base.value,
+            "grok-4.7[context=256k,reasoning_effort=high,fast=true]"
+        );
+        assert_eq!(base.downgraded_tier, None);
+
+        // A family the agent does not expose at all is still an error.
+        assert_eq!(result.resolve_model_value("gpt-9-ultra-high"), None);
+    }
+
+    #[test]
+    fn resolve_model_value_prefers_fast_variant_for_effort_suffix() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "grok-4.7[context=256k,reasoning_effort=high,fast=false]",
+                "options": [
+                    {"value": "grok-4.7[context=256k,reasoning_effort=high,fast=false]", "name": "grok-4.7"},
+                    {"value": "grok-4.7[context=256k,reasoning_effort=xhigh,fast=true]", "name": "grok-4.7 fast"}
+                ]
+            }]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+
+        // A `-fast` effort slug matches the family's fast entry even though the base
+        // entry is listed first.
+        let fast = result
+            .resolve_model_value("grok-4.7-xhigh-fast")
+            .expect("fast tier slug resolves");
+        assert!(fast.value.contains("fast=true"), "{}", fast.value);
+    }
+
+    #[test]
+    fn resolve_model_value_does_not_fall_back_for_bare_model_ids() {
+        // opencode-style ids: no bracketed parameter section, so a `-high` suffix is
+        // part of the model id itself. Falling back to `opencode/foo` for
+        // `opencode/foo-high` would silently run a different model instead of
+        // reporting the bad preset.
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "opencode/claude-opus-4-8",
+                "options": [
+                    {"value": "opencode/claude-opus-4-8", "name": "Claude Opus 4.8"},
+                    {"value": "opencode/deepseek-v4-flash-free", "name": "DeepSeek V4 Flash"}
+                ]
+            }]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+
+        // Exact ids still resolve.
+        assert_eq!(
+            result
+                .resolve_model_value("opencode/claude-opus-4-8")
+                .map(|m| m.value)
+                .as_deref(),
+            Some("opencode/claude-opus-4-8")
+        );
+
+        // A typo'd tier suffix must NOT silently select the base model.
+        assert_eq!(
+            result.resolve_model_value("opencode/claude-opus-4-8-high"),
+            None
+        );
+        assert_eq!(
+            result.resolve_model_value("opencode/deepseek-v4-flash-free-max"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_model_value_keeps_family_ending_in_effort_word() {
+        let json = r#"{
+            "sessionId": "ses_test",
+            "configOptions": [{
+                "id": "model",
+                "currentValue": "gpt-5-max[reasoning=high]",
+                "options": [
+                    {"value": "gpt-5-max[reasoning=high]", "name": "gpt-5-max"}
+                ]
+            }]
+        }"#;
+        let result: NewSessionResult = serde_json::from_str(json).expect("parse session/new");
+
+        // A family whose own name ends in `-max` must not be mistaken for an effort
+        // tier, and its exact match must not be flagged as a downgrade.
+        let resolved = result
+            .resolve_model_value("gpt-5-max")
+            .expect("family ending in -max resolves");
+        assert_eq!(resolved.value, "gpt-5-max[reasoning=high]");
+        assert_eq!(resolved.downgraded_tier, None);
+    }
+
+    #[test]
+    fn describe_model_choices_lists_values_and_caps_long_lists() {
+        assert_eq!(
+            describe_model_choices(&[]),
+            "the agent exposes no model options"
+        );
+
+        let few = vec![
+            ModelChoice {
+                value: "z-model[effort=high]".to_string(),
+                name: None,
+            },
+            ModelChoice {
+                value: "a-model[]".to_string(),
+                name: None,
+            },
+        ];
+        assert_eq!(
+            describe_model_choices(&few),
+            "available models: a-model[], z-model[effort=high]"
+        );
+
+        let many: Vec<ModelChoice> = (0..20)
+            .map(|i| ModelChoice {
+                value: format!("model-{i:02}"),
+                name: None,
+            })
+            .collect();
+        let described = describe_model_choices(&many);
+        assert!(described.contains("model-00"), "{described}");
+        assert!(described.contains("(+8 more)"), "{described}");
+        assert!(!described.contains("model-19"), "{described}");
     }
 
     #[test]

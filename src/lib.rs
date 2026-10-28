@@ -73,10 +73,11 @@ pub fn run() -> Result<()> {
 }
 
 async fn run_headless(cli: Cli) -> Result<()> {
+    let overrides = cli.config_overrides();
     let Some(command) = cli.command else {
         return Ok(());
     };
-    cli::run(command).await
+    cli::run(command, overrides).await
 }
 
 async fn async_main(cli: Cli) -> Result<()> {

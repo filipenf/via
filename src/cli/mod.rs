@@ -125,10 +125,10 @@ pub enum Command {
     },
 }
 
-pub async fn run(command: Command) -> Result<()> {
+pub async fn run(command: Command, overrides: crate::config::ConfigOverrides) -> Result<()> {
     match command {
         Command::Session { command } => session::run(command).await,
-        Command::Agent { command } => agent::run(command),
+        Command::Agent { command } => agent::run(command, overrides).await,
         Command::Plugin { command } => plugin::run(command),
         Command::Task { command } => task::run(command),
     }
@@ -375,6 +375,17 @@ mod tests {
                     peek: true,
                     wait: Some(30),
                 },
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_agent_models() {
+        let cli = Cli::try_parse_from(["via", "agent", "models", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agent {
+                command: AgentCommand::Models { json: true },
             })
         ));
     }

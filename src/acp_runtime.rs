@@ -17,7 +17,7 @@ use anyhow::{Result, anyhow};
 use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
-use crate::acp::{AcpClient, ModelChoice};
+use crate::acp::{AcpClient, ModelChoice, describe_model_choices};
 use crate::acp_auto_approve::{
     AutoApprovePolicy, PermissionContext, permission_result_for_option, pick_allow_option,
 };
@@ -41,6 +41,9 @@ pub struct AcpSession {
     pub model: Option<String>,
     /// Choices from the agent's `model` config option (for the ACP TUI picker).
     pub models: Vec<ModelChoice>,
+    /// Set when the configured preset named an effort tier the agent folded into a
+    /// single family entry, so the pane can say which effort was actually selected.
+    pub model_note: Option<String>,
 }
 
 #[derive(Clone)]
@@ -106,27 +109,43 @@ async fn establish_acp(
         let session = client.new_session(cwd).await?;
         let mut model = session.selected_model();
         let mut models = session.model_choices();
+        let mut model_note = None;
         if let Some(desired) = preset_model {
             let resolved = session.resolve_model_value(desired).ok_or_else(|| {
                 anyhow!(
-                    "model preset '{desired}' is not available from this ACP agent; \
-                     check the agent's model list or use an exact session/new option value"
+                    "model preset '{desired}' is not available from this ACP agent; {}",
+                    describe_model_choices(&models)
                 )
             })?;
             let updated = client
-                .set_config_option(&session.session_id, "model", &resolved)
+                .set_config_option(&session.session_id, "model", &resolved.value)
                 .await?;
-            model = updated.selected_model().or_else(|| Some(resolved.clone()));
+            model = updated
+                .selected_model()
+                .or_else(|| Some(resolved.value.clone()));
             let updated_choices = updated.model_choices();
             if !updated_choices.is_empty() {
                 models = updated_choices;
+            }
+            if let Some(note) = resolved.downgraded_tier {
+                warn!(
+                    agent_id,
+                    note,
+                    selected = ?model,
+                    "ACP model preset fell back to its family entry"
+                );
+                model_note = Some(format!(
+                    "{note}; the agent selected {}",
+                    model.as_deref().unwrap_or(&resolved.value)
+                ));
             }
             tracing::info!(
                 agent_id,
                 session_id = %session.session_id,
                 ?model,
                 desired,
-                resolved,
+                resolved = resolved.value,
+                downgraded = model_note.is_some(),
                 "ACP model set from preset"
             );
         } else {
@@ -138,6 +157,7 @@ async fn establish_acp(
             session_id: session.session_id,
             model,
             models,
+            model_note,
         })
     };
 
@@ -547,8 +567,16 @@ impl AcpRuntime {
                     let client = Arc::clone(&session.client);
                     let model = session.model.clone();
                     let models = session.models.clone();
+                    let model_note = session.model_note.clone();
                     sessions_guard.insert(id.clone(), session);
                     drop(sessions_guard);
+                    if let Some(note) = model_note {
+                        let _ = ui_commands.try_send(UiCommand::AcpTranscriptChunk {
+                            agent_id: id.clone(),
+                            kind: "system".to_string(),
+                            text: format!("via: {note}"),
+                        });
+                    }
                     let _ = ui_commands.try_send(UiCommand::AcpSessionStatus {
                         agent_id: id.clone(),
                         model,
@@ -1131,6 +1159,114 @@ done
         .expect("establish without preset model");
 
         assert_eq!(session.model.as_deref(), Some("agent-default"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn establish_acp_reports_available_models_when_preset_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("via-acp-unknown-model-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("mock_acp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_test","configOptions":[{"id":"model","currentValue":"deepseek-v41-flash-1017[reasoning_effort=high]","options":[{"value":"deepseek-v41-flash-1017[reasoning_effort=high]","name":"deepseek-v41-flash-1017"},{"value":"grok-4.7[fast=true]","name":"grok-4.7"}]}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let err = establish_acp(
+            "coder",
+            "coder",
+            script.to_str().unwrap(),
+            &[],
+            Path::new("/tmp"),
+            Some("no-such-family"),
+        )
+        .await
+        .err()
+        .expect("unknown preset must fail the handshake");
+
+        // The failure must name the models the agent does offer, not just say "not available".
+        let message = err.to_string();
+        assert!(message.contains("no-such-family"), "{message}");
+        assert!(
+            message.contains("deepseek-v41-flash-1017[reasoning_effort=high]"),
+            "{message}"
+        );
+        assert!(message.contains("grok-4.7[fast=true]"), "{message}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn establish_acp_reports_effort_downgrade_in_session_note() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir =
+            std::env::temp_dir().join(format!("via-acp-effort-downgrade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("mock_acp.sh");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sess_test","configOptions":[{"id":"model","currentValue":"deepseek-v41-flash-1017[reasoning_effort=high]","options":[{"value":"deepseek-v41-flash-1017[reasoning_effort=high]","name":"deepseek-v41-flash-1017"}]}]}}\n' "$id"
+      ;;
+    *'"method":"session/set_config_option"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[{"id":"model","currentValue":"deepseek-v41-flash-1017[reasoning_effort=high]","options":[{"value":"deepseek-v41-flash-1017[reasoning_effort=high]","name":"deepseek-v41-flash-1017"}]}]}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+        )
+        .expect("write mock script");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock script");
+
+        let session = establish_acp(
+            "coder",
+            "coder",
+            script.to_str().unwrap(),
+            &[],
+            Path::new("/tmp"),
+            Some("deepseek-v41-flash-1017-max"),
+        )
+        .await
+        .expect("effort tier preset connects via its family entry");
+
+        assert_eq!(
+            session.model.as_deref(),
+            Some("deepseek-v41-flash-1017[reasoning_effort=high]")
+        );
+        let note = session
+            .model_note
+            .expect("downgrade note kept on the session");
+        assert!(note.contains("deepseek-v41-flash-1017-max"), "{note}");
+        assert!(note.contains("'max'"), "{note}");
+        assert!(note.contains("reasoning_effort=high"), "{note}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -111,14 +111,29 @@ set `acp_agent` globally or `command = "… acp"` on each helper preset.
 The active model is shown in the helper pane header. Requires an ACP-capable spawn and an agent that exposes a `model`
 config option (support varies).
 
-**Listing model slugs** (via does not ship a model picker yet — ask the driver):
+**Listing model slugs** — ask via for the values it will actually accept:
 
 ```bash
-agent models      # cursor-agent slugs, e.g. composer-2.5
-opencode models   # opencode ids, e.g. opencode/claude-opus-4-8
+via agent models                                   # configured agent
+via --agent opencode agent models                  # a specific driver
+via --agent opencode agent models --json
 ```
 
-Use the slug (left column / full id), not the display name, in `via.conf` or `--model`.
+This queries the agent over ACP (`session/new` → `model` config option), so it prints the exact `value` strings that
+work in `via.conf` or `--model`, with the display name beside each and a `*` on the currently selected one.
+
+The agent CLI's own list (`agent --list-models`, `opencode models`) is not the same vocabulary — see below.
+
+**Effort / variant suffixes (cursor-agent).** A CLI's model list and its ACP option list do not always use the same names. `agent`
+lists one slug per effort tier (`deepseek-v41-flash-1017-max`, `claude-sonnet-5-5-xhigh`), while `agent acp` exposes a
+single entry per family with the effort baked into the value
+(`deepseek-v41-flash-1017[reasoning_effort=high]`). via resolves tier suffixes to the family entry, but the effort you
+asked for may not be the one you get: if the pane reports a fallback, the agent only offers the effort in that value.
+Put the exact ACP value in `via.conf` when the tier matters.
+
+This fallback only applies to agents whose ACP model values carry a bracketed parameter section, which is how cursor-agent
+folds effort into a single entry. Agents with bare model ids (`opencode/claude-opus-4-8`) treat any suffix as part of the
+id itself, so a typo there keeps failing loudly instead of silently selecting a different model.
 
 **One-shot overrides** (orchestrator or any pane with `VIA_SESSION`):
 
@@ -193,6 +208,7 @@ via agent spawn --id coder --model composer       # override model for this spaw
 via agent assign --id coder --model composer --task abc -m "implement"
 via agent send --to reviewer -m "review this"     # queue a message + deliver it
 via agent inbox                                   # read (and clear) your mailbox
+via agent models                                  # models this agent offers over ACP
 ```
 
 Coordination notes:
