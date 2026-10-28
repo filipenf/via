@@ -103,25 +103,43 @@ fn git_subcommand_allowed(command: &str) -> bool {
     )
 }
 
-/// Pick an allow option for auto-approve; prefer `allow-once` over `allow-always`.
+/// Pick an allow option for auto-approve; prefer `allow_once` over `allow_always`.
 ///
 /// Returns `None` when no option looks like an allow (caller must fall through to the modal).
 /// Never returns deny/cancel/reject ids — that would auto-deny and contradict miss→modal.
+///
+/// The ACP `kind` field is authoritative when present: `allow_once` is a one-shot
+/// approval, while `allow_always` would grant the agent a durable/session-wide
+/// permission (Claude's `allow-with-updates` is "allow all edits during this
+/// session"). Only fall back to `kind`-less id matching for agents that omit it,
+/// and keep that fallback away from anything that reads like a persistent grant.
 pub fn pick_allow_option(options: &[AcpPermissionOption]) -> Option<String> {
+    if let Some(opt) = options
+        .iter()
+        .find(|opt| opt.kind.as_deref() == Some("allow_once"))
+    {
+        return Some(opt.option_id.clone());
+    }
     for opt in options {
+        // `kind` is authoritative: only fall back to the id when the agent sent
+        // no kind at all, so an `allow-once` id declared `allow_always` is not
+        // auto-approved.
+        if opt.kind.is_some() {
+            continue;
+        }
         let id = opt.option_id.as_str();
         if id == "allow-once" || id.ends_with("allow-once") || id == "allow_once" {
             return Some(opt.option_id.clone());
         }
     }
     for opt in options {
+        if opt.kind.is_some() {
+            // The agent told us this is not a one-shot allow (e.g. `allow_always`);
+            // do not guess from the id.
+            continue;
+        }
         let lower = opt.option_id.to_ascii_lowercase();
         if lower.contains("allow") && !lower.contains("always") {
-            return Some(opt.option_id.clone());
-        }
-    }
-    for opt in options {
-        if opt.option_id.to_ascii_lowercase().contains("allow") {
             return Some(opt.option_id.clone());
         }
     }
@@ -318,10 +336,12 @@ mod tests {
             AcpPermissionOption {
                 option_id: "allow-always".to_string(),
                 name: "Always".to_string(),
+                kind: None,
             },
             AcpPermissionOption {
                 option_id: "allow-once".to_string(),
                 name: "Once".to_string(),
+                kind: None,
             },
         ];
         assert_eq!(pick_allow_option(&options).as_deref(), Some("allow-once"));
@@ -333,13 +353,87 @@ mod tests {
             AcpPermissionOption {
                 option_id: "deny".to_string(),
                 name: "Deny".to_string(),
+                kind: None,
             },
             AcpPermissionOption {
                 option_id: "cancel".to_string(),
                 name: "Cancel".to_string(),
+                kind: None,
             },
         ];
         assert_eq!(pick_allow_option(&options), None);
         assert_eq!(pick_allow_option(&[]), None);
+    }
+
+    #[test]
+    fn pick_allow_option_never_picks_allow_always_kind() {
+        // Claude's adapter words this "allow all edits during this session"; an
+        // auto-approve must not silently grant that.
+        let options = vec![AcpPermissionOption {
+            option_id: "allow-with-updates".to_string(),
+            name: "Yes, allow all edits during this session".to_string(),
+            kind: Some("allow_always".to_string()),
+        }];
+        assert_eq!(pick_allow_option(&options), None);
+    }
+
+    #[test]
+    fn pick_allow_option_prefers_kind_over_allow_always_id() {
+        // An id that reads like a one-shot allow is still skipped when the agent
+        // declares the option durable via `kind`.
+        let options = vec![
+            AcpPermissionOption {
+                option_id: "allow-once".to_string(),
+                name: "Always".to_string(),
+                kind: Some("allow_always".to_string()),
+            },
+            AcpPermissionOption {
+                option_id: "yes".to_string(),
+                name: "Yes".to_string(),
+                kind: Some("allow_once".to_string()),
+            },
+        ];
+        assert_eq!(pick_allow_option(&options).as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn pick_allow_option_rejects_allow_once_id_with_durable_kind() {
+        // The only allow-ish option declares `allow_always`; its `allow-once` id
+        // must not win. Falls through to the modal.
+        let options = vec![
+            AcpPermissionOption {
+                option_id: "allow-once".to_string(),
+                name: "Always".to_string(),
+                kind: Some("allow_always".to_string()),
+            },
+            AcpPermissionOption {
+                option_id: "reject".to_string(),
+                name: "No".to_string(),
+                kind: Some("reject_once".to_string()),
+            },
+        ];
+        assert_eq!(pick_allow_option(&options), None);
+    }
+
+    #[test]
+    fn pick_allow_option_matches_claude_adapter_options() {
+        let options = vec![
+            AcpPermissionOption {
+                option_id: "allow-once".to_string(),
+                name: "Yes".to_string(),
+                kind: Some("allow_once".to_string()),
+            },
+            AcpPermissionOption {
+                option_id: "allow-with-updates".to_string(),
+                name: "Yes, allow all edits during this session".to_string(),
+                kind: Some("allow_always".to_string()),
+            },
+            AcpPermissionOption {
+                option_id: "reject".to_string(),
+                name: "No".to_string(),
+                kind: Some("reject_once".to_string()),
+            },
+        ];
+        assert_eq!(pick_allow_option(&options).as_deref(), Some("allow-once"));
     }
 }

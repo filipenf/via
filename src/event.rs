@@ -74,10 +74,18 @@ pub enum UiEvent {
 }
 
 /// ACP permission or Cursor ask-question option (`optionId` + display `name` / `label`).
+///
+/// `kind` is the ACP permission kind (`allow_once`, `allow_always`, `reject_once`,
+/// `reject_always`) when the agent sends one. via uses it to tell a one-shot
+/// approval from a session-wide grant instead of guessing from the option id —
+/// Claude's adapter offers `allow-with-updates` ("allow all edits during this
+/// session") next to `allow-once`. Ask-question and via-owned modal options leave
+/// it `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcpPermissionOption {
     pub option_id: String,
     pub name: String,
+    pub kind: Option<String>,
 }
 
 /// How to build the JSON-RPC `result` when the user answers the modal.

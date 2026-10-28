@@ -708,12 +708,21 @@ done
     /// spawned in PTY form (which would hang waiting for JSON-RPC).
     #[test]
     fn models_rejects_agent_without_acp_mapping() {
-        let launch = crate::config::resolve_agent_launch("claude", None);
+        let launch = crate::config::resolve_agent_launch("crush", None);
         assert!(!launch.acp);
 
         let mapped = crate::config::resolve_agent_launch("opencode", None);
         assert!(mapped.acp);
         assert_eq!(mapped.command, "opencode acp");
+    }
+
+    /// `via agent models` resolves Claude to the ACP adapter, so it lists models
+    /// over ACP instead of rejecting the driver.
+    #[test]
+    fn models_resolves_claude_to_adapter() {
+        let launch = crate::config::resolve_agent_launch("claude", None);
+        assert!(launch.acp);
+        assert_eq!(launch.command, "claude-agent-acp");
     }
 
     #[test]

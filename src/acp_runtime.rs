@@ -229,10 +229,12 @@ fn notify_acp_handshake_failed(
                 crate::event::AcpPermissionOption {
                     option_id: "retry".to_string(),
                     name: "Retry connection".to_string(),
+                    kind: None,
                 },
                 crate::event::AcpPermissionOption {
                     option_id: "discard".to_string(),
                     name: format!("Discard {queued_count} queued message(s)"),
+                    kind: None,
                 },
             ],
             kind: AcpModalKind::HandshakeRetry,
@@ -1323,6 +1325,7 @@ done
                 options: vec![AcpPermissionOption {
                     option_id: "allow-once".to_string(),
                     name: "Allow".to_string(),
+                    kind: Some("allow_once".to_string()),
                 }],
                 command: Some("rm -rf /".to_string()),
                 command_cwd: None,
@@ -1352,6 +1355,7 @@ done
                 options: vec![AcpPermissionOption {
                     option_id: "allow-once".to_string(),
                     name: "Allow".to_string(),
+                    kind: Some("allow_once".to_string()),
                 }],
                 command: Some("via task list".to_string()),
                 command_cwd: None,

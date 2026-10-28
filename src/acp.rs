@@ -707,9 +707,14 @@ fn parse_permission_options(options: &serde_json::Value) -> Option<Vec<AcpPermis
             .and_then(serde_json::Value::as_str)
             .unwrap_or(option_id)
             .to_string();
+        let kind = item
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
         parsed.push(AcpPermissionOption {
             option_id: option_id.to_string(),
             name,
+            kind,
         });
     }
     if parsed.is_empty() {
@@ -847,6 +852,8 @@ fn parse_ask_question(
         options.push(AcpPermissionOption {
             option_id: option_id.to_string(),
             name,
+            // Ask-question options are answers, not permission decisions.
+            kind: None,
         });
     }
     if options.is_empty() {
@@ -1480,6 +1487,43 @@ done
                 && command.is_none()
                 && command_cwd.is_none()
         ));
+    }
+
+    #[test]
+    fn process_acp_line_parses_claude_permission_option_kinds() {
+        // Payload captured from `@agentclientprotocol/claude-agent-acp` 0.98.0:
+        // a top-level `toolCall` (no `subject`), with ACP `kind` on each option.
+        let line = r#"{"jsonrpc":"2.0","id":12,"method":"session/request_permission","params":{"sessionId":"688b2464","toolCall":{"toolCallId":"toolu_01","name":"Write","status":"pending","rawInput":{"file_path":"/tmp/zz1.txt","content":"hi"},"title":"Write zz1.txt","kind":"edit","content":[{"type":"diff","path":"/tmp/zz1.txt","oldText":null,"newText":"hi"}],"locations":[{"path":"/tmp/zz1.txt"}]},"options":[{"optionId":"allow-once","name":"Yes","kind":"allow_once"},{"optionId":"allow-with-updates","name":"Yes, allow all edits during this session","kind":"allow_always"},{"optionId":"reject","name":"No","kind":"reject_once"}]}}"#;
+        let events = process_acp_line(line, "reviewer");
+        assert_eq!(events.len(), 1);
+        let AgentEvent::Acp {
+            event:
+                AcpAgentEvent::PermissionRequest {
+                    tool_call_id,
+                    title,
+                    tool_kind,
+                    options,
+                    ..
+                },
+            ..
+        } = &events[0]
+        else {
+            panic!("expected a permission request, got {:?}", events[0]);
+        };
+        assert_eq!(tool_call_id, "toolu_01");
+        assert_eq!(title, "Write zz1.txt");
+        assert_eq!(tool_kind.as_deref(), Some("edit"));
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| (option.option_id.as_str(), option.kind.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("allow-once", Some("allow_once")),
+                ("allow-with-updates", Some("allow_always")),
+                ("reject", Some("reject_once")),
+            ]
+        );
     }
 
     #[test]

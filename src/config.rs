@@ -478,12 +478,13 @@ fn toml_escape_string(value: &str) -> String {
         .collect()
 }
 
-/// Reject `--agent "… acp"` — the primary pane is always a PTY; spawn orchestration via ACP.
+/// Reject an ACP launch as the primary agent — the primary pane is always a PTY;
+/// spawn orchestration via ACP.
 pub fn reject_acp_primary_agent(agent: &str) -> AnyResult<()> {
     if is_acp_command(agent) {
         anyhow::bail!(
-            "primary agent must be a PTY command (not ending with `acp`); \
-             use e.g. `--agent opencode` and spawn an orchestrator with \
+            "primary agent must be a PTY command (not an ACP launch such as `opencode acp` \
+             or `claude-agent-acp`); use e.g. `--agent opencode` and spawn an orchestrator with \
              `via agent spawn --id orchestrator --role orchestrator`, or set `acp_agent` for spawn resolution"
         );
     }
@@ -699,6 +700,11 @@ fn known_acp_launch_for(agent: &str) -> Option<String> {
         .to_ascii_lowercase();
     match name.as_str() {
         "opencode" | "cursor-agent" | "agent" => Some(format!("{first} acp")),
+        // Claude Code has no `claude acp` subcommand; ACP ships as a separate
+        // adapter that wraps the Claude Agent SDK. Package:
+        // `@agentclientprotocol/claude-agent-acp` (formerly
+        // `@zed-industries/claude-code-acp`, still accepted as a binary name).
+        "claude" => Some("claude-agent-acp".to_string()),
         _ => None,
     }
 }
@@ -823,11 +829,72 @@ fn default_editor_socket_path() -> PathBuf {
     runtime_base_dir().join(format!("via-editor-{}.sock", std::process::id()))
 }
 
-/// True when an agent command string is an ACP launch (its last token is `acp`),
-/// e.g. `opencode acp`, `cursor-agent acp`. Shared by config and runtime spawning so
-/// PTY vs ACP classification has a single source of truth.
+/// Binaries that speak ACP on stdio without an `acp` argument.
+///
+/// Claude Code ships ACP as a standalone adapter package rather than a
+/// subcommand, so `claude-agent-acp` (and its pre-rename name
+/// `claude-code-acp`) is an ACP launch on its own. It is commonly run directly,
+/// through `npx`, or as a scoped package (`@agentclientprotocol/claude-agent-acp@0.98.0`).
+const ACP_STANDALONE_BINARIES: [&str; 2] = ["claude-agent-acp", "claude-code-acp"];
+
+/// Basename of one command token: path and npm scope stripped, lowercased.
+///
+/// Takes the file name *before* dropping an npm `@version` tail, so a path that
+/// contains `@` (a `user@host` directory, `/opt/pkg@2/…`) still resolves to the
+/// binary name. `@scope/pkg@1.0` → `pkg`.
+fn command_token_basename(token: &str) -> String {
+    let name = std::path::Path::new(token)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(token);
+    match name.rsplit_once('@') {
+        // Keep a leading `@` (scoped package) and a bare `@` out of the split.
+        Some((head, _)) if !head.is_empty() => head.to_ascii_lowercase(),
+        _ => name.to_ascii_lowercase(),
+    }
+}
+
+/// Command launchers that run the ACP adapter named in a later token.
+const COMMAND_LAUNCHERS: [&str; 7] = ["npx", "bunx", "pnpx", "node", "deno", "bun", "env"];
+
+/// True when `token` names a standalone ACP adapter binary.
+fn is_acp_adapter_token(token: &str) -> bool {
+    ACP_STANDALONE_BINARIES.contains(&command_token_basename(token).as_str())
+}
+
+/// True when an agent command string is an ACP launch: either its last token is
+/// `acp` (`opencode acp`, `cursor-agent acp`) or it runs a standalone ACP adapter
+/// binary (`claude-agent-acp`, `@agentclientprotocol/claude-agent-acp@0.98.0`,
+/// `npx -y …@0.98.0`).
+///
+/// Shared by config and runtime spawning so PTY vs ACP classification has a
+/// single source of truth.
+///
+/// Only the *program* is inspected — the first token, or the first token after a
+/// known launcher / `VAR=value` assignment. Scanning every argument would
+/// misclassify a PTY command that merely mentions the adapter (e.g.
+/// `npm i -g @zed-industries/claude-code-acp`), and an ACP pane that never
+/// speaks JSON-RPC is a much worse failure than falling back to PTY.
 pub fn is_acp_command(command: &str) -> bool {
-    command.split_whitespace().last() == Some("acp")
+    if command.split_whitespace().last() == Some("acp") {
+        return true;
+    }
+    let mut tokens = command.split_whitespace();
+    // Skip leading `VAR=value` assignments (`env` style prefixes).
+    let Some(first) = tokens.find(|token| !token.contains('=')) else {
+        return false;
+    };
+    if is_acp_adapter_token(first) {
+        return true;
+    }
+    if COMMAND_LAUNCHERS.contains(&command_token_basename(first).as_str()) {
+        // Skip launcher flags and `VAR=value` assignments (`env FOO=1 cmd`), then
+        // the first remaining token is the script/binary.
+        return tokens
+            .find(|token| !token.starts_with('-') && !token.contains('='))
+            .is_some_and(is_acp_adapter_token);
+    }
+    false
 }
 
 /// Resolve which agent command `via agent models` should query: an explicit
@@ -909,6 +976,56 @@ mod tests {
         assert!(!is_acp_command("opencode"));
         assert!(!is_acp_command("opencode acp --foo"));
         assert!(!is_acp_command(""));
+    }
+
+    #[test]
+    fn is_acp_command_matches_standalone_claude_adapter() {
+        assert!(is_acp_command("claude-agent-acp"));
+        assert!(is_acp_command("claude-code-acp"));
+        assert!(is_acp_command("/usr/local/bin/claude-agent-acp"));
+        assert!(is_acp_command(
+            "npx -y @agentclientprotocol/claude-agent-acp@0.98.0"
+        ));
+        assert!(is_acp_command(
+            "node /opt/acp/node_modules/.bin/claude-agent-acp"
+        ));
+    }
+
+    #[test]
+    fn is_acp_command_handles_at_sign_in_path() {
+        // An `@` in a parent directory must not swallow the binary name.
+        assert!(is_acp_command("/home/me@host/bin/claude-agent-acp"));
+        assert!(is_acp_command("/opt/pkg@2/claude-agent-acp"));
+        assert!(is_acp_command("npx /opt/pkg@2/claude-agent-acp"));
+    }
+
+    #[test]
+    fn is_acp_command_ignores_adapter_name_in_arguments() {
+        // Only the program counts; a PTY command that merely mentions the
+        // adapter must not open an ACP pane that never speaks JSON-RPC.
+        assert!(!is_acp_command("npm i -g @zed-industries/claude-code-acp"));
+        assert!(!is_acp_command("which claude-agent-acp"));
+        assert!(!is_acp_command("claude --mcp-config ./claude-agent-acp"));
+        assert!(!is_acp_command("sh -c 'echo hi'"));
+    }
+
+    #[test]
+    fn is_acp_command_skips_env_assignments_and_launcher_flags() {
+        assert!(is_acp_command("FOO=1 claude-agent-acp"));
+        assert!(is_acp_command("env FOO=1 claude-agent-acp"));
+        assert!(is_acp_command("bunx -y claude-code-acp"));
+        assert!(!is_acp_command("FOO=1"));
+    }
+
+    #[test]
+    fn is_acp_command_leaves_claude_and_others_as_pty() {
+        // `claude` itself has no ACP mode; only the adapter binary is ACP.
+        assert!(!is_acp_command("claude"));
+        assert!(!is_acp_command("claude --resume"));
+        assert!(!is_acp_command("crush"));
+        assert!(!is_acp_command("gemini"));
+        // A near-miss name must not be classified as ACP.
+        assert!(!is_acp_command("claude-agent-acpx"));
     }
 
     #[test]
@@ -1177,12 +1294,56 @@ scroll_sensitivity = 1.5
     }
 
     #[test]
-    fn resolve_agent_launch_unknown_without_override_stays_pty() {
+    fn resolve_agent_launch_claude_maps_to_adapter() {
+        // Claude Code has no `claude acp`; the ACP adapter package is the launch.
         let resolved = resolve_agent_launch("claude", None);
         assert_eq!(
             resolved,
             ResolvedAgentLaunch {
-                command: "claude".to_string(),
+                command: "claude-agent-acp".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_claude_drops_path_prefix_for_adapter() {
+        // The adapter is a separate npm package, not a sibling of `claude`, so a
+        // prefixed `claude` cannot imply an adapter path. The launch is the bare
+        // adapter name resolved from PATH (unlike `{first} acp`, which keeps the
+        // prefix because it re-runs the same binary).
+        let resolved = resolve_agent_launch("/opt/bin/claude", None);
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "claude-agent-acp".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_override_beats_claude_mapping() {
+        let resolved = resolve_agent_launch(
+            "claude",
+            Some("npx -y @agentclientprotocol/claude-agent-acp@0.98.0"),
+        );
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "npx -y @agentclientprotocol/claude-agent-acp@0.98.0".to_string(),
+                acp: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_agent_launch_unknown_without_override_stays_pty() {
+        let resolved = resolve_agent_launch("crush", None);
+        assert_eq!(
+            resolved,
+            ResolvedAgentLaunch {
+                command: "crush".to_string(),
                 acp: false,
             }
         );
@@ -1223,8 +1384,38 @@ scroll_sensitivity = 1.5
 
     #[test]
     fn orchestration_unavailable_without_acp_mapping() {
-        let orchestration = resolve_agent_launch("claude", None).acp;
+        let orchestration = resolve_agent_launch("crush", None).acp;
         assert!(!orchestration);
+    }
+
+    #[test]
+    fn orchestration_enabled_for_claude_primary() {
+        // A `claude` primary is a PTY pane, but Claude still resolves to an ACP
+        // driver for spawned helpers via the adapter mapping.
+        let user = ResolvedPrefs {
+            nvim_command: "nvim".to_string(),
+            agent_command: Some("claude".to_string()),
+            acp_agent: None,
+            agent_pane_cols: AgentPaneCols { min: 80, max: 100 },
+            review_backend: ReviewBackend::Nvim,
+            scroll_sensitivity: DEFAULT_SCROLL_SENSITIVITY,
+            agent_presets: HashMap::new(),
+            auto_approve: AutoApproveConfig::default(),
+        };
+        let orchestration = user
+            .agent_command
+            .as_deref()
+            .map(|agent| resolve_agent_launch(agent, user.acp_agent.as_deref()).acp)
+            .unwrap_or(false);
+        assert!(orchestration);
+        assert_eq!(user.agent_command.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn reject_acp_primary_agent_keeps_claude_primary_allowed() {
+        // `claude` runs as a PTY primary; only ACP launch strings are rejected.
+        assert!(reject_acp_primary_agent("claude").is_ok());
+        assert!(reject_acp_primary_agent("claude-agent-acp").is_err());
     }
 
     #[test]

@@ -427,6 +427,7 @@ mod tests {
             vec![AcpPermissionOption {
                 option_id: "allow".to_string(),
                 name: "Allow".to_string(),
+                kind: Some("allow_once".to_string()),
             }],
             AcpModalKind::SessionPermission,
         );

@@ -61,7 +61,9 @@ pub fn detect_agent_family(agent_command: &str) -> AgentFamily {
     match agent_binary(agent_command).as_str() {
         "agent" | "cursor-agent" => AgentFamily::Cursor,
         "opencode" => AgentFamily::OpenCode,
-        "claude" | "claude-code-acp" => AgentFamily::Claude,
+        // `claude-agent-acp` is the ACP adapter for Claude Code; it reads the same
+        // `~/.claude/skills` tree as the native CLI.
+        "claude" | "claude-agent-acp" | "claude-code-acp" => AgentFamily::Claude,
         "crush" => AgentFamily::Crush,
         _ => AgentFamily::Unknown,
     }
@@ -211,6 +213,11 @@ mod tests {
         );
         assert_eq!(detect_agent_family("opencode acp"), AgentFamily::OpenCode);
         assert_eq!(detect_agent_family("claude"), AgentFamily::Claude);
+        assert_eq!(detect_agent_family("claude-agent-acp"), AgentFamily::Claude);
+        assert_eq!(
+            detect_agent_family("/usr/local/bin/claude-code-acp"),
+            AgentFamily::Claude
+        );
         assert_eq!(detect_agent_family("crush"), AgentFamily::Crush);
         assert_eq!(detect_agent_family("something-else"), AgentFamily::Unknown);
     }
