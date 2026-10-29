@@ -181,6 +181,14 @@ via agent spawn --id coder --model gpt-5.3-codex-high
 - `Alt+J` toggles the split direction (split mode only).
 - Alt+Left/Right and Alt+Shift+Left/Right are not layout shortcuts; they go to the focused editor or agent.
 
+**ACP pane transcript keys**
+
+- `Ctrl+T` collapses or expands every agent thought block. Blocks show at most five lines; a closed block keeps its
+  newest lines.
+- `Ctrl+↑` / `Ctrl+↓` scroll the newest thought block's five-row body window; `Ctrl+Home` / `Ctrl+End` jump to its
+  top or bottom.
+- `PgUp` / `PgDn`, `Home` / `End` scroll the whole transcript; `↑` / `↓` do the same while the prompt is empty.
+
 **Lua API for plugins**
 
 `require('via')` is available inside any via-launched Neovim session (the module is injected into

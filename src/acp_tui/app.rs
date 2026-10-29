@@ -1,5 +1,7 @@
 //! Ratatui application state for the ACP TUI.
 
+use std::collections::HashSet;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -16,6 +18,8 @@ const MAX_TRANSCRIPT_ENTRIES: usize = 500;
 const MAX_PROMPT_HEIGHT: u16 = 6;
 /// Fallback PageUp/PageDown step before the first draw records a viewport height.
 const DEFAULT_PAGE_SCROLL: u16 = 10;
+/// Visible body rows for an expanded thought block; longer blocks scroll inside.
+const THOUGHT_BODY_ROWS: usize = 5;
 
 /// Baked syntect themes for light/dark polarity.
 ///
@@ -29,6 +33,28 @@ struct TranscriptEntry {
     text: String,
     /// Cached markdown lines for agent/thought; `None` means dirty / not yet rendered.
     md_lines: Option<Vec<Line<'static>>>,
+    /// A finished thought block must not absorb thought chunks from a later phase.
+    sealed: bool,
+    /// Row offset inside a thought block's five-row body window.
+    thought_scroll: usize,
+    /// Show the newest body rows (streaming block, or a closed block's tail).
+    thought_follow_tail: bool,
+    /// Wrapped body rows measured by the last layout pass (thought blocks only).
+    thought_body_rows: usize,
+}
+
+/// One transcript entry's position in content-row space.
+struct EntryLayout {
+    entry: usize,
+    /// First rendered row of the entry, counted from the top of the transcript.
+    top: usize,
+    /// Total rendered rows, including the trailing spacer.
+    height: usize,
+}
+
+struct TranscriptLayout {
+    entries: Vec<EntryLayout>,
+    total_rows: usize,
 }
 
 struct ProgressState {
@@ -55,6 +81,10 @@ pub(super) struct App {
     scroll_from_bottom: u16,
     /// Last drawn transcript body height; drives PageUp/PageDown step size.
     transcript_viewport_rows: u16,
+    /// Global collapse state for every thought block.
+    thoughts_collapsed: bool,
+    /// Tool ids already reported this turn; a repeated update must not seal again.
+    seen_tool_ids: HashSet<String>,
     quit: bool,
     /// Light appearance (Ghostty background luminance / host [`HostToTui::Appearance`]).
     light: bool,
@@ -87,6 +117,8 @@ impl App {
             show_input,
             scroll_from_bottom: 0,
             transcript_viewport_rows: 0,
+            thoughts_collapsed: false,
+            seen_tool_ids: HashSet::new(),
             quit: false,
             light,
             syntect: Syntect::new(if light { TM_THEME_LIGHT } else { TM_THEME_DARK }),
@@ -163,7 +195,7 @@ impl App {
     pub(super) fn seed_demo(&mut self) {
         self.push(
             TranscriptKind::System,
-            "Demo — Enter send · Shift+Enter newline · /model · PgUp/PgDn scroll · q quit.".into(),
+            "Demo — Enter send · Shift+Enter newline · /model · PgUp/PgDn scroll · Ctrl+T thoughts · Ctrl+↑/↓ thought scroll · q quit.".into(),
         );
         for i in 1..=8 {
             self.push(
@@ -177,7 +209,10 @@ impl App {
         );
         self.push(
             TranscriptKind::Thought,
-            "Thinking about the next step…".into(),
+            (1..=12)
+                .map(|i| format!("- Reasoning step {i}: checking the next step…"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         );
         self.update_progress("demo".into(), "working".into(), true);
     }
@@ -208,7 +243,7 @@ impl App {
                 if let Some(entry) = self
                     .transcript
                     .last_mut()
-                    .filter(|entry| entry.kind == kind)
+                    .filter(|entry| entry.kind == kind && !entry.sealed)
                 {
                     entry.text.push_str(&text);
                     entry.md_lines = None;
@@ -217,6 +252,20 @@ impl App {
                 }
             }
             HostToTui::Progress { id, label, active } => {
+                if id == "__turn" {
+                    // A finished turn ends the current reasoning phase. Tool ids
+                    // are scoped to a turn, so the next turn starts clean.
+                    if !active {
+                        self.seal_active_thought();
+                    }
+                    self.seen_tool_ids.clear();
+                } else if self.seen_tool_ids.insert(id.clone()) {
+                    // First report for this tool starts a new reasoning phase,
+                    // even when the tool arrives already completed. Later
+                    // `tool_call_update` events for the same id must not split
+                    // the thought that followed the first report.
+                    self.seal_active_thought();
+                }
                 self.update_progress(id, label, active);
             }
             HostToTui::SessionStatus {
@@ -285,6 +334,33 @@ impl App {
                 self.prompt.set_text("");
                 InputEvent::None
             }
+            // Thought blocks: global collapse, plus scrolling the newest block body.
+            // Ctrl+T (not plain `t`) so a prompt can still start with "t".
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.thoughts_collapsed = !self.thoughts_collapsed;
+                InputEvent::None
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_thought(-1);
+                InputEvent::None
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.scroll_thought(1);
+                InputEvent::None
+            }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(entry) = self.newest_thought_mut() {
+                    entry.thought_scroll = 0;
+                    entry.thought_follow_tail = false;
+                }
+                InputEvent::None
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(entry) = self.newest_thought_mut() {
+                    entry.thought_follow_tail = true;
+                }
+                InputEvent::None
+            }
             // Transcript scroll: Page*/Home/End always; Up/Down only when prompt empty
             // so multiline editing can move the caret.
             KeyCode::PageUp => {
@@ -334,6 +410,7 @@ impl App {
                 }
                 self.push(TranscriptKind::User, text.clone());
                 self.scroll_from_bottom = 0;
+                self.seen_tool_ids.clear();
                 self.update_progress("__turn".into(), "Thinking".into(), true);
                 InputEvent::Submit(text)
             }
@@ -488,8 +565,16 @@ impl App {
         let chunks = Layout::vertical(constraints).split(area);
         self.transcript_viewport_rows = chunks[1].height;
 
-        frame.render_widget(self.header_widget(chunks[1].height), chunks[0]);
-        frame.render_widget(self.transcript_widget(chunks[1].height), chunks[1]);
+        let layout = self.layout_transcript(chunks[1].width);
+        // Home can overshoot a short transcript; store the clamped offset so a
+        // following Down/PageDown moves the view instead of decrementing a
+        // saturated sentinel.
+        let max_scroll = layout
+            .total_rows
+            .saturating_sub(usize::from(chunks[1].height.max(1)));
+        self.scroll_from_bottom = self.scroll_from_bottom.min(to_u16(max_scroll));
+        frame.render_widget(self.header_widget(&layout, chunks[1].height), chunks[0]);
+        self.draw_transcript(frame, chunks[1], &layout);
         if self.show_input {
             self.draw_prompt(frame, chunks[2]);
         }
@@ -599,7 +684,7 @@ impl App {
         if self.provider_error.is_some() { 3 } else { 2 }
     }
 
-    fn header_widget(&self, transcript_rows: u16) -> Paragraph<'static> {
+    fn header_widget(&self, layout: &TranscriptLayout, transcript_rows: u16) -> Paragraph<'static> {
         let title_style = Style::default()
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD);
@@ -627,7 +712,10 @@ impl App {
             })
             .unwrap_or_default();
 
-        let from_bottom = self.scroll_offset(transcript_rows.max(1));
+        let max_scroll = layout
+            .total_rows
+            .saturating_sub(usize::from(transcript_rows.max(1)));
+        let from_bottom = usize::from(self.scroll_from_bottom).min(max_scroll);
         let scroll_hint = if from_bottom == 0 {
             String::new()
         } else {
@@ -655,22 +743,183 @@ impl App {
         Paragraph::new(lines).block(Block::default().borders(Borders::BOTTOM))
     }
 
-    fn transcript_widget(&self, viewport_rows: u16) -> Paragraph<'static> {
-        let body_rows = viewport_rows.max(1);
-        let lines = self.wrapped_lines();
-        let max_scroll = (lines.len() as u16).saturating_sub(body_rows);
-        let from_bottom = self.scroll_from_bottom.min(max_scroll);
-        let scroll_y = max_scroll.saturating_sub(from_bottom);
+    /// Measure every entry once per draw.
+    ///
+    /// `Paragraph` wraps at render time, so heights must be measured with
+    /// [`Paragraph::line_count`]; otherwise transcript scrolling is wrong for
+    /// long lines and thought blocks cannot be capped at a fixed row count.
+    fn layout_transcript(&mut self, width: u16) -> TranscriptLayout {
+        let muted = self.muted_fg();
+        let mut entries = Vec::with_capacity(self.transcript.len());
+        let mut top = 0usize;
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll_y, 0))
+        for (idx, entry) in self.transcript.iter_mut().enumerate() {
+            let height = match entry.kind {
+                TranscriptKind::Thought => {
+                    entry.thought_body_rows = thought_body_height(entry, width);
+                    let visible = if self.thoughts_collapsed {
+                        0
+                    } else {
+                        entry.thought_body_rows.min(THOUGHT_BODY_ROWS)
+                    };
+                    1 + visible + 1
+                }
+                _ => {
+                    let lines = entry_text_lines(entry, muted);
+                    wrapped_row_count(lines, width)
+                }
+            };
+            entries.push(EntryLayout {
+                entry: idx,
+                top,
+                height,
+            });
+            top = top.saturating_add(height);
+        }
+
+        TranscriptLayout {
+            entries,
+            total_rows: top,
+        }
     }
 
-    fn scroll_offset(&self, viewport_rows: u16) -> u16 {
-        let total = self.wrapped_lines().len() as u16;
-        let max_scroll = total.saturating_sub(viewport_rows.max(1));
-        self.scroll_from_bottom.min(max_scroll)
+    fn draw_transcript(&self, frame: &mut Frame<'_>, area: Rect, layout: &TranscriptLayout) {
+        if self.transcript.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::from(Span::styled(
+                    "No transcript yet.",
+                    Style::default().fg(self.muted_fg()),
+                ))),
+                area,
+            );
+            return;
+        }
+
+        let max_scroll = layout
+            .total_rows
+            .saturating_sub(usize::from(area.height.max(1)));
+        let top = max_scroll.saturating_sub(usize::from(self.scroll_from_bottom));
+        let view_bottom = top.saturating_add(usize::from(area.height));
+
+        for geom in &layout.entries {
+            let entry_top = geom.top;
+            let entry_bottom = entry_top.saturating_add(geom.height);
+            if entry_bottom <= top {
+                continue;
+            }
+            if entry_top >= view_bottom {
+                break;
+            }
+
+            let entry = &self.transcript[geom.entry];
+            if entry.kind == TranscriptKind::Thought {
+                self.draw_thought(frame, area, top, view_bottom, geom);
+                continue;
+            }
+
+            let visible_start = entry_top.max(top);
+            let visible_end = entry_bottom.min(view_bottom);
+            let rect = Rect::new(
+                area.x,
+                area.y + to_u16(visible_start - top),
+                area.width,
+                to_u16(visible_end - visible_start),
+            );
+            let lines = entry_text_lines(entry, self.muted_fg());
+            let (start, row) = row_slice(&lines, area.width, visible_start - entry_top);
+            if start >= lines.len() {
+                continue;
+            }
+            frame.render_widget(
+                Paragraph::new(lines[start..].to_vec())
+                    .wrap(Wrap { trim: false })
+                    .scroll((safe_scroll(row, rect.height), 0)),
+                rect,
+            );
+        }
+    }
+
+    fn draw_thought(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        top: usize,
+        view_bottom: usize,
+        geom: &EntryLayout,
+    ) {
+        let entry = &self.transcript[geom.entry];
+        let body_rows = entry.thought_body_rows;
+        let body_scroll = thought_offset(entry);
+
+        if geom.top >= top && geom.top < view_bottom {
+            let rect = Rect::new(area.x, area.y + to_u16(geom.top - top), area.width, 1);
+            frame.render_widget(
+                Paragraph::new(self.thought_header_line(entry, body_scroll)),
+                rect,
+            );
+        }
+
+        if self.thoughts_collapsed || body_rows == 0 {
+            return;
+        }
+
+        let body_top = geom.top.saturating_add(1);
+        let body_height = body_rows.min(THOUGHT_BODY_ROWS);
+        let body_bottom = body_top.saturating_add(body_height);
+        let visible_start = body_top.max(top);
+        let visible_end = body_bottom.min(view_bottom);
+        if visible_end <= visible_start {
+            return;
+        }
+
+        let rect = Rect::new(
+            area.x,
+            area.y + to_u16(visible_start - top),
+            area.width,
+            to_u16(visible_end - visible_start),
+        );
+        let skip = (visible_start - body_top).saturating_add(body_scroll);
+        let lines = thought_body_lines(entry);
+        let (start, row) = row_slice(&lines, area.width.saturating_sub(1), skip);
+        if start >= lines.len() {
+            return;
+        }
+        frame.render_widget(
+            Paragraph::new(lines[start..].to_vec())
+                .style(Style::default().fg(self.muted_fg()))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT)
+                        .border_style(Style::default().fg(self.muted_fg())),
+                )
+                .scroll((safe_scroll(row, rect.height), 0)),
+            rect,
+        );
+    }
+
+    fn thought_header_line(&self, entry: &TranscriptEntry, body_scroll: usize) -> Line<'static> {
+        let marker = if self.thoughts_collapsed {
+            "▸"
+        } else {
+            "▾"
+        };
+        let body_rows = entry.thought_body_rows;
+        let mut text = format!("{marker} thought");
+        if body_rows > 0 {
+            text.push_str(&format!(" · {body_rows} lines"));
+        }
+        if !self.thoughts_collapsed && body_rows > THOUGHT_BODY_ROWS {
+            let start = body_scroll.saturating_add(1);
+            let end = body_scroll.saturating_add(THOUGHT_BODY_ROWS).min(body_rows);
+            text.push_str(&format!(" · {start}–{end}"));
+        }
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
     }
 
     fn refresh_markdown_caches(&mut self) {
@@ -687,78 +936,63 @@ impl App {
         }
     }
 
-    fn wrapped_lines(&self) -> Vec<Line<'static>> {
-        if self.transcript.is_empty() {
-            return vec![Line::from(Span::styled(
-                "No transcript yet.",
-                Style::default().fg(self.muted_fg()),
-            ))];
-        }
-
-        let mut lines = Vec::new();
-        for entry in &self.transcript {
-            match entry.kind {
-                TranscriptKind::Agent | TranscriptKind::Thought => {
-                    let label = match entry.kind {
-                        TranscriptKind::Thought => "thought",
-                        _ => "agent",
-                    };
-                    let label_style = match entry.kind {
-                        TranscriptKind::Thought => Style::default().fg(Color::Cyan),
-                        _ => Style::default().fg(Color::Green),
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("{label}:"),
-                        label_style.add_modifier(Modifier::BOLD),
-                    )));
-                    if let Some(md) = &entry.md_lines {
-                        lines.extend(md.iter().cloned());
-                    } else {
-                        // Cache not warm yet (shouldn't happen after refresh); plain fallback.
-                        for part in entry.text.split('\n') {
-                            lines.push(Line::from(Span::styled(part.to_string(), label_style)));
-                        }
-                    }
-                    lines.push(Line::from(""));
-                }
-                kind => {
-                    let (prefix, style) = match kind {
-                        TranscriptKind::User => (
-                            "you",
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        TranscriptKind::Tool => ("tool", Style::default().fg(Color::Magenta)),
-                        TranscriptKind::System => ("system", Style::default().fg(self.muted_fg())),
-                        TranscriptKind::Agent | TranscriptKind::Thought => unreachable!(),
-                    };
-                    for (idx, part) in entry.text.split('\n').enumerate() {
-                        if idx == 0 {
-                            lines.push(Line::from(vec![
-                                Span::styled(format!("{prefix}: "), style),
-                                Span::styled(part.to_string(), style),
-                            ]));
-                        } else {
-                            lines.push(Line::from(Span::styled(part.to_string(), style)));
-                        }
-                    }
-                }
-            }
-        }
-        lines
-    }
-
     fn push(&mut self, kind: TranscriptKind, text: String) {
+        if kind != TranscriptKind::Thought {
+            self.seal_active_thought();
+        }
         self.transcript.push(TranscriptEntry {
             kind,
             text,
             md_lines: None,
+            sealed: false,
+            thought_scroll: 0,
+            // A new thought block starts expanded and follows the newest rows.
+            thought_follow_tail: kind == TranscriptKind::Thought,
+            thought_body_rows: 0,
         });
         if self.transcript.len() > MAX_TRANSCRIPT_ENTRIES {
             let drain = self.transcript.len() - MAX_TRANSCRIPT_ENTRIES;
             self.transcript.drain(..drain);
         }
+    }
+
+    /// Mark the current thought block finished so later chunks open a new block.
+    ///
+    /// Sealing is idempotent: repeated tool updates must not move a block the
+    /// user already scrolled.
+    fn seal_active_thought(&mut self) {
+        let Some(entry) = self.transcript.last_mut() else {
+            return;
+        };
+        if entry.kind != TranscriptKind::Thought || entry.sealed {
+            return;
+        }
+        entry.sealed = true;
+        // Keep the most recent reasoning in view once the block closes.
+        entry.thought_follow_tail = true;
+    }
+
+    fn newest_thought_mut(&mut self) -> Option<&mut TranscriptEntry> {
+        self.transcript
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.kind == TranscriptKind::Thought)
+    }
+
+    /// Move the newest thought block's body window by `delta` rows.
+    fn scroll_thought(&mut self, delta: i16) {
+        let Some(entry) = self.newest_thought_mut() else {
+            return;
+        };
+        let max = thought_max_scroll(entry);
+        let current = thought_offset(entry);
+        let next = if delta < 0 {
+            current.saturating_sub(usize::from(delta.unsigned_abs()))
+        } else {
+            current.saturating_add(delta as usize).min(max)
+        };
+        entry.thought_scroll = next;
+        entry.thought_follow_tail = next >= max;
     }
 
     fn update_progress(&mut self, id: String, label: String, active: bool) {
@@ -788,6 +1022,127 @@ impl App {
             progress.label = label.clone();
         }
     }
+}
+
+/// Rendered lines for a non-thought entry (agent markdown, user/tool/system text).
+fn entry_text_lines(entry: &TranscriptEntry, muted: Color) -> Vec<Line<'static>> {
+    match entry.kind {
+        TranscriptKind::Agent => {
+            let label_style = Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD);
+            let mut lines = vec![Line::from(Span::styled("agent:", label_style))];
+            if let Some(md) = &entry.md_lines {
+                lines.extend(md.iter().cloned());
+            } else {
+                // Cache not warm yet (shouldn't happen after refresh); plain fallback.
+                for part in entry.text.split('\n') {
+                    lines.push(Line::from(Span::styled(part.to_string(), label_style)));
+                }
+            }
+            lines.push(Line::from(""));
+            lines
+        }
+        TranscriptKind::Thought => Vec::new(),
+        kind => {
+            let (prefix, style) = match kind {
+                TranscriptKind::User => (
+                    "you",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                TranscriptKind::Tool => ("tool", Style::default().fg(Color::Magenta)),
+                TranscriptKind::System => ("system", Style::default().fg(muted)),
+                TranscriptKind::Agent | TranscriptKind::Thought => unreachable!(),
+            };
+            let mut lines = Vec::new();
+            for (idx, part) in entry.text.split('\n').enumerate() {
+                if idx == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{prefix}: "), style),
+                        Span::styled(part.to_string(), style),
+                    ]));
+                } else {
+                    lines.push(Line::from(Span::styled(part.to_string(), style)));
+                }
+            }
+            lines
+        }
+    }
+}
+
+fn thought_body_lines(entry: &TranscriptEntry) -> Vec<Line<'static>> {
+    if let Some(md) = &entry.md_lines {
+        return md.clone();
+    }
+    entry
+        .text
+        .split('\n')
+        .map(|part| Line::from(part.to_string()))
+        .collect()
+}
+
+/// Wrapped rows for a thought body. The body renders inside a left-border block,
+/// so it has one fewer column than the transcript.
+fn thought_body_height(entry: &TranscriptEntry, width: u16) -> usize {
+    let lines = thought_body_lines(entry);
+    if lines.is_empty() {
+        return 0;
+    }
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width.saturating_sub(1))
+}
+
+fn wrapped_row_count(lines: Vec<Line<'static>>, width: u16) -> usize {
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+}
+
+fn thought_max_scroll(entry: &TranscriptEntry) -> usize {
+    entry.thought_body_rows.saturating_sub(THOUGHT_BODY_ROWS)
+}
+
+fn thought_offset(entry: &TranscriptEntry) -> usize {
+    let max = thought_max_scroll(entry);
+    if entry.thought_follow_tail {
+        max
+    } else {
+        entry.thought_scroll.min(max)
+    }
+}
+
+/// Locate the first line and row offset that cover `skip` wrapped rows.
+///
+/// `Paragraph::scroll` is `u16`, so entries taller than that cannot be
+/// rendered by scrolling alone. Rendering starts at the matching line instead.
+fn row_slice(lines: &[Line<'static>], width: u16, skip: usize) -> (usize, usize) {
+    if skip == 0 || width == 0 {
+        return (0, 0);
+    }
+    let mut remaining = skip;
+    for (idx, line) in lines.iter().enumerate() {
+        let height = Paragraph::new(line.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width)
+            .max(1);
+        if remaining < height {
+            return (idx, remaining);
+        }
+        remaining -= height;
+    }
+    (lines.len(), 0)
+}
+
+/// Keep `Paragraph`'s internal `scroll.y + area.height` inside `u16`.
+fn safe_scroll(row: usize, height: u16) -> u16 {
+    to_u16(row).min(u16::MAX.saturating_sub(height))
+}
+
+fn to_u16(value: usize) -> u16 {
+    u16::try_from(value).unwrap_or(u16::MAX)
 }
 
 fn model_choice_label(choice: &ModelChoice) -> &str {
@@ -921,7 +1276,7 @@ mod tests {
             text: "# Title\n\n**bold**".into(),
         });
         app.refresh_markdown_caches();
-        let lines = app.wrapped_lines();
+        let lines = entry_text_lines(&app.transcript[0], app.muted_fg());
         let joined: String = lines
             .iter()
             .map(|l| {
@@ -934,6 +1289,398 @@ mod tests {
             .join("\n");
         assert!(joined.contains("Title") || joined.contains("bold") || joined.contains("agent:"));
         assert!(app.transcript[0].md_lines.is_some());
+    }
+
+    fn transcript_rows(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn long_thought(lines: usize) -> String {
+        // A markdown list keeps one rendered row per item; consecutive plain
+        // lines would collapse into a single wrapped paragraph.
+        (1..=lines)
+            .map(|i| format!("- think {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn thought_body_is_capped_at_five_rows_and_follows_the_tail() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+
+        let layout = app.layout_transcript(60);
+        let geom = layout.entries.last().expect("thought layout");
+        assert_eq!(app.transcript[0].thought_body_rows, 20);
+        assert_eq!(geom.height, 1 + 5 + 1);
+
+        let rows = transcript_rows(&mut app, 60, 20);
+        let body: Vec<&String> = rows.iter().filter(|row| row.contains("think ")).collect();
+        assert_eq!(
+            body.len(),
+            5,
+            "body must render exactly five rows: {rows:?}"
+        );
+        assert!(
+            body.iter().any(|row| row.contains("think 20")),
+            "streaming block should follow the tail: {body:?}"
+        );
+        assert!(
+            !body.iter().any(|row| row.contains("think 15")),
+            "rows above the five-row window must stay hidden: {body:?}"
+        );
+    }
+
+    #[test]
+    fn thought_toggle_collapses_all_blocks() {
+        let mut app = App::new("a".into(), true, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "one\ntwo".into(),
+        });
+        let layout = app.layout_transcript(60);
+        assert_eq!(layout.entries.last().unwrap().height, 1 + 2 + 1);
+
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            InputEvent::None
+        ));
+        assert!(app.thoughts_collapsed);
+        let layout = app.layout_transcript(60);
+        assert_eq!(layout.entries.last().unwrap().height, 2);
+    }
+
+    #[test]
+    fn tool_progress_seals_thought_blocks() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "first".into(),
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "second".into(),
+        });
+
+        assert_eq!(app.transcript.len(), 2);
+        assert!(app.transcript[0].sealed);
+        assert!(!app.transcript[1].sealed);
+    }
+
+    #[test]
+    fn repeated_tool_progress_does_not_split_the_thought() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+        // tool_call starts the phase.
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.layout_transcript(60);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        let scrolled = app.transcript[0].thought_scroll;
+
+        // Every later tool_call_update for the same id must not seal again.
+        for active in [true, true, false, false] {
+            app.apply_host(HostToTui::Progress {
+                id: "tool-1".into(),
+                label: "edit".into(),
+                active,
+            });
+        }
+        assert_eq!(app.transcript.len(), 1);
+        assert_eq!(app.transcript[0].thought_scroll, scrolled);
+
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "second".into(),
+        });
+        assert_eq!(app.transcript.len(), 2);
+        assert!(app.transcript[0].sealed);
+        assert!(!app.transcript[1].sealed);
+    }
+
+    #[test]
+    fn tool_ids_reset_between_turns() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "first".into(),
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "__turn".into(),
+            label: String::new(),
+            active: false,
+        });
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "second".into(),
+        });
+        // The same id in a new turn is a new tool call and seals the block.
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "third".into(),
+        });
+
+        assert_eq!(app.transcript.len(), 3);
+        assert!(app.transcript[1].sealed);
+        assert!(!app.transcript[2].sealed);
+    }
+
+    #[test]
+    fn completed_tool_event_seals_the_thought() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "first".into(),
+        });
+        // A tool that arrives already completed still ends the phase.
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: false,
+        });
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "second".into(),
+        });
+
+        assert_eq!(app.transcript.len(), 2);
+        assert!(app.transcript[0].sealed);
+    }
+
+    #[test]
+    fn agent_text_does_not_reset_a_scrolled_thought() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.layout_transcript(60);
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        let scrolled = app.transcript[0].thought_scroll;
+
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Agent,
+            text: "answer".into(),
+        });
+
+        assert!(app.transcript[0].sealed);
+        assert_eq!(app.transcript[0].thought_scroll, scrolled);
+        assert!(!app.transcript[0].thought_follow_tail);
+    }
+
+    #[test]
+    fn thought_scroll_keys_move_the_newest_block() {
+        let mut app = App::new("a".into(), true, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+        app.layout_transcript(60);
+        assert_eq!(app.transcript[0].thought_body_rows, 20);
+
+        // The live window is at the tail (rows 16..20), so one row up is 14.
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(app.transcript[0].thought_scroll, 14);
+        assert!(!app.transcript[0].thought_follow_tail);
+
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        assert_eq!(app.transcript[0].thought_scroll, 0);
+        assert!(!app.transcript[0].thought_follow_tail);
+
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL));
+        assert!(app.transcript[0].thought_follow_tail);
+    }
+
+    #[test]
+    fn sealing_a_thought_keeps_its_tail_visible() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "__turn".into(),
+            label: String::new(),
+            active: false,
+        });
+        assert!(app.transcript[0].sealed);
+        assert!(app.transcript[0].thought_follow_tail);
+
+        let rows = transcript_rows(&mut app, 60, 20);
+        assert!(rows.iter().any(|row| row.contains("think 20")));
+        assert!(!rows.iter().any(|row| row.contains("think 01")));
+    }
+
+    #[test]
+    fn older_thought_blocks_keep_their_tail_window() {
+        let mut app = App::new("a".into(), false, false);
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: long_thought(20),
+        });
+        app.apply_host(HostToTui::Progress {
+            id: "tool-1".into(),
+            label: "edit".into(),
+            active: true,
+        });
+        app.apply_host(HostToTui::Transcript {
+            kind: TranscriptKind::Thought,
+            text: "second".into(),
+        });
+
+        let rows = transcript_rows(&mut app, 60, 40);
+        assert!(
+            rows.iter().any(|row| row.contains("think 20")),
+            "closed block should keep its newest rows reachable: {rows:?}"
+        );
+        assert!(!rows.iter().any(|row| row.contains("think 01")));
+    }
+
+    #[test]
+    fn home_clamps_transcript_scroll_before_down() {
+        let mut app = App::new("a".into(), false, false);
+        for i in 0..40 {
+            app.push(TranscriptKind::System, format!("line {i}"));
+        }
+        transcript_rows(&mut app, 40, 12);
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        transcript_rows(&mut app, 40, 12);
+
+        let layout = app.layout_transcript(40);
+        let max = layout
+            .total_rows
+            .saturating_sub(usize::from(app.transcript_viewport_rows));
+        assert_eq!(usize::from(app.scroll_from_bottom), max);
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(usize::from(app.scroll_from_bottom), max - 1);
+    }
+
+    #[test]
+    fn row_slice_matches_paragraph_scroll() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let lines = vec![
+            Line::from("one two three four five six seven eight nine ten"),
+            Line::from(""),
+            Line::from("short"),
+            Line::from("a b c d e f g h i j k l m n o p"),
+        ];
+        let width = 12;
+        let total = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(width);
+
+        for skip in 0..total {
+            let (start, row) = row_slice(&lines, width, skip);
+            let mut expected = Terminal::new(TestBackend::new(width, 4)).expect("terminal");
+            expected
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(lines.clone())
+                            .wrap(Wrap { trim: false })
+                            .scroll((to_u16(skip), 0)),
+                        frame.area(),
+                    );
+                })
+                .expect("draw");
+
+            let mut actual = Terminal::new(TestBackend::new(width, 4)).expect("terminal");
+            actual
+                .draw(|frame| {
+                    frame.render_widget(
+                        Paragraph::new(lines[start..].to_vec())
+                            .wrap(Wrap { trim: false })
+                            .scroll((to_u16(row), 0)),
+                        frame.area(),
+                    );
+                })
+                .expect("draw");
+
+            assert_eq!(
+                expected.backend().buffer(),
+                actual.backend().buffer(),
+                "skip {skip} resolved to line {start}, row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn huge_entry_does_not_hide_later_entries() {
+        let mut app = App::new("a".into(), false, false);
+        let huge = (0..70_000)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push(TranscriptKind::Tool, huge);
+        app.push(TranscriptKind::System, "after".into());
+
+        let layout = app.layout_transcript(80);
+        assert!(layout.total_rows > usize::from(u16::MAX));
+        assert!(layout.entries.last().unwrap().top > usize::from(u16::MAX));
+
+        let rows = transcript_rows(&mut app, 80, 20);
+        assert!(
+            rows.iter().any(|row| row.contains("line 69999")),
+            "the huge entry's tail must render: {rows:?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("after")));
+    }
+
+    #[test]
+    fn typing_t_in_the_prompt_does_not_toggle_thoughts() {
+        let mut app = App::new("a".into(), true, false);
+        app.prompt.set_text("a");
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(app.prompt.text().len(), 2);
+        assert!(app.prompt.text().contains('t'));
+        assert!(!app.thoughts_collapsed);
+
+        // Ctrl+T is the toggle, including while composing.
+        app.handle_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
+        assert!(app.thoughts_collapsed);
     }
 
     #[test]

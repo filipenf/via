@@ -34,6 +34,8 @@ ratatui = { version = "0.29", default-features = false, features = [
   "crossterm",
   # Required by xai-ratatui-textarea WidgetRef / StatefulWidgetRef.
   "unstable-widget-ref",
+  # `Paragraph::line_count` measures wrapped rows for the transcript layout.
+  "unstable-rendered-line-info",
 ] }
 # Leaf UI crates from grok-build (Apache-2.0). Git pin of xai-org only — not
 # SylphxAI/spiron republishes. Requires ratatui 0.29 type unification
