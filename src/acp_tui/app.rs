@@ -39,7 +39,8 @@ struct ProgressState {
 
 pub(super) struct App {
     agent_id: String,
-    role: String,
+    /// The host draws a tab strip above this pane, so the header need not name the agent.
+    tab_strip_visible: bool,
     model: Option<String>,
     models: Vec<ModelChoice>,
     /// When set, the model picker overlay is open at this index.
@@ -71,10 +72,10 @@ pub(super) enum InputEvent {
 }
 
 impl App {
-    pub(super) fn new(agent_id: String, role: String, show_input: bool, light: bool) -> Self {
+    pub(super) fn new(agent_id: String, show_input: bool, light: bool) -> Self {
         let mut app = Self {
             agent_id,
-            role,
+            tab_strip_visible: false,
             model: None,
             models: Vec::new(),
             model_picker: None,
@@ -248,6 +249,9 @@ impl App {
             }
             HostToTui::Appearance { light } => {
                 self.set_appearance(light);
+            }
+            HostToTui::TabStripVisible { visible } => {
+                self.tab_strip_visible = visible;
             }
             HostToTui::Shutdown => {
                 self.quit = true;
@@ -630,16 +634,16 @@ impl App {
             format!("  ↑{from_bottom}")
         };
 
+        // The model and what the agent is doing. The agent id is shown only when the
+        // host has no tab strip above this pane to name it.
+        let identity = if self.tab_strip_visible {
+            Span::raw("")
+        } else {
+            Span::styled(format!("{}  ·  ", self.agent_id), muted)
+        };
         let mut lines = vec![Line::from(vec![
-            Span::styled(self.role.clone(), title_style),
-            Span::styled(format!("  ({})", self.agent_id), muted),
-            Span::raw("  ·  "),
-            Span::styled(format!("model: {model}"), muted),
-            if self.models.is_empty() {
-                Span::raw("")
-            } else {
-                Span::styled(" · /model", muted)
-            },
+            identity,
+            Span::styled(model.to_string(), title_style),
             Span::styled(progress, Style::default().fg(Color::Magenta)),
             Span::styled(scroll_hint, muted),
         ])];
@@ -853,7 +857,7 @@ mod tests {
 
     #[test]
     fn page_up_down_scroll_by_viewport_not_one_row() {
-        let mut app = App::new("a".into(), "a".into(), true, false);
+        let mut app = App::new("a".into(), true, false);
         app.transcript_viewport_rows = 12;
         assert_eq!(app.page_scroll_step(), 11);
 
@@ -871,7 +875,7 @@ mod tests {
 
     #[test]
     fn submit_clears_prompt_and_appends_user() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.prompt.set_text(" hello ");
         match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)) {
             InputEvent::Submit(text) => assert_eq!(text, "hello"),
@@ -883,7 +887,7 @@ mod tests {
 
     #[test]
     fn shift_enter_inserts_newline_without_submit() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.prompt.set_text("line1");
         match app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)) {
             InputEvent::None => {}
@@ -895,7 +899,7 @@ mod tests {
 
     #[test]
     fn host_transcript_coalesces_same_kind() {
-        let mut app = App::new("a".into(), "a".into(), true, false);
+        let mut app = App::new("a".into(), true, false);
         app.apply_host(HostToTui::Transcript {
             kind: TranscriptKind::Agent,
             text: "hel".into(),
@@ -911,7 +915,7 @@ mod tests {
 
     #[test]
     fn agent_markdown_cache_renders_on_draw_refresh() {
-        let mut app = App::new("a".into(), "a".into(), false, false);
+        let mut app = App::new("a".into(), false, false);
         app.apply_host(HostToTui::Transcript {
             kind: TranscriptKind::Agent,
             text: "# Title\n\n**bold**".into(),
@@ -934,7 +938,7 @@ mod tests {
 
     #[test]
     fn appearance_switches_theme_and_invalidates_markdown_cache() {
-        let mut app = App::new("a".into(), "a".into(), false, false);
+        let mut app = App::new("a".into(), false, false);
         assert!(!app.light);
         app.apply_host(HostToTui::Transcript {
             kind: TranscriptKind::Agent,
@@ -957,7 +961,7 @@ mod tests {
 
     #[test]
     fn progress_activates_and_clears() {
-        let mut app = App::new("a".into(), "a".into(), false, false);
+        let mut app = App::new("a".into(), false, false);
         app.apply_host(HostToTui::Progress {
             id: "t".into(),
             label: "edit".into(),
@@ -974,7 +978,7 @@ mod tests {
 
     #[test]
     fn session_status_updates_header_model() {
-        let mut app = App::new("coder".into(), "coder".into(), false, false);
+        let mut app = App::new("coder".into(), false, false);
         app.apply_host(HostToTui::SessionStatus {
             model: Some("composer-2.5".into()),
             models: Some(vec![
@@ -994,9 +998,59 @@ mod tests {
         assert_eq!(app.models.len(), 2);
     }
 
+    fn header_row(app: &mut App) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(60, 6)).expect("terminal");
+        terminal.draw(|frame| app.draw(frame)).expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.width)
+            .map(|col| buffer[(col, 0)].symbol())
+            .collect()
+    }
+
+    fn header_app() -> App {
+        let mut app = App::new("coder".into(), false, false);
+        app.model = Some("composer-2.5".into());
+        app.models = vec![ModelChoice {
+            value: "composer-2.5".into(),
+            name: None,
+        }];
+        app.update_progress("t1".into(), "edit".into(), true);
+        app
+    }
+
+    #[test]
+    fn header_shows_only_model_and_status_when_a_tab_strip_names_the_agent() {
+        let mut app = header_app();
+        app.apply_host(HostToTui::TabStripVisible { visible: true });
+        let row = header_row(&mut app);
+
+        assert!(row.starts_with("composer-2.5"), "got {row:?}");
+        assert!(row.contains("edit"), "status missing: {row:?}");
+        for noise in ["coder", "model:", "/model"] {
+            assert!(!row.contains(noise), "{noise:?} should be gone: {row:?}");
+        }
+    }
+
+    #[test]
+    fn header_names_the_agent_when_no_tab_strip_is_visible() {
+        let mut app = header_app();
+        let row = header_row(&mut app);
+        assert!(row.starts_with("coder  ·  composer-2.5"), "got {row:?}");
+        assert!(row.contains("edit"), "status missing: {row:?}");
+
+        // The strip appears, then goes away again.
+        app.apply_host(HostToTui::TabStripVisible { visible: true });
+        assert!(!header_row(&mut app).contains("coder"));
+        app.apply_host(HostToTui::TabStripVisible { visible: false });
+        assert!(header_row(&mut app).starts_with("coder  ·  "));
+    }
+
     #[test]
     fn slash_model_opens_picker() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.apply_host(HostToTui::SessionStatus {
             model: Some("a".into()),
             models: Some(vec![
@@ -1032,7 +1086,7 @@ mod tests {
 
     #[test]
     fn slash_model_query_sets_directly() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.apply_host(HostToTui::SessionStatus {
             model: Some("a".into()),
             models: Some(vec![
@@ -1078,7 +1132,7 @@ mod tests {
 
     #[test]
     fn model_choices_sorted_by_label() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.apply_host(HostToTui::SessionStatus {
             model: None,
             models: Some(vec![
@@ -1104,7 +1158,7 @@ mod tests {
 
     #[test]
     fn session_status_without_models_leaves_picker_list_unchanged() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.apply_host(HostToTui::SessionStatus {
             model: Some("a".into()),
             models: Some(vec![
@@ -1133,7 +1187,7 @@ mod tests {
 
     #[test]
     fn model_change_waits_for_session_status() {
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         app.apply_host(HostToTui::SessionStatus {
             model: Some("a".into()),
             models: Some(vec![
@@ -1166,7 +1220,7 @@ mod tests {
 
     #[test]
     fn agent_transcript_clears_sticky_turn_progress() {
-        let mut app = App::new("a".into(), "a".into(), true, false);
+        let mut app = App::new("a".into(), true, false);
         app.apply_host(HostToTui::Progress {
             id: "__turn".into(),
             label: "Thinking".into(),

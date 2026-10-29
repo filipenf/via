@@ -35,6 +35,7 @@ use crate::reference_index::ReferenceIndex;
 use self::links::ReferenceContext;
 
 mod acp_modal;
+mod activity;
 mod config;
 mod font;
 mod input;
@@ -43,19 +44,24 @@ pub mod links;
 mod pane;
 mod pane_controller;
 mod render;
+mod tab_strip;
 
 use acp_modal::{AcpModalQueue, AcpModalState, render_acp_modal_buffer};
+use activity::PaneActivity;
 use config::{TerminalConfig, TerminalMetrics};
 use font::FontRenderer;
 use input::{Key, Modifiers};
 use layout::{
-    AgentPaneShare, PaneLayoutMode, PaneLayoutState, PaneRect, PaneSplitDirection, SplitLayout,
-    SplitLayoutOptions, adjust_pane_indices_after_removal, agent_region_span,
-    focus_nvim_after_agent_reference, handle_layout_shortcuts, vertical_split_fits,
+    AgentArea, AgentAreaMode, AgentPaneShare, FrameLayout, PaneLayoutMode, PaneLayoutState,
+    PaneRect, PaneSplitDirection, PaneTargets, SplitLayout, SplitLayoutOptions,
+    adjust_pane_indices_after_removal, agent_region_span, chord_keeps_geometry,
+    focus_nvim_after_agent_reference, handle_layout_shortcuts, layout_mode_after_sync,
+    vertical_split_fits,
 };
 use pane::TerminalPane;
 use pane_controller::{PaneCommand, PaneEventOutcome, PaneRole, TerminalPaneController};
 use render::{DamageRect, draw_ratatui_buffer};
+use tab_strip::{TabStripEntry, tab_strip_buffer, tab_strip_hit_boxes};
 
 const INITIAL_WIDTH: usize = 960;
 const INITIAL_HEIGHT: usize = 540;
@@ -145,16 +151,37 @@ struct WinitGhosttyApp {
     font_renderer: FontRenderer,
     buffer: Vec<u32>,
     damage: Vec<DamageRect>,
-    panes: Vec<AppPane>,
+    panes: PaneStore,
     review_pane: Option<TerminalPaneController>,
     review_active: bool,
     acp_modal: AcpModalQueue,
     /// Control-plane bridges for PTY-hosted `via --acp-tui` panes (keyed by agent id).
     acp_tui_bridges: HashMap<String, AcpTuiBridge>,
+    /// What the ACP TUIs were last told about the tab strip, so a change is sent once.
+    acp_tui_strip_visible: bool,
     layout_state: PaneLayoutState,
+    /// Which panes the agent region shows, and in what tab order.
+    ///
+    /// Defaults to `Split`, which reproduces the pre-tabs geometry exactly.
+    agent_area: AgentArea,
     /// Split was auto-collapsed because the window is too narrow; restore on widen.
     split_collapsed_for_width: bool,
-    layout: SplitLayout,
+    /// The frame from just before a tab switch, when the switch can be repainted
+    /// regionally.
+    ///
+    /// Set by a tab switch whose geometry did not move: the visible agent pane
+    /// changes but the editor does not, so the repaint must stay inside the agent
+    /// region. `render` feeds this to [`tab_switch_region`], the same decision
+    /// `relayout_for_tab_switch` used, so the flag and the drawn region agree.
+    tab_switch_from: Option<FrameLayout>,
+    /// The strip cells currently on screen, so a change can be detected.
+    ///
+    /// Indicators move on background output (which only sets `dirty`) and on the
+    /// busy window expiring (which has no event at all), so the strip cannot rely on
+    /// a full redraw or a tab switch to repaint. Comparing against this is what makes
+    /// a new dot show up, and what lets `draw_ratatui_buffer` keep its early return.
+    last_drawn_strip_entries: Option<Vec<TabStripEntry>>,
+    layout: FrameLayout,
     width: usize,
     height: usize,
     modifiers: Modifiers,
@@ -172,6 +199,196 @@ struct WinitGhosttyApp {
     pending_config_reload: Option<UserConfig>,
     error: Option<anyhow::Error>,
     file_index: ReferenceIndex,
+}
+
+/// Stable identity for one pane slot.
+///
+/// Panes are addressed by id rather than by their position in [`PaneStore`], so
+/// spawning, terminating, or reordering panes never renumbers the survivors.
+/// Ids are never reused, so a stale id cannot alias a freshly spawned pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PaneId(u64);
+
+impl PaneId {
+    /// Raw numeric value, for diagnostics and labels.
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Build an id from a raw value.
+    ///
+    /// Test-only: production ids come from [`PaneStore::allocate_id`], which never
+    /// reuses a value. This exists so tests and pure renderers can name a pane
+    /// without standing up a store.
+    #[cfg(test)]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+}
+
+struct PaneSlot {
+    id: PaneId,
+    pane: AppPane,
+    /// Host-side work state for this pane (busy / exited / unseen output).
+    activity: PaneActivity,
+}
+
+/// Ordered pane slots plus the active pane identity.
+///
+/// `slots` order is the layout order (editor first, then agents) and is what the
+/// positional layout layer indexes. `active` is a [`PaneId`], so removing or
+/// reordering slots cannot silently move focus to a different pane.
+#[derive(Default)]
+struct PaneStore {
+    slots: Vec<PaneSlot>,
+    active: Option<PaneId>,
+    next_id: u64,
+}
+
+impl PaneStore {
+    fn allocate_id(&mut self) -> PaneId {
+        // Start at 1 so a default `PaneId(0)` is never a live pane.
+        self.next_id = self.next_id.max(1);
+        let id = PaneId(self.next_id);
+        self.next_id = self.next_id.saturating_add(1);
+        id
+    }
+
+    /// Append a pane and return its new id. The first pane becomes active.
+    fn push(&mut self, pane: AppPane) -> PaneId {
+        let id = self.allocate_id();
+        self.slots.push(PaneSlot {
+            id,
+            pane,
+            activity: PaneActivity::new(),
+        });
+        if self.active.is_none() {
+            self.active = Some(id);
+        }
+        id
+    }
+
+    /// Swap the pane inside `id`'s slot, keeping the slot and its identity.
+    /// The old pane is dropped, and its activity resets because a replacement is
+    /// a fresh process with no history.
+    /// Returns false when `id` is unknown.
+    fn replace(&mut self, id: PaneId, pane: AppPane) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        self.slots[index].pane = pane;
+        self.slots[index].activity = PaneActivity::new();
+        true
+    }
+
+    /// Apply an ACP progress update to the pane hosting `agent_id`.
+    fn apply_acp_progress(&mut self, agent_id: &str, id: &str, active: bool) {
+        let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.pane.agent_id_matches(agent_id))
+        else {
+            return;
+        };
+        slot.activity.apply_acp_progress(id, active);
+    }
+
+    /// Mark the pane with this id as seen, returning whether it changed.
+    fn mark_seen(&mut self, id: PaneId) -> bool {
+        let Some(index) = self.index_of(id) else {
+            return false;
+        };
+        let activity = &mut self.slots[index].activity;
+        let was_unseen = activity.unseen_output;
+        activity.mark_seen();
+        was_unseen
+    }
+
+    /// Activity for one pane.
+    fn activity(&self, id: PaneId) -> Option<&PaneActivity> {
+        self.slots
+            .iter()
+            .find(|slot| slot.id == id)
+            .map(|slot| &slot.activity)
+    }
+
+    /// Remove the slot at `index`. When it held the active pane, focus moves to
+    /// the pane that takes its place (or the new last pane).
+    fn remove_index(&mut self, index: usize) -> Option<PaneSlot> {
+        if index >= self.slots.len() {
+            return None;
+        }
+        let slot = self.slots.remove(index);
+        if self.active == Some(slot.id) {
+            let next = index.min(self.slots.len().saturating_sub(1));
+            self.active = self.slots.get(next).map(|slot| slot.id);
+        }
+        Some(slot)
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    /// Every slot id in slot order. Test-only: the layout path asks
+    /// [`WinitGhosttyApp::editor_and_agent_ids`] instead, because it needs the
+    /// editor separated from the agents.
+    #[cfg(test)]
+    fn ids(&self) -> Vec<PaneId> {
+        self.slots.iter().map(|slot| slot.id).collect()
+    }
+
+    fn id_at(&self, index: usize) -> Option<PaneId> {
+        self.slots.get(index).map(|slot| slot.id)
+    }
+
+    fn index_of(&self, id: PaneId) -> Option<usize> {
+        self.slots.iter().position(|slot| slot.id == id)
+    }
+
+    fn get(&self, id: PaneId) -> Option<&AppPane> {
+        self.slots
+            .iter()
+            .find(|slot| slot.id == id)
+            .map(|slot| &slot.pane)
+    }
+
+    fn get_mut(&mut self, id: PaneId) -> Option<&mut AppPane> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .map(|slot| &mut slot.pane)
+    }
+
+    fn first_mut(&mut self) -> Option<&mut AppPane> {
+        self.slots.first_mut().map(|slot| &mut slot.pane)
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, PaneSlot> {
+        self.slots.iter()
+    }
+
+    fn iter_mut(&mut self) -> std::slice::IterMut<'_, PaneSlot> {
+        self.slots.iter_mut()
+    }
+
+    fn active(&self) -> Option<PaneId> {
+        self.active
+    }
+
+    fn active_index(&self) -> Option<usize> {
+        self.active.and_then(|id| self.index_of(id))
+    }
+
+    fn set_active(&mut self, id: PaneId) {
+        if self.index_of(id).is_some() {
+            self.active = Some(id);
+        }
+    }
 }
 
 enum AppPane {
@@ -203,6 +420,15 @@ impl AppPane {
 
     fn agent_id_matches(&self, want: &str) -> bool {
         matches!(self, Self::Terminal(pane) if matches!(pane.role(), PaneRole::AgentTerminal { id, .. } if id == want))
+    }
+
+    /// Short display label for this agent pane, used as its tab title.
+    fn agent_label(&self) -> Option<String> {
+        let Self::Terminal(pane) = self;
+        match pane.role() {
+            PaneRole::AgentTerminal { label, .. } => Some(label.clone()),
+            _ => None,
+        }
     }
 
     /// Discovery record for an agent pane, or `None` for non-agent panes.
@@ -420,7 +646,7 @@ impl WinitGhosttyApp {
         let font_renderer = FontRenderer::new(&terminal_config)?;
         let pane_split_direction = PaneSplitDirection::for_window(INITIAL_WIDTH, INITIAL_HEIGHT);
         let pane_count = pane_count(&ui.app);
-        let layout = SplitLayout::for_window(
+        let split = SplitLayout::for_window(
             INITIAL_WIDTH,
             INITIAL_HEIGHT,
             pane_count,
@@ -428,6 +654,8 @@ impl WinitGhosttyApp {
             pane_split_direction,
             SplitLayoutOptions::unbounded(),
         );
+        // No slots exist yet; the frame carries rects only and is rebuilt by relayout.
+        let layout = FrameLayout::from_split(&[], split);
 
         let file_index = ReferenceIndex::default();
         let config_watcher = ConfigFileWatcher::new(ui.app.cli_overrides.clone());
@@ -445,18 +673,22 @@ impl WinitGhosttyApp {
             font_renderer,
             buffer: vec![terminal_config.theme.background; INITIAL_WIDTH * INITIAL_HEIGHT],
             damage: Vec::new(),
-            panes: Vec::new(),
+            panes: PaneStore::default(),
             review_pane: None,
             review_active: false,
             acp_modal: AcpModalQueue::new(),
             acp_tui_bridges: HashMap::new(),
+            acp_tui_strip_visible: false,
             layout_state: PaneLayoutState {
                 mode: PaneLayoutMode::Split,
                 split_direction: pane_split_direction,
                 active_pane: 0,
                 agent_share: AgentPaneShare::Auto,
             },
+            agent_area: AgentArea::new(),
             split_collapsed_for_width: false,
+            tab_switch_from: None,
+            last_drawn_strip_entries: None,
             layout,
             width: INITIAL_WIDTH,
             height: INITIAL_HEIGHT,
@@ -508,13 +740,13 @@ impl WinitGhosttyApp {
         self.resize_terminals(size.width as usize, size.height as usize);
 
         if self.panes.is_empty() {
-            self.panes = vec![self.create_editor_pane(
-                self.width,
-                self.height,
-                self.terminal_config.metrics,
-            )?];
+            let editor =
+                self.create_editor_pane(self.width, self.height, self.terminal_config.metrics)?;
+            self.panes.push(editor);
+            self.sync_active_pane_from_store();
             let nvim_args = nvim_args(&self.app);
-            let Some(editor_pane) = self.panes[0].as_terminal_mut() else {
+            let Some(editor_pane) = self.panes.first_mut().and_then(AppPane::as_terminal_mut)
+            else {
                 return Err(anyhow!("editor pane is not a terminal"));
             };
             editor_pane.spawn(
@@ -530,15 +762,17 @@ impl WinitGhosttyApp {
                     Some("agent"),
                     Some(agent_command.as_str()),
                 )?;
-                if let Some(index) = self
+                if let Some(id) = self
                     .panes
                     .iter()
-                    .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                    .find(|slot| slot.pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                    .map(|slot| slot.id)
                 {
                     // A narrow window may have collapsed the split onto the editor.
                     // Keys should follow the pane that is actually visible.
                     if self.layout_state.mode == PaneLayoutMode::Split {
-                        self.layout_state.active_pane = index;
+                        self.panes.set_active(id);
+                        self.sync_active_pane_from_store();
                     }
                 }
             } else {
@@ -591,7 +825,7 @@ impl WinitGhosttyApp {
         command: Option<&str>,
     ) -> Result<()> {
         // Deduplicate: if a pane with this id already exists, do nothing.
-        if self.panes.iter().any(|pane| pane.agent_id_matches(id)) {
+        if self.panes.iter().any(|slot| slot.pane.agent_id_matches(id)) {
             info!(%id, "create_agent_pane called for existing id – ignoring");
             return Ok(());
         }
@@ -599,43 +833,8 @@ impl WinitGhosttyApp {
         let metrics = self.terminal_config.metrics;
         // Use current layout dimensions to size the new pane; relayout will adjust.
         let (w, h) = (self.width, self.height);
-        let label = role.unwrap_or(id).to_string();
-        // Prefer the command passed to SpawnAgent, then the configured agent_command,
-        // finally fall back to $SHELL so the pane is at least usable.
-        let cmd = command
-            .map(|s| s.to_string())
-            .or_else(|| self.app.user.agent_command.clone())
-            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
-
-        if crate::config::is_acp_command(&cmd) {
-            self.spawn_acp_tui_pane(id, &label, role.unwrap_or(id), &cmd, w, h, metrics)?;
-        } else {
-            // Leak a small string for the static title requirement of TerminalPane.
-            let title: &'static str = Box::leak(label.clone().into_boxed_str());
-            let mut pane =
-                TerminalPane::new(title, w / 2, h / 2, metrics, &self.terminal_config.theme)?;
-            let role_label = role.unwrap_or(id);
-            pane.spawn_shell_command(
-                &cmd,
-                &self.app.launch.working_directory,
-                &[
-                    (crate::agent_bus::VIA_AGENT_ID_ENV, id),
-                    (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
-                ],
-                self.output_notifier.clone(),
-            )?;
-            self.panes
-                .push(AppPane::Terminal(TerminalPaneController::new(
-                    PaneRole::AgentTerminal {
-                        id: id.to_string(),
-                        label,
-                        command: Some(cmd),
-                        acp_tui: false,
-                    },
-                    pane,
-                    self.app.user.scroll_sensitivity,
-                )));
-        }
+        let pane = self.spawn_agent_terminal(id, role, command, w, h, metrics)?;
+        self.panes.push(pane);
 
         self.relayout();
         self.write_agent_registry();
@@ -644,9 +843,67 @@ impl WinitGhosttyApp {
         Ok(())
     }
 
-    /// Bind the ACP UI socket, then spawn `via --acp-tui` in a PTY pane.
+    /// Spawn an agent pane and return it without inserting it into the store.
+    ///
+    /// Both [`Self::create_agent_pane`] (new slot) and
+    /// [`Self::respawn_primary_agent_pane`] (existing slot) go through here, so a
+    /// respawn cannot drift from a first spawn.
+    fn spawn_agent_terminal(
+        &mut self,
+        id: &str,
+        role: Option<&str>,
+        command: Option<&str>,
+        width: usize,
+        height: usize,
+        metrics: TerminalMetrics,
+    ) -> Result<AppPane> {
+        let label = role.unwrap_or(id).to_string();
+        let role_label = role.unwrap_or(id);
+        // Prefer the command passed to SpawnAgent, then the configured agent_command,
+        // finally fall back to $SHELL so the pane is at least usable.
+        let cmd = command
+            .map(str::to_string)
+            .or_else(|| self.app.user.agent_command.clone())
+            .unwrap_or_else(|| std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()));
+
+        if crate::config::is_acp_command(&cmd) {
+            return self
+                .spawn_acp_tui_terminal(id, &label, role_label, &cmd, width, height, metrics);
+        }
+
+        // Leak a small string for the static title requirement of TerminalPane.
+        let title: &'static str = Box::leak(label.clone().into_boxed_str());
+        let mut pane = TerminalPane::new(
+            title,
+            width / 2,
+            height / 2,
+            metrics,
+            &self.terminal_config.theme,
+        )?;
+        pane.spawn_shell_command(
+            &cmd,
+            &self.app.launch.working_directory,
+            &[
+                (crate::agent_bus::VIA_AGENT_ID_ENV, id),
+                (crate::agent_bus::VIA_AGENT_ROLE_ENV, role_label),
+            ],
+            self.output_notifier.clone(),
+        )?;
+        Ok(AppPane::Terminal(TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: id.to_string(),
+                label,
+                command: Some(cmd),
+                acp_tui: false,
+            },
+            pane,
+            self.app.user.scroll_sensitivity,
+        )))
+    }
+
+    /// Bind the ACP UI socket and spawn `via --acp-tui`, returning the pane uninserted.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_acp_tui_pane(
+    fn spawn_acp_tui_terminal(
         &mut self,
         id: &str,
         label: &str,
@@ -655,7 +912,7 @@ impl WinitGhosttyApp {
         width: usize,
         height: usize,
         metrics: TerminalMetrics,
-    ) -> Result<()> {
+    ) -> Result<AppPane> {
         let runtime_dir = crate::config::runtime_base_dir();
         let socket_path = socket_path_for_agent(&runtime_dir, id);
         let bridge = AcpTuiBridge::bind(id, socket_path.clone())
@@ -692,19 +949,17 @@ impl WinitGhosttyApp {
         .with_context(|| format!("spawn via --acp-tui for agent {id}"))?;
 
         self.acp_tui_bridges.insert(id.to_string(), bridge);
-        self.panes
-            .push(AppPane::Terminal(TerminalPaneController::new(
-                PaneRole::AgentTerminal {
-                    id: id.to_string(),
-                    label: label.to_string(),
-                    command: Some(acp_command.to_string()),
-                    acp_tui: true,
-                },
-                pane,
-                self.app.user.scroll_sensitivity,
-            )));
         info!(%id, socket = %socket.display(), bin = %bin.display(), "spawned ACP TUI pane");
-        Ok(())
+        Ok(AppPane::Terminal(TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: id.to_string(),
+                label: label.to_string(),
+                command: Some(acp_command.to_string()),
+                acp_tui: true,
+            },
+            pane,
+            self.app.user.scroll_sensitivity,
+        )))
     }
 
     fn terminate_agent_pane(&mut self, id: &str) -> Result<()> {
@@ -713,21 +968,24 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let Some(index) = self.panes.iter().position(|pane| pane.agent_id_matches(id)) else {
+        let Some(index) = self
+            .panes
+            .iter()
+            .position(|slot| slot.pane.agent_id_matches(id))
+        else {
             info!(%id, "terminate_agent called for unknown id – ignoring");
             return Ok(());
         };
 
-        if !self.panes[index].is_terminable_sub_agent() {
+        if !self.panes.slots[index].pane.is_terminable_sub_agent() {
             info!(%id, "terminate_agent refused for non-sub-agent pane");
             return Ok(());
         }
 
-        self.panes[index].terminate_agent()?;
-        self.panes.remove(index);
+        self.panes.slots[index].pane.terminate_agent()?;
+        self.remove_pane_at(index);
         self.close_acp_tui_bridge(id);
 
-        adjust_pane_indices_after_removal(&mut self.layout_state, index, self.panes.len());
         self.acp_modal.remove_agent(id);
 
         self.relayout();
@@ -744,7 +1002,7 @@ impl WinitGhosttyApp {
         let records: Vec<crate::agent_bus::AgentRecord> = self
             .panes
             .iter()
-            .filter_map(|pane| pane.agent_record())
+            .filter_map(|slot| slot.pane.agent_record())
             .collect();
         if let Err(error) = crate::agent_bus::write_registry(&self.app.paths.agents_dir, &records) {
             warn!(%error, "failed to write agent registry");
@@ -755,15 +1013,19 @@ impl WinitGhosttyApp {
     /// The primary agent is respawned instead of removed.
     fn prune_exited_agent_panes(&mut self) {
         let mut acp_tui_exited: Vec<String> = Vec::new();
-        let mut pty_remove: Vec<usize> = Vec::new();
-        let mut primary_respawn: Option<(String, Option<String>)> = None;
-        for (index, pane) in self.panes.iter_mut().enumerate() {
+        let mut pty_remove: Vec<PaneId> = Vec::new();
+        let mut primary_respawn: Option<(PaneId, String, Option<String>)> = None;
+        for slot in self.panes.iter_mut() {
+            let PaneSlot { id, pane, activity } = slot;
             if !pane.has_exited_agent() {
                 continue;
             }
+            // Record the exit before the pane is dropped. ACP TUI panes are removed
+            // by the mediator a moment later, so their slot may still be on screen.
+            activity.mark_exited();
             if pane.agent_id_matches(PRIMARY_PTY_AGENT_ID) {
                 if let Some((label, command)) = pane.primary_agent_launch() {
-                    primary_respawn = Some((label, command));
+                    primary_respawn = Some((*id, label, command));
                 }
                 continue;
             }
@@ -772,7 +1034,7 @@ impl WinitGhosttyApp {
                     acp_tui_exited.push(id);
                 }
             } else {
-                pty_remove.push(index);
+                pty_remove.push(*id);
             }
         }
 
@@ -784,26 +1046,18 @@ impl WinitGhosttyApp {
         }
 
         let mut removed_any = false;
-        for index in pty_remove.into_iter().rev() {
-            self.panes.remove(index);
-            adjust_pane_indices_after_removal(&mut self.layout_state, index, self.panes.len());
-            removed_any = true;
-        }
-
-        // Resolve the primary by id after other removals so the pane index stays valid.
-        if let Some((label, command)) = primary_respawn {
-            if let Some(index) = self
-                .panes
-                .iter()
-                .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
-            {
-                if let Err(error) =
-                    self.respawn_primary_agent_pane(index, &label, command.as_deref())
-                {
-                    error!(%error, "failed to respawn primary agent pane");
-                }
+        for id in pty_remove {
+            if self.remove_pane_by_id(id) {
                 removed_any = true;
             }
+        }
+
+        // The primary is addressed by id, so removals above cannot invalidate it.
+        if let Some((id, label, command)) = primary_respawn {
+            if let Err(error) = self.respawn_primary_agent_pane(id, &label, command.as_deref()) {
+                error!(%error, "failed to respawn primary agent pane");
+            }
+            removed_any = true;
         }
 
         if !removed_any {
@@ -817,43 +1071,44 @@ impl WinitGhosttyApp {
         info!("pruned/respawned exited agent pane(s); refreshed agent registry");
     }
 
-    /// Replace an exited primary agent pane with a fresh spawn at the same index.
+    /// Replace an exited primary agent pane in its own slot, keeping its [`PaneId`].
     fn respawn_primary_agent_pane(
         &mut self,
-        index: usize,
+        id: PaneId,
         label: &str,
         command: Option<&str>,
     ) -> Result<()> {
-        if index >= self.panes.len() || !self.panes[index].agent_id_matches(PRIMARY_PTY_AGENT_ID) {
+        if !self
+            .panes
+            .get(id)
+            .is_some_and(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+        {
             return Ok(());
         }
 
-        if self.panes[index].is_acp_tui_agent() {
+        if self.panes.get(id).is_some_and(AppPane::is_acp_tui_agent) {
             self.close_acp_tui_bridge(PRIMARY_PTY_AGENT_ID);
         }
 
-        // `create_agent_pane` refuses a duplicate id, so the exited pane must come
-        // out first. Put it back if the replacement spawn fails so the next drain
-        // can retry instead of leaving the session without a primary agent.
-        let old = self.panes.remove(index);
-        if let Err(error) = self.create_agent_pane(PRIMARY_PTY_AGENT_ID, Some(label), command) {
-            let insert_at = index.min(self.panes.len());
-            self.panes.insert(insert_at, old);
-            return Err(error);
-        }
+        let metrics = self.terminal_config.metrics;
+        let (w, h) = (self.width, self.height);
+        // Keep the exited slot on failure so the next drain can retry instead of
+        // leaving the session without a primary agent.
+        let pane =
+            self.spawn_agent_terminal(PRIMARY_PTY_AGENT_ID, Some(label), command, w, h, metrics)?;
 
-        // `create_agent_pane` appends; put the primary back where it was.
-        if let Some(pane) = self.panes.pop() {
-            let insert_at = index.min(self.panes.len());
-            self.panes.insert(insert_at, pane);
+        if !self.panes.replace(id, pane) {
+            warn!(?id, "primary agent pane vanished before respawn completed");
+            return Ok(());
         }
-
-        info!(%index, "respawned primary agent pane");
+        info!(?id, "respawned primary agent pane");
         Ok(())
     }
 
     fn editor_has_exited(&mut self) -> bool {
-        self.panes.iter_mut().any(|pane| pane.editor_has_exited())
+        self.panes
+            .iter_mut()
+            .any(|slot| slot.pane.editor_has_exited())
     }
 
     fn request_quit(&mut self, event_loop: &ActiveEventLoop) {
@@ -898,6 +1153,10 @@ impl WinitGhosttyApp {
                         let light = self.terminal_config.theme.is_light();
                         if let Err(err) = bridge.send(HostToTui::Appearance { light }) {
                             warn!(%agent_id, %err, "failed to send ACP TUI appearance");
+                        }
+                        // A new pane starts assuming no strip; tell it if one is up.
+                        if self.acp_tui_strip_visible {
+                            let _ = bridge.send(HostToTui::TabStripVisible { visible: true });
                         }
                     }
                     TuiToHost::Submit { text } => {
@@ -1018,18 +1277,50 @@ impl WinitGhosttyApp {
         };
 
         if self.layout_state.mode == PaneLayoutMode::Split && !fits {
-            self.layout_state.mode = PaneLayoutMode::PaneMaximized(0);
+            self.layout_state.mode = PaneLayoutMode::EditorFull;
             self.split_collapsed_for_width = true;
             return;
         }
 
-        if self.layout_state.mode == PaneLayoutMode::PaneMaximized(0)
+        if self.layout_state.mode == PaneLayoutMode::EditorFull
             && self.split_collapsed_for_width
             && fits
         {
             self.layout_state.mode = PaneLayoutMode::Split;
             self.split_collapsed_for_width = false;
         }
+    }
+
+    /// The pane ids and editor index the layout layer needs to address tabs.
+    ///
+    /// The layout layer works in slot indices; tab addressing needs identity, and the
+    /// editor's slot is not always 0-by-assumption, so both come from one place.
+    fn pane_targets(&self) -> PaneTargets {
+        let (editor, _) = self.editor_and_agent_ids();
+        let slots: Vec<PaneId> = self.panes.iter().map(|slot| slot.id).collect();
+        let editor_index = editor.and_then(|id| slots.iter().position(|slot| *slot == id));
+        PaneTargets {
+            slots,
+            editor_index,
+        }
+    }
+
+    /// Split the live slots into the editor id and the agent ids, in slot order.
+    ///
+    /// The editor is the one pane that is never a tab, so the agent region model
+    /// needs it separately to keep its own invariant. It is `None` only if the
+    /// slots somehow hold no editor, which the startup path rules out.
+    fn editor_and_agent_ids(&self) -> (Option<PaneId>, Vec<PaneId>) {
+        let mut editor = None;
+        let mut agents = Vec::new();
+        for slot in self.panes.iter() {
+            if slot.pane.is_agent_pane() {
+                agents.push(slot.id);
+            } else if editor.is_none() {
+                editor = Some(slot.id);
+            }
+        }
+        (editor, agents)
     }
 
     fn relayout(&mut self) {
@@ -1039,14 +1330,32 @@ impl WinitGhosttyApp {
 
         self.adjust_layout_mode_for_width();
 
-        let new_layout = SplitLayout::for_window(
+        // Tabs are a pure model over pane identity: reconcile it with the live
+        // panes, then ask it which panes this frame should place. In the default
+        // `Split` mode this list is the editor plus every agent in slot order,
+        // i.e. exactly the pre-tabs geometry.
+        let (editor, agents) = self.editor_and_agent_ids();
+        sync_agent_area(&mut self.agent_area, &mut self.panes, &agents, editor);
+        // `sync_agent_area` may have moved keyboard focus onto the active tab. The slot
+        // index has to follow, or the Alt-key path and the frame disagree about focus.
+        self.sync_active_pane_from_store();
+        // Closing the last agent while one was fullscreen would leave nothing to fill
+        // the window, so the mode falls back to Split and the editor comes back.
+        self.layout_state.mode =
+            layout_mode_after_sync(self.layout_state.mode, self.agent_area.active().is_some());
+        self.sync_acp_tui_strip_state();
+        let ids = self
+            .agent_area
+            .visible_panes(editor, &agents, self.layout_state.mode);
+        let split = SplitLayout::for_window(
             self.width,
             self.height,
-            self.panes.len().max(1),
+            ids.len().max(1),
             self.layout_state.mode,
             self.layout_state.split_direction,
             self.split_layout_options(),
         );
+        let new_layout = FrameLayout::from_split(&ids, split);
         if new_layout == self.layout {
             return;
         }
@@ -1059,14 +1368,17 @@ impl WinitGhosttyApp {
 
     fn resize_panes(&mut self) {
         let metrics = self.terminal_config.metrics;
+        let placed = self.layout.placed().to_vec();
 
-        for (index, pane) in self.panes.iter_mut().enumerate() {
-            let rect = self.layout.pane(index);
+        for placed in placed {
+            let rect = self.effective_pane_rect(placed.id, placed.rect);
             if rect.width == 0 || rect.height == 0 {
                 continue;
             }
-
-            pane.resize_with_metrics(rect.width, rect.height, metrics);
+            let Some(slot) = self.panes.get_mut(placed.id) else {
+                continue;
+            };
+            slot.resize_with_metrics(rect.width, rect.height, metrics);
         }
 
         if let Some(review_pane) = &mut self.review_pane {
@@ -1286,26 +1598,52 @@ impl WinitGhosttyApp {
             return Ok(());
         }
         let agent_span = agent_region_span(
-            &self.layout,
+            self.layout.split(),
             self.layout_state.split_direction,
             self.width,
             self.height,
         );
-        let layout_shortcut_consumed = handle_layout_shortcuts(
+        // Snapshot both modes and the focused pane before the chord runs: entering tabs
+        // or AgentFull changes geometry, and the editor's focus chrome depends on which
+        // pane had focus before the switch.
+        let area_mode_before = self.agent_area.mode();
+        let layout_mode_before = self.layout_state.mode;
+        let focus_before_shortcut = self.panes.active();
+        let pane_targets = self.pane_targets();
+        let consumed_chord = handle_layout_shortcuts(
             &pressed_keys,
             self.modifiers,
             event.repeat,
             self.panes.len(),
             &mut self.layout_state,
+            &mut self.agent_area,
             agent_span,
+            &pane_targets,
         );
-        if layout_shortcut_consumed {
+        let layout_shortcut_consumed = consumed_chord.is_some();
+        if let Some(chord) = consumed_chord {
             self.split_collapsed_for_width = false;
-            self.relayout();
+            // Shortcuts are index-based; fold the new index back into pane identity.
+            self.adopt_indexed_focus();
+            if chord_keeps_geometry(chord, area_mode_before, layout_mode_before) {
+                // Same regional repaint a strip click uses, so an unchanged frame does
+                // not repaint the editor. `relayout_for_tab_switch` owns `force_redraw`
+                // here: it clears the flag `relayout` raised, and preserves a full
+                // redraw that was already pending. Setting the flag afterwards would
+                // undo exactly that, so it is set only on the geometry-changing path.
+                self.tab_switch_from = self.relayout_for_tab_switch(focus_before_shortcut);
+            } else {
+                // Everything else changes geometry (mode, direction, focus) and needs
+                // the full redraw.
+                self.relayout();
+                self.force_redraw = true;
+            }
             self.dirty = true;
-            self.force_redraw = true;
         }
-        let Some(active_pane) = self.panes.get_mut(self.layout_state.active_pane) else {
+        let Some(active_id) = self.panes.active() else {
+            return Ok(());
+        };
+        let Some(active_pane) = self.panes.get_mut(active_id) else {
             return Ok(());
         };
         let outcome = active_pane.handle_key_event(
@@ -1393,6 +1731,7 @@ impl WinitGhosttyApp {
     fn open_nvim_review(&mut self) {
         self.review_active = false;
         self.layout_state.focus_maximized_editor();
+        self.adopt_indexed_focus();
         self.relayout();
         self.events.try_send(Event::Ui(UiEvent::ReviewRequested));
     }
@@ -1415,7 +1754,10 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let Some(active_pane) = self.panes.get_mut(self.layout_state.active_pane) else {
+        let Some(active_id) = self.panes.active() else {
+            return Ok(());
+        };
+        let Some(active_pane) = self.panes.get_mut(active_id) else {
             return Ok(());
         };
         let outcome = active_pane.handle_text_commit(text, self.modifiers)?;
@@ -1449,12 +1791,12 @@ impl WinitGhosttyApp {
         let Some((x, y)) = self.cursor_position else {
             return Ok(());
         };
-        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+        let Some((pane_id, local_x, local_y)) = self.pane_local_hit(x, y) else {
             return Ok(());
         };
-        if let Some(pane) = self.panes.get_mut(pane_index) {
+        if let Some(pane) = self.panes.get_mut(pane_id) {
             let outcome =
-                pane.handle_mouse_wheel(scroll_delta, x - rect.x, y - rect.y, self.modifiers)?;
+                pane.handle_mouse_wheel(scroll_delta, local_x, local_y, self.modifiers)?;
             self.apply_pane_outcome(outcome);
         }
         Ok(())
@@ -1486,33 +1828,36 @@ impl WinitGhosttyApp {
         let Some((x, y)) = self.cursor_position else {
             return Ok(());
         };
-        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
-            return Ok(());
-        };
-        if pane_index >= self.panes.len() {
-            if state == ElementState::Pressed {
-                self.set_active_pane(pane_index);
-            }
+        // The strip owns its row, so it must be offered the click before the pane
+        // hit test: otherwise a click on a tab would be routed to the agent pane
+        // drawn underneath it. There is no close button, so a hit only activates.
+        if state == ElementState::Pressed && self.handle_tab_strip_click(x, y) {
             return Ok(());
         }
-        for (index, pane) in self.panes.iter_mut().enumerate() {
-            if index != pane_index {
-                self.dirty |= pane.clear_selection();
+        let Some((pane_id, local_x, local_y)) = self.pane_local_hit(x, y) else {
+            return Ok(());
+        };
+        for slot in self.panes.iter_mut() {
+            if slot.id != pane_id {
+                self.dirty |= slot.pane.clear_selection();
             }
         }
 
-        let outcome = self.panes[pane_index].handle_mouse_input(
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return Ok(());
+        };
+        let outcome = pane.handle_mouse_input(
             state,
             button,
-            x - rect.x,
-            y - rect.y,
+            local_x,
+            local_y,
             self.modifiers,
             ReferenceContext::new(&self.app.launch.working_directory, Some(&self.file_index)),
         )?;
         let reference_navigation = Self::is_reference_navigation_command(&outcome.command);
         self.apply_pane_outcome(outcome);
         if state == ElementState::Pressed && !reference_navigation {
-            self.set_active_pane(pane_index);
+            self.set_active_pane(pane_id);
         }
         Ok(())
     }
@@ -1542,16 +1887,18 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let Some((pane_index, rect)) = self.layout.pane_at(x, y) else {
+        let Some((pane_id, local_x, local_y)) = self.pane_local_hit(x, y) else {
             return Ok(());
         };
 
-        if pane_index != self.layout_state.active_pane || pane_index >= self.panes.len() {
+        if self.panes.active() != Some(pane_id) {
             return Ok(());
         }
 
-        let outcome =
-            self.panes[pane_index].handle_mouse_motion(x - rect.x, y - rect.y, self.modifiers)?;
+        let Some(pane) = self.panes.get_mut(pane_id) else {
+            return Ok(());
+        };
+        let outcome = pane.handle_mouse_motion(local_x, local_y, self.modifiers)?;
         self.apply_pane_outcome(outcome);
         Ok(())
     }
@@ -1580,6 +1927,8 @@ impl WinitGhosttyApp {
 
     fn focus_nvim_after_reference_navigation(&mut self) {
         let focus = focus_nvim_after_agent_reference(&mut self.layout_state);
+        // The helper sets a positional index; fold it back into pane identity.
+        self.adopt_indexed_focus();
         if focus.relayout_needed {
             self.relayout();
         } else if focus.focus_changed {
@@ -1594,9 +1943,18 @@ impl WinitGhosttyApp {
         // during the drain will set `pending` again and fire a new UserEvent::PtyOutput,
         // rather than being silently swallowed.
         self.output_notifier.clear();
+        let now = Instant::now();
+        let active_tab = self.agent_area.active();
         let mut symbol_names = Vec::new();
-        let mut symbol_sources = Vec::new();
-        for (index, pane) in self.panes.iter_mut().enumerate() {
+        let mut symbol_sources: Vec<PaneId> = Vec::new();
+        for slot in self.panes.iter_mut() {
+            let id = slot.id;
+            let PaneSlot { pane, activity, .. } = slot;
+            // The editor is never a tab, so it has no unseen state to track. Treating
+            // it as an inactive tab would leave a permanent unseen dot on a pane the
+            // strip never shows.
+            let is_agent = pane.is_agent_pane();
+            let output_is_seen = !is_agent || active_tab == Some(id);
             if let Some(chunks) = pane.drain_agent_output_chunks() {
                 let drained = !chunks.is_empty();
                 for chunk in &chunks {
@@ -1609,20 +1967,22 @@ impl WinitGhosttyApp {
                 }
                 self.dirty |= drained;
                 if drained {
+                    activity.mark_output(now, output_is_seen);
                     let before = symbol_names.len();
                     symbol_names.extend(pane.take_new_symbol_queries());
                     if symbol_names.len() != before {
-                        symbol_sources.push(index);
+                        symbol_sources.push(id);
                     }
                 }
             } else {
                 let drained = pane.drain_output();
                 self.dirty |= drained;
                 if drained {
+                    activity.mark_output(now, output_is_seen);
                     let before = symbol_names.len();
                     symbol_names.extend(pane.take_new_symbol_queries());
                     if symbol_names.len() != before {
-                        symbol_sources.push(index);
+                        symbol_sources.push(id);
                     }
                 }
             }
@@ -1639,8 +1999,10 @@ impl WinitGhosttyApp {
         {
             // The names were marked seen before the send. Put them back so the
             // next drain can try again instead of dropping them for the session.
-            for index in symbol_sources {
-                self.panes[index].forget_symbol_queries(&queued);
+            for id in symbol_sources {
+                if let Some(pane) = self.panes.get_mut(id) {
+                    pane.forget_symbol_queries(&queued);
+                }
             }
         }
         if let Some(review_pane) = &mut self.review_pane {
@@ -1669,9 +2031,10 @@ impl WinitGhosttyApp {
 
         self.terminal_config.theme = loaded_config.theme.clone();
         self.font_renderer.theme = loaded_config.theme;
-        for pane in &mut self.panes {
-            pane.apply_theme(&self.terminal_config.theme);
-            pane.notify_theme_changed(&self.terminal_config.theme)?;
+        for slot in self.panes.iter_mut() {
+            slot.pane.apply_theme(&self.terminal_config.theme);
+            slot.pane
+                .notify_theme_changed(&self.terminal_config.theme)?;
         }
         if let Some(review_pane) = &mut self.review_pane {
             review_pane.apply_theme(&self.terminal_config.theme);
@@ -1724,8 +2087,8 @@ impl WinitGhosttyApp {
         }
         if self.app.user.scroll_sensitivity != user.scroll_sensitivity {
             let sensitivity = user.scroll_sensitivity;
-            for pane in &mut self.panes {
-                if let Some(pane) = pane.as_terminal_mut() {
+            for slot in self.panes.iter_mut() {
+                if let Some(pane) = slot.pane.as_terminal_mut() {
                     pane.set_scroll_sensitivity(sensitivity);
                 }
             }
@@ -1755,6 +2118,22 @@ impl WinitGhosttyApp {
         self.pending_config_reload = Some(user);
     }
 
+    /// Tell the ACP TUIs whether a tab strip now names them, once per change.
+    ///
+    /// Without a strip the pane header repeats the agent id; with one it would only
+    /// duplicate the tab label.
+    fn sync_acp_tui_strip_state(&mut self) {
+        let visible = self.tab_strip_enabled();
+        if visible == self.acp_tui_strip_visible {
+            return;
+        }
+        self.acp_tui_strip_visible = visible;
+        let agent_ids: Vec<String> = self.acp_tui_bridges.keys().cloned().collect();
+        for agent_id in agent_ids {
+            let _ = self.send_acp_tui(&agent_id, HostToTui::TabStripVisible { visible });
+        }
+    }
+
     fn broadcast_acp_tui_appearance(&mut self) {
         let light = self.terminal_config.theme.is_light();
         let msg = HostToTui::Appearance { light };
@@ -1764,11 +2143,149 @@ impl WinitGhosttyApp {
         }
     }
 
-    fn set_active_pane(&mut self, pane_index: usize) {
-        if self.layout_state.active_pane != pane_index {
-            self.layout_state.active_pane = pane_index;
-            self.dirty = true;
+    /// Focus `id` (no-op when it is already active or unknown).
+    /// Focus `id`. In tabs mode the new tab also has to be laid out: the previous
+    /// tab's rect is the only agent rect in the frame, so without a relayout the
+    /// newly active pane would have no placement and the strip would vanish.
+    ///
+    /// A tab switch repaints only the agent region: `relayout` raises `force_redraw`
+    /// because it cannot know why it was called, so when the geometry turns out to be
+    /// unchanged the full redraw is downgraded here. Otherwise the editor - which a
+    /// tab switch never touches - would be repainted on every click.
+    fn set_active_pane(&mut self, id: PaneId) {
+        if self.panes.active() == Some(id) {
+            return;
+        }
+        // Decided before focus moves: `tab_activation_needs_relayout` would otherwise
+        // compare `id` against itself and never report a switch.
+        let needs_relayout = tab_activation_needs_relayout(&self.agent_area, id);
+        // `move_focus_to` returns the pane that had focus first, so the chrome rule
+        // cannot be evaluated against the post-move state by mistake. Fusing the two
+        // is deliberate: a pure test cannot see caller ordering, so the ordering is
+        // made unrepresentable instead.
+        let focus_before = self.move_focus_to(id);
+        self.dirty = true;
+
+        if needs_relayout {
+            self.tab_switch_from = self.relayout_for_tab_switch(focus_before);
+        } else {
             self.force_redraw = true;
+        }
+    }
+
+    /// Move focus to `id` and report the pane that had it before.
+    ///
+    /// The tab model and the unseen marker move with focus, exactly as
+    /// [`Self::set_active_pane`] did inline. Returning the previous focus is what lets
+    /// [`Self::relayout_for_tab_switch`] tell whether the editor's chrome changed,
+    /// without any caller having to remember to capture it first.
+    fn move_focus_to(&mut self, id: PaneId) -> Option<PaneId> {
+        let before = self.panes.active();
+        self.panes.set_active(id);
+        self.note_focus(id);
+        self.sync_active_pane_from_store();
+        before
+    }
+
+    /// Relayout after a tab switch, returning the pre-switch frame when the repaint
+    /// can stay regional.
+    ///
+    /// `focus_before` is the pane that had focus *before* the switch. Both callers must
+    /// capture it before they move focus (`set_active_pane` and `adopt_indexed_focus`
+    /// both do), because the chrome rule needs to know whether focus entered or left
+    /// the editor.
+    ///
+    /// `relayout` raises `force_redraw` because it cannot know why it was called. The
+    /// decision about how much to repaint is [`tab_switch_repaint`]'s, the same
+    /// function `render` asks, so the flag set here and the region drawn there can
+    /// never disagree. `Some(before)` means "only the agent region changed" and is
+    /// handed to `render` for the next frame; `None` means the whole window must be
+    /// repainted.
+    ///
+    /// Two things force the whole window even when no rect moved:
+    ///
+    /// - the editor's focus chrome changed. Its border and dim tint live outside the
+    ///   agent region, so a regional repaint would leave the editor looking focused
+    ///   while the agent is drawn focused too.
+    /// - a full redraw was already pending. A resize or font change sets `force_redraw`
+    ///   and waits for the next `RedrawRequested`, and a strip click landing first must
+    ///   not downgrade that - it would clear the buffer and leave the editor unpainted.
+    ///
+    /// On a Full fallback the flag stays set; only a real Region clears it.
+    fn relayout_for_tab_switch(&mut self, focus_before: Option<PaneId>) -> Option<FrameLayout> {
+        let pending = self.force_redraw;
+        let before = self.layout.clone();
+        self.relayout();
+        let (editor, _) = self.editor_and_agent_ids();
+        let chrome_changes = editor_chrome_changes(
+            self.show_pane_focus_chrome(),
+            focus_before,
+            self.panes.active(),
+            editor,
+        );
+        let decision = tab_switch_repaint(
+            &before,
+            &self.layout,
+            self.agent_region_rect(),
+            chrome_changes,
+        );
+        self.force_redraw = force_redraw_after_tab_switch(pending, decision);
+        match decision {
+            TabSwitchRepaint::Region(_) => Some(before),
+            TabSwitchRepaint::Full => None,
+        }
+    }
+    /// Side effects shared by every path that changes which pane has focus.
+    ///
+    /// Both the mouse path and the Alt-key path route through here, so the tab
+    /// model and the unseen marker cannot drift apart. See [`note_focus`].
+    fn note_focus(&mut self, id: PaneId) {
+        note_focus(&mut self.panes, &mut self.agent_area, id);
+    }
+
+    /// Mirror the store's active pane into the layout state's positional index.
+    ///
+    /// [`PaneStore`] owns focus by identity; the layout layer addresses panes by
+    /// index because the Alt-key shortcuts are index-based. This is the single
+    /// place the identity becomes an index again.
+    fn sync_active_pane_from_store(&mut self) {
+        if let Some(index) = self.panes.active_index() {
+            self.layout_state.active_pane = index;
+        }
+    }
+
+    /// Fold a positional focus change from the layout layer back into the store.
+    ///
+    /// Called after shortcut handling, which only knows indices. This must mirror
+    /// [`Self::set_active_pane`] exactly - the Alt-key path is a second entry point
+    /// to the same focus change, and skipping the tab model here would leave the
+    /// newly focused pane stuck with `unseen_output` and `AgentArea::active` stale.
+    fn adopt_indexed_focus(&mut self) {
+        let Some(id) = self.panes.id_at(self.layout_state.active_pane) else {
+            return;
+        };
+        self.panes.set_active(id);
+        self.note_focus(id);
+    }
+
+    /// Remove the slot at `index`, keeping focus on a valid pane.
+    fn remove_pane_at(&mut self, index: usize) -> Option<PaneSlot> {
+        let removed = self.panes.remove_index(index)?;
+        // `active_pane` is a slot index, so it has to be shifted; the layout mode no
+        // longer carries an index of its own. The store then supplies the active
+        // identity, which is index-independent, and the next relayout reconciles the
+        // tab model through `sync_agent_area`.
+        adjust_pane_indices_after_removal(&mut self.layout_state, index, self.panes.len());
+        self.sync_active_pane_from_store();
+        self.dirty = true;
+        self.force_redraw = true;
+        Some(removed)
+    }
+
+    fn remove_pane_by_id(&mut self, id: PaneId) -> bool {
+        match self.panes.index_of(id) {
+            Some(index) => self.remove_pane_at(index).is_some(),
+            None => false,
         }
     }
 
@@ -1781,14 +2298,200 @@ impl WinitGhosttyApp {
         if let Some(i) = self
             .panes
             .iter()
-            .position(|pane| pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+            .position(|slot| slot.pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
         {
-            return self.panes[i].as_terminal_mut();
+            return self.panes.slots[i].pane.as_terminal_mut();
         }
         self.panes
             .iter_mut()
-            .find(|pane| pane.is_agent_terminal())
-            .and_then(AppPane::as_terminal_mut)
+            .find(|slot| slot.pane.is_agent_terminal())
+            .and_then(|slot| slot.pane.as_terminal_mut())
+    }
+
+    /// Whether the tab strip reserves geometry.
+    ///
+    /// The strip owns a row of the agent region whenever tabs are on, whether or
+    /// not it is currently drawn. Reserving it unconditionally is what keeps the
+    /// terminal grid stable across a review session.
+    fn tab_strip_enabled(&self) -> bool {
+        tab_strip_visible(self.agent_area.mode(), self.agent_area.order().len())
+    }
+
+    /// The strip rect and the rect left to `pane_rect` below it.
+    ///
+    /// Returns `None` when the strip is off or that pane is not the one hosting it.
+    /// Both `resize_panes` and `render` go through here, so the terminal grid and the
+    /// drawn pixels agree on how much room the pane actually has.
+    fn strip_split(&self, id: PaneId) -> Option<(PaneRect, PaneRect)> {
+        if !self.tab_strip_enabled() {
+            return None;
+        }
+        // The strip rides on the active tab, which in Tabs mode is the only agent
+        // with a rect.
+        if self.agent_area.active() != Some(id) {
+            return None;
+        }
+        self.layout
+            .strip_rect_for(id, self.terminal_config.metrics.cell_height)
+    }
+
+    /// The rect covered by every agent pane in the current frame.
+    ///
+    /// Union of the agents' frame rects, so it is exactly the region a tab switch
+    /// can change. `None` when no agent is placed: there is then nothing to confine
+    /// a repaint to, and the caller must repaint the window.
+    fn agent_region_rect(&self) -> Option<PaneRect> {
+        agent_region(&self.layout, |id| {
+            self.panes.get(id).is_some_and(AppPane::is_agent_pane)
+        })
+    }
+
+    /// The pane under `(x, y)` and the point in that pane's own coordinates.
+    ///
+    /// Local coordinates are measured from the rect the pane is *drawn* in, which is
+    /// below the tab strip for the strip's host pane. Measuring from the frame rect
+    /// instead puts every click one strip-height too low, so a ctrl+click on a link
+    /// only lands when aimed above the text. A point inside the strip row belongs to
+    /// no pane.
+    fn pane_local_hit(&self, x: usize, y: usize) -> Option<(PaneId, usize, usize)> {
+        let (id, frame_rect) = self.layout.pane_at(x, y)?;
+        let drawn = self.effective_pane_rect(id, frame_rect);
+        let (local_x, local_y) = pane_local_point(drawn, x, y)?;
+        Some((id, local_x, local_y))
+    }
+
+    /// The rect a pane is actually drawn in / sized to.
+    ///
+    /// Identical to its frame rect except for the tab strip anchor, which gives up
+    /// its top row to the strip.
+    fn effective_pane_rect(&self, id: PaneId, rect: PaneRect) -> PaneRect {
+        match self.strip_split(id) {
+            Some((_, below)) => below,
+            None => rect,
+        }
+    }
+
+    /// Build the strip entries from the current [`AgentArea`] state.
+    ///
+    /// The editor is skipped by construction: `order` only ever holds agents.
+    fn tab_strip_entries(&self, now: Instant) -> Vec<TabStripEntry> {
+        let active = self.agent_area.active();
+        self.agent_area
+            .order()
+            .iter()
+            .filter_map(|id| {
+                let activity = self.panes.activity(*id)?;
+                Some(TabStripEntry {
+                    id: *id,
+                    label: self
+                        .panes
+                        .get(*id)
+                        .and_then(AppPane::agent_label)
+                        .unwrap_or_else(|| id.raw().to_string()),
+                    active: Some(*id) == active,
+                    busy: activity.is_busy(now),
+                    exited: activity.exited,
+                    unseen: activity.unseen_output,
+                })
+            })
+            .collect()
+    }
+
+    /// The strip rect plus its entries, or `None` when the strip is not shown.
+    fn tab_strip_overlay(&self) -> Option<(PaneRect, Vec<TabStripEntry>)> {
+        let active = self.agent_area.active()?;
+        let (strip_rect, _) = self.strip_split(active)?;
+        Some((strip_rect, self.tab_strip_entries(Instant::now())))
+    }
+
+    /// Whether the strip cells on screen differ from what would be drawn now.
+    ///
+    /// Cheap enough to call from the idle poll, and the entries it compares are the
+    /// same ones `render` would draw, resolved the same way: the gate must match
+    /// `render`'s draw condition exactly. `tab_strip_enabled` is not that condition.
+    /// It says whether the strip reserves geometry, which stays true when the active
+    /// agent has no rect and nothing is drawn. Gating on it would compare `None`
+    /// against non-empty entries forever and spin the idle poll.
+    ///
+    /// The unshown case is passed through to [`tab_strip_screen_changed`] rather than
+    /// short-circuited here: that branch is where the spin lives, so it has to be the
+    /// branch the idle poll actually runs.
+    fn tab_strip_entries_changed(&self) -> bool {
+        if self.review_active {
+            return false;
+        }
+        let shown = self.tab_strip_overlay().map(|(_, entries)| entries);
+        tab_strip_screen_changed(shown.as_deref(), self.last_drawn_strip_entries.as_deref())
+    }
+
+    /// Blit the strip buffer into `rect`.
+    ///
+    /// `changed` says whether the strip's own contents need repainting: true on a
+    /// full redraw or a tab switch, false when nothing about the strip moved. The
+    /// ACP modal passes the same kind of flag; without it every frame would present,
+    /// because a Ratatui blit always reports that it drew.
+    fn draw_tab_strip(&mut self, rect: PaneRect, entries: &[TabStripEntry], changed: bool) -> bool {
+        let metrics = self.terminal_config.metrics;
+        let cols = self.strip_columns(rect);
+        if cols == 0 {
+            return false;
+        }
+        let strip = tab_strip_buffer(entries, cols, self.terminal_config.theme.background);
+        draw_ratatui_buffer(
+            &strip,
+            &mut self.font_renderer,
+            &mut self.buffer,
+            self.width,
+            self.height,
+            rect.x,
+            rect.y,
+            metrics,
+            self.terminal_config.theme.foreground,
+            self.terminal_config.theme.background,
+            changed,
+            changed,
+            &mut self.damage,
+        )
+    }
+
+    /// How many whole cells fit in the strip rect.
+    ///
+    /// Drawing and hit testing must use the same width: it decides which tabs fit,
+    /// and therefore which tabs can be clicked.
+    fn strip_columns(&self, rect: PaneRect) -> u16 {
+        (rect.width / self.terminal_config.metrics.cell_width.max(1)).min(u16::MAX as usize) as u16
+    }
+
+    /// Activate the tab under `(x, y)` if the strip is showing there.
+    ///
+    /// Returns whether the click was consumed, so the caller can skip the pane hit
+    /// test entirely. There is no close button: a hit only activates.
+    fn handle_tab_strip_click(&mut self, x: usize, y: usize) -> bool {
+        let Some((strip_rect, entries)) = self.tab_strip_overlay() else {
+            return false;
+        };
+        if y < strip_rect.y || y >= strip_rect.y.saturating_add(strip_rect.height) {
+            return false;
+        }
+        if x < strip_rect.x || x >= strip_rect.x.saturating_add(strip_rect.width) {
+            return false;
+        }
+
+        let col = (x - strip_rect.x) / self.terminal_config.metrics.cell_width.max(1);
+        let col = col.min(u16::MAX as usize) as u16;
+        // Same width as the blit above, so a tab that was dropped for not fitting
+        // has no hit box either: clicking the empty tail must not activate it.
+        let cols = self.strip_columns(strip_rect);
+        let Some((id, _, _)) = tab_strip_hit_boxes(&entries, cols)
+            .into_iter()
+            .find(|(_, start, end)| col >= *start && col < *end)
+        else {
+            // Clicked the strip row but not on a tab: consumed anyway, so the click
+            // does not fall through to the pane underneath.
+            return true;
+        };
+        self.set_active_pane(id);
+        true
     }
 
     fn render(&mut self) -> Result<()> {
@@ -1797,20 +2500,50 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
-        let Some(window) = self.window.as_ref() else {
+        if self.window.is_none() {
             return Ok(());
-        };
+        }
 
-        if self.force_redraw {
+        let tab_switch_from = self.tab_switch_from.take();
+        let force_full = self.force_redraw;
+        if force_full {
             self.buffer.fill(self.terminal_config.theme.background);
         }
         self.damage.clear();
-        let mut redrawn = self.force_redraw;
-        let redraw_chrome = self.show_pane_focus_chrome() && (self.dirty || self.force_redraw);
+        let mut redrawn = force_full;
+        let redraw_chrome = self.show_pane_focus_chrome() && (self.dirty || force_full);
 
-        let Some(surface) = self.surface.as_mut() else {
-            return Ok(());
+        // The strip is part of the agent region, so it is resolved before drawing:
+        // the anchor pane gives up its top row to it. Nothing here mutates the
+        // layout, so this is stable frame to frame.
+        let strip = if self.review_active {
+            None
+        } else {
+            self.tab_strip_overlay()
         };
+        // When the strip is not drawn its cells are gone: review paints over the
+        // whole window, and with tabs off the row belongs to the pane. Forgetting the
+        // baseline keeps the strip from coming back over repainted pixels and deciding
+        // it has nothing to do.
+        if strip.is_none() {
+            self.last_drawn_strip_entries = None;
+        }
+
+        // How much to repaint is the same decision `relayout_for_tab_switch` made
+        // when it cleared `force_redraw`, asked again here through one function so
+        // the flag and the drawn region cannot disagree. A regional switch repaints
+        // the agent region and the strip; the editor's pixels are unchanged, so it
+        // is skipped. A full redraw always wins over a recorded regional switch.
+        let repaint_region = tab_switch_region(
+            force_full,
+            tab_switch_from.as_ref(),
+            &self.layout,
+            self.agent_region_rect(),
+        );
+        let tab_switch = repaint_region.is_some();
+        // Panes inside the region still need a forced paint: the pane that was hidden
+        // behind the old tab is clean and would otherwise repaint nothing.
+        let pane_force = pane_force_redraw(force_full, repaint_region);
 
         if self.review_active {
             if let Some(review_pane) = &mut self.review_pane {
@@ -1821,7 +2554,7 @@ impl WinitGhosttyApp {
                     self.height,
                     full_window_rect(self.width, self.height),
                     true,
-                    self.force_redraw,
+                    force_full,
                     false,
                     &mut self.damage,
                 );
@@ -1829,18 +2562,44 @@ impl WinitGhosttyApp {
                 self.review_active = false;
             }
         } else {
-            for (index, pane) in self.panes.iter_mut().enumerate() {
-                redrawn |= pane.draw(
+            let placed = self.layout.placed().to_vec();
+            let active = self.panes.active();
+            for placed in placed {
+                let rect = self.effective_pane_rect(placed.id, placed.rect);
+                // Skip panes the repaint region does not cover, so a tab switch
+                // never redraws the editor.
+                if let Some(region) = repaint_region {
+                    if !rects_intersect(rect, region) {
+                        continue;
+                    }
+                }
+                let Some(slot) = self.panes.get_mut(placed.id) else {
+                    continue;
+                };
+                redrawn |= slot.draw(
                     &mut self.font_renderer,
                     &mut self.buffer,
                     self.width,
                     self.height,
-                    self.layout.pane(index),
-                    index == self.layout_state.active_pane,
-                    self.force_redraw,
+                    rect,
+                    Some(placed.id) == active,
+                    pane_force,
                     redraw_chrome,
                     &mut self.damage,
                 );
+            }
+            if let Some((strip_rect, entries)) = strip {
+                let changed = tab_strip_changed(
+                    force_full,
+                    tab_switch,
+                    &entries,
+                    self.last_drawn_strip_entries.as_deref(),
+                );
+                redrawn |= self.draw_tab_strip(strip_rect, &entries, changed);
+                // Record what is now on screen, including on a frame that skipped the
+                // blit: the cells are unchanged either way, and this is the baseline
+                // the next comparison is made against.
+                self.last_drawn_strip_entries = Some(entries);
             }
         }
 
@@ -1867,7 +2626,8 @@ impl WinitGhosttyApp {
                     m,
                     self.terminal_config.theme.foreground,
                     self.terminal_config.theme.background,
-                    self.force_redraw || self.dirty,
+                    force_full,
+                    self.dirty,
                     &mut self.damage,
                 );
             }
@@ -1878,6 +2638,14 @@ impl WinitGhosttyApp {
             return Ok(());
         }
 
+        // The surface is borrowed only for the present step. Taking it earlier
+        // would hold a mutable borrow of `self` across the drawing code above.
+        let Some(window) = self.window.as_ref() else {
+            return Ok(());
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
         let mut surface_buffer = surface
             .buffer_mut()
             .map_err(|error| anyhow!("failed to acquire softbuffer frame: {error:?}"))?;
@@ -1934,29 +2702,44 @@ impl WinitGhosttyApp {
                     focus_agent,
                     target_agent_id,
                 } => {
-                    let idx = if let Some(ref want) = target_agent_id {
-                        self.panes.iter().position(|p| p.agent_id_matches(want))
+                    let id = if let Some(ref want) = target_agent_id {
+                        self.panes
+                            .iter()
+                            .find(|slot| slot.pane.agent_id_matches(want))
+                            .map(|slot| slot.id)
                     } else {
                         None
                     };
                     // Default to the primary PTY agent
-                    let idx = idx
+                    let id = id
                         .or_else(|| {
                             self.panes
                                 .iter()
-                                .position(|p| p.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                                .find(|slot| slot.pane.agent_id_matches(PRIMARY_PTY_AGENT_ID))
+                                .map(|slot| slot.id)
                         })
-                        .or_else(|| self.panes.iter().position(AppPane::is_agent_pane));
+                        .or_else(|| {
+                            self.panes
+                                .iter()
+                                .find(|slot| slot.pane.is_agent_pane())
+                                .map(|slot| slot.id)
+                        });
 
-                    if let Some(i) = idx {
+                    if let Some(id) = id {
                         if focus_agent {
-                            if matches!(self.layout_state.mode, PaneLayoutMode::PaneMaximized(_)) {
-                                self.layout_state.mode = PaneLayoutMode::PaneMaximized(i);
+                            // Agent-fullscreen is now the agent region's Tabs mode,
+                            // not a positional layout mode.
+                            if self.layout_state.mode == PaneLayoutMode::EditorFull
+                                && self.agent_area.mode() == AgentAreaMode::Tabs
+                            {
+                                self.layout_state.mode = PaneLayoutMode::Split;
                             }
-                            self.set_active_pane(i);
+                            self.set_active_pane(id);
                         }
-                        debug!(target = ?target_agent_id, pane_index = i, "forwarding input to agent pane");
-                        if let Some(agent_pane) = self.panes[i].as_terminal_mut() {
+                        debug!(target = ?target_agent_id, pane = ?id, "forwarding input to agent pane");
+                        if let Some(agent_pane) =
+                            self.panes.get_mut(id).and_then(AppPane::as_terminal_mut)
+                        {
                             if agent_pane.is_acp_tui() {
                                 let agent_id = agent_pane.agent_id().unwrap_or("agent").to_string();
                                 self.send_acp_tui(
@@ -2002,6 +2785,10 @@ impl WinitGhosttyApp {
                     label,
                     active,
                 } => {
+                    // Keep host-side turn state in addition to forwarding, so the
+                    // UI can show a busy indicator for this agent. Forwarding below
+                    // is unchanged.
+                    self.panes.apply_acp_progress(&agent_id, &id, active);
                     if self.send_acp_tui(
                         &agent_id,
                         HostToTui::Progress {
@@ -2319,6 +3106,15 @@ impl ApplicationHandler<UserEvent> for WinitGhosttyApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let result = self.drain_background_work();
         self.handle_drain_result(event_loop, result, |this, event_loop| {
+            // The strip is the one piece of chrome whose content can change with no
+            // event at all: the busy dot expires when the output window elapses, and
+            // nothing fires for that. This poll is already the idle tick, so compare
+            // the recomputed cells against what is on screen and wake a render if
+            // they differ. Without it a busy -> idle flip waits for the next full
+            // redraw.
+            if !this.dirty && this.tab_strip_entries_changed() {
+                this.dirty = true;
+            }
             if this.dirty {
                 this.request_redraw();
                 this.set_wait_for_next_redraw(event_loop);
@@ -2345,14 +3141,325 @@ impl WinitGhosttyApp {
             return;
         }
 
-        for pane in &mut self.panes {
-            let outcome = pane.handle_modifiers_changed(self.modifiers, ctx);
+        for slot in self.panes.iter_mut() {
+            let outcome = slot.pane.handle_modifiers_changed(self.modifiers, ctx);
             dirty |= outcome.dirty;
             force_redraw |= outcome.force_redraw;
         }
         self.dirty |= dirty;
         self.force_redraw |= force_redraw;
     }
+}
+
+/// Smallest rect covering both inputs.
+fn union_rect(a: PaneRect, b: PaneRect) -> PaneRect {
+    let x = a.x.min(b.x);
+    let y = a.y.min(b.y);
+    let right = a.x.saturating_add(a.width).max(b.x.saturating_add(b.width));
+    let bottom =
+        a.y.saturating_add(a.height)
+            .max(b.y.saturating_add(b.height));
+    PaneRect {
+        x,
+        y,
+        width: right.saturating_sub(x),
+        height: bottom.saturating_sub(y),
+    }
+}
+
+/// Whether two rects overlap. Touching edges do not count.
+fn rects_intersect(a: PaneRect, b: PaneRect) -> bool {
+    a.x < b.x.saturating_add(b.width)
+        && b.x < a.x.saturating_add(a.width)
+        && a.y < b.y.saturating_add(b.height)
+        && b.y < a.y.saturating_add(a.height)
+}
+
+/// Whether two frames occupy the same rects, ignoring which pane sits in each.
+///
+/// A tab switch in tabs mode swaps *which* agent occupies the agent region, so the
+/// rects match while the occupant changes. When they do, only the agent region needs
+/// repainting rather than the whole window - the editor in particular is untouched.
+fn frames_share_geometry(a: &FrameLayout, b: &FrameLayout) -> bool {
+    a.placed().len() == b.placed().len()
+        && a.placed()
+            .iter()
+            .zip(b.placed())
+            .all(|(left, right)| left.rect == right.rect)
+}
+
+/// The rect covered by every placed pane that `is_agent` accepts.
+///
+/// `None` when no such pane has geometry, which is what "there is nothing to
+/// confine a repaint to" looks like.
+fn agent_region(layout: &FrameLayout, is_agent: impl Fn(PaneId) -> bool) -> Option<PaneRect> {
+    let mut bounds: Option<PaneRect> = None;
+    for placed in layout.placed() {
+        if !is_agent(placed.id) {
+            continue;
+        }
+        bounds = Some(match bounds {
+            Some(rect) => union_rect(rect, placed.rect),
+            None => placed.rect,
+        });
+    }
+    bounds
+}
+
+/// What a tab switch has to repaint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabSwitchRepaint {
+    /// Only this region changed. Everything outside it - the editor in particular -
+    /// still holds correct pixels.
+    Region(PaneRect),
+    /// The frame moved, so the whole window has to be repainted.
+    Full,
+}
+
+/// Whether the editor's focus chrome changes as focus moves.
+///
+/// `draw_pane_focus_chrome` paints an active border on the focused pane and a dim tint
+/// on the others, and that chrome is only shown in `Split` with 2+ panes. So when
+/// focus moves to or from the editor in that configuration, the editor's own pixels
+/// change - one pane's border stops being active and the other's starts. A repaint
+/// confined to the agent region would leave the editor looking focused while the agent
+/// is drawn focused too.
+///
+/// Agent-to-agent switches are unaffected: the editor is inactive before and after.
+/// Both callers must capture the focused pane *before* they move focus.
+fn editor_chrome_changes(
+    chrome_shown: bool,
+    before_focus: Option<PaneId>,
+    after_focus: Option<PaneId>,
+    editor: Option<PaneId>,
+) -> bool {
+    let Some(editor) = editor.filter(|_| chrome_shown) else {
+        return false;
+    };
+    (before_focus == Some(editor)) != (after_focus == Some(editor))
+}
+
+/// Decide how much of the window a tab switch repaints.
+///
+/// This exists because two call sites need the same answer and used to compute it
+/// separately: `relayout` always raises `force_redraw` (it cannot know why it ran),
+/// so a switch that only swaps the occupant has to downgrade that flag, and `render`
+/// has to keep the repaint inside the agent region. One function, called by both,
+/// is what stops the two from drifting apart.
+///
+/// `agent_region` is the union of the agent rects in `after`; `None` means no agent
+/// is placed and there is nothing to confine the repaint to. `focus_chrome_changes`
+/// carries the one reason an unchanged frame still needs the whole window: the
+/// editor's border and tint live outside the agent region.
+fn tab_switch_repaint(
+    before: &FrameLayout,
+    after: &FrameLayout,
+    agent_region: Option<PaneRect>,
+    focus_chrome_changes: bool,
+) -> TabSwitchRepaint {
+    match agent_region {
+        // Same rects, different occupant, and nothing about the editor's chrome moved:
+        // the editor's pixels are still correct.
+        Some(region) if !focus_chrome_changes && frames_share_geometry(before, after) => {
+            TabSwitchRepaint::Region(region)
+        }
+        // The geometry moved, the editor's focus chrome changed, or there is no agent
+        // region to stay inside.
+        _ => TabSwitchRepaint::Full,
+    }
+}
+
+/// The repaint region `render` should confine this frame to, if any.
+///
+/// Composes the two things `render` needs: the [`tab_switch_repaint`] decision, and
+/// the rule that a full redraw always wins over a recorded regional switch. `None`
+/// means "paint the whole window":
+///
+/// - `force_full` is set. The buffer has just been cleared, so confining the repaint
+///   would leave everything outside the region blank. This is also what protects a
+///   regional switch that a resize or font change overtook before it was rendered.
+/// - no pre-switch frame was recorded, so this is not a tab-switch frame at all.
+/// - the decision itself is [`TabSwitchRepaint::Full`] (geometry moved, or no agent).
+///
+/// `Some(region)` means exactly one regional tab switch, with `force_full` clear.
+///
+/// The editor-chrome rule is not repeated here: only
+/// [`WinitGhosttyApp::relayout_for_tab_switch`] knows which pane had focus before the
+/// switch, and it records a pre-switch frame only when chrome did not change. So a
+/// recorded frame already implies "chrome unchanged", and re-deriving without that
+/// fact cannot disagree.
+fn tab_switch_region(
+    force_full: bool,
+    before: Option<&FrameLayout>,
+    after: &FrameLayout,
+    agent_region: Option<PaneRect>,
+) -> Option<PaneRect> {
+    if force_full {
+        return None;
+    }
+    match tab_switch_repaint(before?, after, agent_region, false) {
+        TabSwitchRepaint::Region(region) => Some(region),
+        TabSwitchRepaint::Full => None,
+    }
+}
+
+/// Whether a pane's terminal must repaint every row this frame.
+///
+/// A regional repaint skips the panes outside the region, but the panes inside it
+/// still need a forced paint. `draw_screen` returns early on `Dirty::Clean`, and a
+/// terminal that was hidden behind a tab keeps its render state - so on A -> B -> A
+/// the returning pane is clean, resizes to the same size, and would paint nothing,
+/// leaving B's pixels under A's strip. The first visit of a never-drawn tab only
+/// looks right because it starts dirty.
+///
+/// So: a full redraw forces every pane, and a regional repaint forces the panes it
+/// does draw. A plain incremental frame (no region) lets dirty tracking decide.
+fn pane_force_redraw(force_full: bool, repaint_region: Option<PaneRect>) -> bool {
+    force_full || repaint_region.is_some()
+}
+
+/// Whether the strip's cells need repainting, given what was last drawn.
+///
+/// Keeps the early return in `draw_ratatui_buffer` (a Ratatui blit always claims it
+/// drew, so asking at all means presenting a frame) while still updating live: a
+/// new busy/unseen/exited dot arrives as *background* output, which only sets
+/// `dirty`, and the busy -> idle flip at the end of the output window has no event
+/// at all. Both are caught by comparing the recomputed entries with the ones on
+/// screen. `last` is `None` before the first draw, which must paint.
+fn tab_strip_changed(
+    force_full: bool,
+    tab_switch: bool,
+    entries: &[TabStripEntry],
+    last: Option<&[TabStripEntry]>,
+) -> bool {
+    force_full || tab_switch || tab_strip_screen_changed(Some(entries), last)
+}
+
+/// The `force_redraw` flag to leave behind after a tab switch.
+///
+/// A regional switch wants to clear the flag `relayout` just raised, but only the
+/// one *it* raised. A full redraw that was already pending - set by a resize or a
+/// font change waiting for the next `RedrawRequested` - must survive: the strip
+/// click that triggered this relayout can land before that render, and downgrading
+/// it would clear the buffer while leaving the editor unpainted.
+///
+/// `pending` is the flag as it was before the relayout ran.
+fn force_redraw_after_tab_switch(pending: bool, decision: TabSwitchRepaint) -> bool {
+    match decision {
+        // Keep whatever was already pending; drop only the relayout's own flag.
+        TabSwitchRepaint::Region(_) => pending,
+        // The switch repaints the window anyway.
+        TabSwitchRepaint::Full => true,
+    }
+}
+
+/// Whether the strip needs a repaint against what is currently on screen.
+///
+/// `shown` is the entries the strip *would* draw, or `None` when it is not on screen
+/// at all. Not being on screen is never a change: the idle poll calls this to decide
+/// whether to wake a render, and returning true there means redrawing nothing and
+/// asking again, forever. `last` is `None` only when nothing has been drawn yet,
+/// which is a change the first time the strip does appear.
+fn tab_strip_screen_changed(
+    shown: Option<&[TabStripEntry]>,
+    last: Option<&[TabStripEntry]>,
+) -> bool {
+    let Some(shown) = shown else {
+        return false;
+    };
+    last != Some(shown)
+}
+
+/// Activate `id` as the tab and report whether the frame must be rebuilt.
+///
+/// In tabs mode only the active agent has a rect, so switching tabs is a layout
+/// change, not just a focus change: without the relayout the newly active pane has
+/// no placement, `strip_rect_for` returns `None`, and the strip disappears. Split
+/// mode shows every agent, so nothing needs rebuilding there.
+fn tab_activation_needs_relayout(area: &AgentArea, id: PaneId) -> bool {
+    area.active() != Some(id) && area.mode() == AgentAreaMode::Tabs
+}
+
+/// Whether the tab strip is shown.
+///
+/// Two conditions, both required: tabs mode (in split mode every agent is already
+/// visible side by side, so a strip would be redundant) and more than one agent (a
+/// lone tab is pure chrome).
+///
+/// Deliberately independent of the review pane. The strip is not *drawn* while
+/// review owns the window, but its row must still be reserved, otherwise a resize
+/// during review would hand the agent pane the strip's row and the terminal grid
+/// would disagree with the pixels the moment review closes.
+fn tab_strip_visible(mode: AgentAreaMode, agent_count: usize) -> bool {
+    mode == AgentAreaMode::Tabs && agent_count > 1
+}
+
+/// Apply the side effects every focus change must have, on the two models.
+///
+/// Kept free so it can be tested without standing up a window. The editor is not a
+/// tab, so focusing it must neither activate a tab (which would move the strip and
+/// show the wrong pane) nor clear an agent's unseen marker (the user is not looking
+/// at that agent). Both are asserted in the tests below.
+fn note_focus(panes: &mut PaneStore, area: &mut AgentArea, id: PaneId) {
+    if !panes.get(id).is_some_and(AppPane::is_agent_pane) {
+        return;
+    }
+    area.activate(id);
+    panes.mark_seen(id);
+}
+
+/// Reconcile the tab model with the live panes and clean up after a handover.
+///
+/// When [`AgentArea::sync`] moves `active` onto a neighbor because the previous
+/// active tab was terminated, that neighbor becomes visible, so its unseen marker
+/// must be cleared. Without this the pane would appear with a stale "new output"
+/// dot the moment it is promoted.
+///
+/// It also keeps keyboard focus and the active tab pointing at the same pane. After a
+/// close they can disagree: [`PaneStore::remove_index`] takes the slot that slid into
+/// the removed one, while [`AgentArea::sync`] takes the tab that slid into the removed
+/// tab's position. With slots `[E, a, b, c]` and order `[b, a, c]`, closing `a` leaves
+/// the store on `b` and the tabs on `c`. In tabs mode the visible pane is the active
+/// tab, so the store follows it; in split mode every agent is visible and the store's
+/// choice stands.
+fn sync_agent_area(
+    area: &mut AgentArea,
+    panes: &mut PaneStore,
+    agents: &[PaneId],
+    editor: Option<PaneId>,
+) {
+    let active_before = area.active();
+    area.sync(agents, editor);
+    if area.active() != active_before {
+        if let Some(active) = area.active() {
+            panes.mark_seen(active);
+        }
+    }
+
+    if area.mode() != AgentAreaMode::Tabs {
+        return;
+    }
+    let Some(active_tab) = area.active() else {
+        return;
+    };
+    // Only an agent focus can be out of step with a tab; the editor is not a tab, so
+    // focusing it is a deliberate divergence and must be left alone.
+    let focused_is_agent = panes
+        .active()
+        .and_then(|id| panes.get(id))
+        .is_some_and(AppPane::is_agent_pane);
+    if focused_is_agent && panes.active() != Some(active_tab) {
+        panes.set_active(active_tab);
+    }
+}
+
+/// `(x, y)` relative to the rect a pane is drawn in, or `None` when the point is
+/// above or left of it (the tab strip row, for the strip's host pane).
+fn pane_local_point(drawn: PaneRect, x: usize, y: usize) -> Option<(usize, usize)> {
+    if x < drawn.x || y < drawn.y {
+        return None;
+    }
+    Some((x - drawn.x, y - drawn.y))
 }
 
 fn pane_count(app: &AppContext) -> usize {
@@ -2484,7 +3591,7 @@ mod tests {
     use super::*;
     use crate::pty::TerminalSize;
     use config::ghostty_config_entry;
-    use layout::PaneRect;
+    use layout::{PaneRect, chord_switches_tab};
     use links::{
         LinkSpan, ReferenceTarget, file_target_from_uri, parse_vt_hyperlinks,
         reference_target_from_row, reference_target_from_uri,
@@ -2710,7 +3817,7 @@ mod tests {
             100,
             50,
             2,
-            PaneLayoutMode::PaneMaximized(0),
+            PaneLayoutMode::EditorFull,
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
@@ -2737,60 +3844,39 @@ mod tests {
     }
 
     #[test]
-    fn creates_agent_maximized_layout() {
+    fn create_nvim_maximized_layout_hides_every_agent() {
+        // Agent-fullscreen was `PaneMaximized(1)`; it is now the agent region's Tabs
+        // mode, so this layout mode only ever means "the editor alone".
         let layout = SplitLayout::for_window(
             100,
             50,
-            2,
-            PaneLayoutMode::PaneMaximized(1),
+            3,
+            PaneLayoutMode::EditorFull,
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
 
-        assert_eq!(
-            layout.pane(0),
-            PaneRect {
-                x: 0,
-                y: 0,
-                width: 0,
-                height: 0,
-            }
-        );
-        assert_eq!(
-            layout.pane(1),
-            PaneRect {
-                x: 0,
-                y: 0,
-                width: 100,
-                height: 50,
-            }
-        );
-        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(1));
+        assert_eq!(layout.pane(0).width, 100, "the editor keeps the window");
+        for index in 1..3 {
+            assert_eq!(layout.pane(index).width, 0, "agent {index} is hidden");
+            assert_eq!(layout.pane(index).height, 0, "agent {index} is hidden");
+        }
+        assert_eq!(layout.pane_at(10, 10).map(|(index, _)| index), Some(0));
     }
 
     #[test]
-    fn maximized_layouts_keep_hidden_panes_zero_sized() {
+    fn editor_full_keeps_hidden_panes_zero_sized() {
         let nvim_layout = SplitLayout::for_window(
             100,
             50,
             2,
-            PaneLayoutMode::PaneMaximized(0),
-            PaneSplitDirection::Vertical,
-            SplitLayoutOptions::unbounded(),
-        );
-        let agent_layout = SplitLayout::for_window(
-            100,
-            50,
-            2,
-            PaneLayoutMode::PaneMaximized(1),
+            PaneLayoutMode::EditorFull,
             PaneSplitDirection::Vertical,
             SplitLayoutOptions::unbounded(),
         );
 
         assert_eq!(nvim_layout.pane(1).width, 0);
         assert_eq!(nvim_layout.pane(1).height, 0);
-        assert_eq!(agent_layout.pane(0).width, 0);
-        assert_eq!(agent_layout.pane(0).height, 0);
     }
 
     fn shortcut_modifiers(alt: bool, shift: bool) -> Modifiers {
@@ -2801,11 +3887,47 @@ mod tests {
         }
     }
 
+    /// Slot order the shortcut tests use: editor first, then agents.
+    fn shortcut_targets(pane_count: usize) -> PaneTargets {
+        PaneTargets {
+            slots: (0..pane_count)
+                .map(|index| PaneId(index as u64 + 1))
+                .collect(),
+            editor_index: (pane_count > 0).then_some(0),
+        }
+    }
+
+    /// A `Split`-mode agent area over `pane_count` slots, matching `shortcut_targets`.
+    fn shortcut_area(pane_count: usize) -> AgentArea {
+        let slots: Vec<PaneId> = (0..pane_count)
+            .map(|index| PaneId(index as u64 + 1))
+            .collect();
+        let mut area = AgentArea::new();
+        area.sync(&slots[1.min(slots.len())..], slots.first().copied());
+        area
+    }
+
     fn press_layout_shortcut(
         pressed_keys: &[Key],
         modifiers: Modifiers,
         pane_count: usize,
         layout: &mut PaneLayoutState,
+    ) -> bool {
+        press_layout_shortcut_in(
+            pressed_keys,
+            modifiers,
+            pane_count,
+            layout,
+            &mut shortcut_area(pane_count),
+        )
+    }
+
+    fn press_layout_shortcut_in(
+        pressed_keys: &[Key],
+        modifiers: Modifiers,
+        pane_count: usize,
+        layout: &mut PaneLayoutState,
+        area: &mut AgentArea,
     ) -> bool {
         handle_layout_shortcuts(
             pressed_keys,
@@ -2813,8 +3935,11 @@ mod tests {
             false,
             pane_count,
             layout,
+            area,
             layout::AgentRegionSpan::unknown(),
+            &shortcut_targets(pane_count),
         )
+        .is_some()
     }
 
     fn test_layout_state(
@@ -2832,11 +3957,8 @@ mod tests {
 
     #[test]
     fn maps_alt_number_shortcuts_to_active_panes() {
-        let mut layout = test_layout_state(
-            PaneLayoutMode::PaneMaximized(1),
-            PaneSplitDirection::Vertical,
-            1,
-        );
+        let mut layout =
+            test_layout_state(PaneLayoutMode::EditorFull, PaneSplitDirection::Vertical, 1);
 
         assert!(press_layout_shortcut(
             &[Key::Key1],
@@ -2857,56 +3979,69 @@ mod tests {
     }
 
     #[test]
-    fn maps_alt_shift_number_shortcuts_to_layout_modes() {
+    fn maps_alt_shift_number_shortcuts_to_editor_full_and_agent_full() {
         let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1);
 
+        // Alt+Shift+1 is the editor fullscreen, the renamed PaneMaximized(0).
         assert!(press_layout_shortcut(
             &[Key::Key1],
             shortcut_modifiers(true, true),
             2,
             &mut layout
         ));
-        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(0));
+        assert_eq!(layout.mode, PaneLayoutMode::EditorFull);
         assert_eq!(layout.active_pane, 0);
-        assert!(press_layout_shortcut(
+
+        // Alt+Shift+2 maximizes the first agent: AgentFull with its tab active.
+        let mut area = shortcut_area(2);
+        assert!(press_layout_shortcut_in(
             &[Key::Key2],
             shortcut_modifiers(true, true),
             2,
-            &mut layout
+            &mut layout,
+            &mut area
         ));
-        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(1));
-        assert_eq!(layout.active_pane, 1);
-    }
-
-    #[test]
-    fn maps_alt_arrow_shortcuts_to_active_panes() {
-        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1);
-
-        assert!(press_layout_shortcut(
-            &[Key::Left],
-            shortcut_modifiers(true, false),
-            2,
-            &mut layout
-        ));
-        assert_eq!(layout.mode, PaneLayoutMode::Split);
-        assert_eq!(layout.active_pane, 0);
-        assert!(press_layout_shortcut(
-            &[Key::Right],
-            shortcut_modifiers(true, false),
-            2,
-            &mut layout
-        ));
-        assert_eq!(layout.mode, PaneLayoutMode::Split);
-        assert_eq!(layout.active_pane, 1);
-    }
-
-    #[test]
-    fn maps_alt_shift_3_shortcut_to_split_direction_toggle() {
-        let mut layout = test_layout_state(
-            PaneLayoutMode::PaneMaximized(1),
-            PaneSplitDirection::Vertical,
-            0,
+        assert_eq!(area.mode(), AgentAreaMode::Tabs);
+        assert_eq!(
+            area.active(),
+            Some(PaneId(2)),
+            "Alt+Shift+2 activates the first tab"
         );
+        assert_eq!(
+            layout.mode,
+            PaneLayoutMode::AgentFull,
+            "and fills the window with it"
+        );
+        assert_eq!(
+            layout.active_pane, 1,
+            "focus follows the activated tab to its slot"
+        );
+    }
+
+    #[test]
+    fn alt_arrows_are_not_layout_shortcuts() {
+        // Alt+Left/Right and Alt+Shift+Left/Right belong to the editor and the agent
+        // TUIs (word motion, history), so the layout layer must never claim them.
+        for shift in [false, true] {
+            for key in [Key::Left, Key::Right] {
+                let modifiers = shortcut_modifiers(true, shift);
+                assert!(layout::layout_chord(key, modifiers).is_none());
+
+                let mut layout =
+                    test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1);
+                assert!(
+                    !press_layout_shortcut(&[key], modifiers, 2, &mut layout),
+                    "{key:?} shift={shift} must not be consumed"
+                );
+                assert_eq!(layout.active_pane, 1, "and must not move focus");
+                assert_eq!(layout.mode, PaneLayoutMode::Split);
+            }
+        }
+    }
+
+    #[test]
+    fn maps_alt_j_shortcut_to_split_direction_toggle() {
+        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 0);
 
         assert!(press_layout_shortcut(
             &[Key::J],
@@ -2924,6 +4059,1941 @@ mod tests {
             &mut layout
         ));
         assert_eq!(layout.split_direction, PaneSplitDirection::Vertical);
+    }
+
+    #[test]
+    fn alt_j_outside_split_mode_is_consumed_and_changes_nothing() {
+        // The axis only exists in split mode, so there is nothing to flip - but the
+        // chord must still be consumed. Its return value is the input layer's skip
+        // flag, so an unconsumed Alt+J would be typed into Neovim as a "j".
+        let mut layout =
+            test_layout_state(PaneLayoutMode::EditorFull, PaneSplitDirection::Vertical, 0);
+
+        assert!(
+            press_layout_shortcut(&[Key::J], shortcut_modifiers(true, false), 2, &mut layout),
+            "Alt+J must be consumed even when there is no split to flip"
+        );
+        assert_eq!(
+            layout.mode,
+            PaneLayoutMode::EditorFull,
+            "the mode is unchanged"
+        );
+        assert_eq!(
+            layout.split_direction,
+            PaneSplitDirection::Vertical,
+            "the direction is unchanged"
+        );
+    }
+
+    // --- Tabs-mode shortcuts (via:tab-keys) --------------------------------
+
+    /// Four slots: editor at 0, three agents. Returns everything a shortcut test
+    /// needs, so each test can reorder tabs without rebuilding the fixture.
+    struct TabFixture {
+        layout: PaneLayoutState,
+        area: AgentArea,
+        panes: PaneTargets,
+        editor: PaneId,
+        agents: [PaneId; 3],
+    }
+
+    impl TabFixture {
+        fn new() -> Self {
+            let editor = PaneId(1);
+            let agents = [PaneId(2), PaneId(3), PaneId(4)];
+            let mut area = AgentArea::new();
+            area.sync(&agents, Some(editor));
+            area.set_mode(AgentAreaMode::Tabs);
+            Self {
+                layout: test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 1),
+                area,
+                panes: PaneTargets {
+                    slots: vec![editor, agents[0], agents[1], agents[2]],
+                    editor_index: Some(0),
+                },
+                editor,
+                agents,
+            }
+        }
+
+        fn press(&mut self, key: Key, shift: bool) -> bool {
+            press_layout_shortcut_in(
+                &[key],
+                shortcut_modifiers(true, shift),
+                4,
+                &mut self.layout,
+                &mut self.area,
+            )
+        }
+
+        /// The tab the frame would actually draw: `visible_panes` in tabs mode is the
+        /// editor plus the active agent, so index 1 is that agent - never a slot index.
+        fn active_visible_agent(&self) -> Option<PaneId> {
+            self.area
+                .visible_panes(Some(self.editor), &self.agents, PaneLayoutMode::Split)
+                .get(1)
+                .copied()
+        }
+    }
+
+    #[test]
+    fn tabs_mode_alt_number_activates_the_nth_tab_not_the_nth_pane() {
+        let mut fixture = TabFixture::new();
+
+        // Alt+2 is the first tab, order[0].
+        assert!(fixture.press(Key::Key2, false));
+        assert_eq!(fixture.area.active(), Some(fixture.agents[0]));
+        assert_eq!(fixture.active_visible_agent(), Some(fixture.agents[0]));
+
+        // Alt+3 is order[1]. Slot index 2 is agent[1] as well here, so reorder first
+        // in the dedicated test below; this asserts the order-based mapping.
+        assert!(fixture.press(Key::Key3, false));
+        assert_eq!(fixture.area.active(), Some(fixture.agents[1]));
+
+        // Alt+1 is the editor and must not move the active tab.
+        let before = fixture.area.active();
+        assert!(fixture.press(Key::Key1, false));
+        assert_eq!(
+            fixture.area.active(),
+            before,
+            "Alt+1 focuses the editor without changing the active tab"
+        );
+        assert_eq!(
+            fixture.layout.active_pane, 0,
+            "keyboard focus is the editor"
+        );
+    }
+
+    #[test]
+    fn tabs_mode_alt_four_activates_order_two_after_a_reorder() {
+        // The "third tab" from the acceptance, made unambiguous: with tabs reordered
+        // so that tab position and slot index disagree, Alt+4 must pick order[2].
+        let mut fixture = TabFixture::new();
+        // Reverse the tabs: order becomes [agents[2], agents[1], agents[0]], so
+        // order[2] is agents[0] - the agent at slot index 1, not slot index 2.
+        assert!(fixture.area.move_tab(fixture.agents[1], 0));
+        assert!(fixture.area.move_tab(fixture.agents[2], 0));
+        assert_eq!(
+            fixture.area.order(),
+            &[fixture.agents[2], fixture.agents[1], fixture.agents[0]],
+            "premise: the tab order is the reverse of the slot order"
+        );
+        let expected = fixture.area.order()[2];
+        assert_eq!(expected, fixture.agents[0]);
+        assert_ne!(
+            fixture.panes.slots.get(2),
+            Some(&expected),
+            "premise: order[2] is not the pane at slot index 2"
+        );
+
+        // Alt+4 is the third tab: the editor is 1, so tabs start at Alt+2.
+        assert!(fixture.press(Key::Key4, false));
+
+        assert_eq!(
+            fixture.area.active(),
+            Some(expected),
+            "Alt+4 activates order[2]"
+        );
+        assert_ne!(
+            fixture.layout.active_pane, 2,
+            "and not the pane at slot index 2"
+        );
+        // The visible frame holds only the editor and the active tab, so indexing it
+        // with a tab position would be out of bounds - the point of this assertion.
+        let visible = fixture.area.visible_panes(
+            Some(fixture.editor),
+            &fixture.agents,
+            PaneLayoutMode::Split,
+        );
+        assert_eq!(
+            visible.len(),
+            2,
+            "tabs mode places the editor plus one agent"
+        );
+        assert_eq!(
+            visible.get(2),
+            None,
+            "visible_panes[2] does not exist, so it cannot be what Alt+4 selected"
+        );
+        assert_eq!(fixture.active_visible_agent(), Some(expected));
+    }
+
+    #[test]
+    fn tabs_mode_alt_three_activates_order_one() {
+        let mut fixture = TabFixture::new();
+        // Reorder so order[1] is not the pane at slot index 2.
+        assert!(fixture.area.move_tab(fixture.agents[2], 1));
+        let expected = fixture.area.order()[1];
+        assert_eq!(expected, fixture.agents[2]);
+
+        assert!(fixture.press(Key::Key3, false));
+
+        assert_eq!(fixture.area.active(), Some(expected));
+        assert_ne!(
+            fixture.panes.slots.get(2),
+            Some(&expected),
+            "premise: slot index 2 holds a different pane, so this is not slot indexing"
+        );
+    }
+
+    #[test]
+    fn tabs_mode_alt_past_the_end_is_a_no_op() {
+        let mut fixture = TabFixture::new();
+        // Only three tabs exist, so Alt+5 and beyond address nothing.
+        assert!(fixture.press(Key::Key2, false));
+        let before = fixture.area.active();
+
+        for key in [Key::Key5, Key::Key6, Key::Key9] {
+            assert!(fixture.press(key, false), "the chord is still consumed");
+            assert_eq!(
+                fixture.area.active(),
+                before,
+                "an index past the end must not change the active tab"
+            );
+        }
+    }
+
+    #[test]
+    fn tabs_mode_alt_shift_number_activates_that_tab_and_enters_tabs() {
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+
+        assert!(fixture.press(Key::Key3, true));
+
+        assert_eq!(
+            fixture.area.mode(),
+            AgentAreaMode::Tabs,
+            "Alt+Shift+N enters tabs mode"
+        );
+        assert_eq!(fixture.area.active(), Some(fixture.agents[1]));
+    }
+
+    #[test]
+    fn alt_t_toggles_between_split_and_tabs() {
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+
+        assert!(fixture.press(Key::T, false));
+        assert_eq!(fixture.area.mode(), AgentAreaMode::Tabs);
+        assert_eq!(
+            fixture.area.active(),
+            Some(fixture.agents[0]),
+            "entering tabs activates the focused agent"
+        );
+
+        // Leaving tabs restores split without moving focus or the agent share.
+        let focused = fixture.layout.active_pane;
+        let share = fixture.layout.agent_share;
+        assert!(fixture.press(Key::T, false));
+        assert_eq!(fixture.area.mode(), AgentAreaMode::Split);
+        assert_eq!(fixture.layout.active_pane, focused);
+        assert_eq!(fixture.layout.agent_share, share);
+    }
+
+    #[test]
+    fn alt_t_entering_tabs_keeps_an_existing_active_tab() {
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+        // Focus the editor, so there is no focused agent to activate.
+        fixture.layout.active_pane = 0;
+        assert!(fixture.area.activate(fixture.agents[2]));
+
+        assert!(fixture.press(Key::T, false));
+
+        assert_eq!(
+            fixture.area.active(),
+            Some(fixture.agents[2]),
+            "a populated tab set keeps its active tab"
+        );
+    }
+
+    #[test]
+    fn agent_share_refocus_does_not_run_in_tabs_mode() {
+        let mut fixture = TabFixture::new();
+        fixture.layout.agent_share = AgentPaneShare::Half;
+        let span = layout::AgentRegionSpan {
+            agent: 150,
+            usable: 300,
+        };
+
+        // Re-focusing the already-active tab must not resize the (unused) split.
+        assert!(fixture.area.activate(fixture.agents[0]));
+        assert!(press_layout_shortcut_in_span(
+            &[Key::Key2],
+            shortcut_modifiers(true, false),
+            4,
+            &mut fixture.layout,
+            &mut fixture.area,
+            span,
+        ));
+
+        assert_eq!(
+            fixture.layout.agent_share,
+            AgentPaneShare::Half,
+            "the split share is untouched while tabs are on"
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn press_layout_shortcut_in_span(
+        pressed_keys: &[Key],
+        modifiers: Modifiers,
+        pane_count: usize,
+        layout: &mut PaneLayoutState,
+        area: &mut AgentArea,
+        span: layout::AgentRegionSpan,
+    ) -> bool {
+        handle_layout_shortcuts(
+            pressed_keys,
+            modifiers,
+            false,
+            pane_count,
+            layout,
+            area,
+            span,
+            &shortcut_targets(pane_count),
+        )
+        .is_some()
+    }
+
+    #[test]
+    fn new_chords_never_reach_the_pty() {
+        // The filter and the handler share one predicate, so every chord the handler
+        // would consume must also be skipped by the input path.
+        let alt = shortcut_modifiers(true, false);
+        let alt_shift = shortcut_modifiers(true, true);
+
+        for key in [
+            Key::Key1,
+            Key::Key2,
+            Key::Key3,
+            Key::Key4,
+            Key::Key5,
+            Key::Key6,
+            Key::Key7,
+            Key::Key8,
+            Key::Key9,
+            Key::J,
+            Key::T,
+        ] {
+            assert!(
+                layout::layout_chord(key, alt).is_some(),
+                "{key:?} with Alt must be filtered from the PTY"
+            );
+        }
+        for key in [Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::Key9] {
+            assert!(
+                layout::layout_chord(key, alt_shift).is_some(),
+                "{key:?} with Alt+Shift must be filtered from the PTY"
+            );
+        }
+
+        // And the filter does not swallow ordinary typing.
+        assert!(layout::layout_chord(Key::Key1, shortcut_modifiers(false, false)).is_none());
+        assert!(layout::layout_chord(Key::T, shortcut_modifiers(false, false)).is_none());
+        assert!(layout::layout_chord(Key::Left, shortcut_modifiers(false, false)).is_none());
+    }
+
+    #[test]
+    fn the_handler_consumes_exactly_what_the_filter_blocks() {
+        // The input layer's skip flag *is* the handler's return value, so the two must
+        // agree exactly: a chord the handler calls consumed must also be filtered, and
+        // anything it does not consume must still reach the agent. Feeding the handler's
+        // bool into the real payload builder is what closes the loop - asserting the
+        // shared predicate twice would not have caught Alt+J typing "j" in EditorFull.
+        let all_keys = [
+            Key::Key1,
+            Key::Key2,
+            Key::Key3,
+            Key::Key4,
+            Key::Key5,
+            Key::Key6,
+            Key::Key7,
+            Key::Key8,
+            Key::Key9,
+            Key::Left,
+            Key::Right,
+            Key::J,
+            Key::T,
+            Key::K, // not a chord, must pass through
+        ];
+
+        for shift in [false, true] {
+            let modifiers = shortcut_modifiers(true, shift);
+
+            // Split mode, Tabs mode, EditorFull, and a fixture with no editor at all.
+            for mode in [
+                AgentAreaMode::Split,
+                AgentAreaMode::Tabs,
+                AgentAreaMode::Split, // repeated with EditorFull below
+            ] {
+                let mut area = AgentArea::new();
+                let slots = [PaneId(1), PaneId(2), PaneId(3)];
+                area.sync(&slots[1..], Some(slots[0]));
+                area.set_mode(mode);
+                let layout_mode = if mode == AgentAreaMode::Tabs {
+                    PaneLayoutMode::EditorFull
+                } else {
+                    PaneLayoutMode::Split
+                };
+                check_handler_against_filter(&mut area, layout_mode, &modifiers, &all_keys);
+            }
+        }
+
+        // No editor, tabs mode: the arms that used to bail out on a missing editor.
+        let mut area = AgentArea::new();
+        area.sync(&[PaneId(2)], None);
+        area.set_mode(AgentAreaMode::Tabs);
+        let no_editor = PaneTargets {
+            slots: vec![PaneId(2)],
+            editor_index: None,
+        };
+        for shift in [false, true] {
+            let modifiers = shortcut_modifiers(true, shift);
+            for key in all_keys {
+                let mut layout =
+                    test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 0);
+                let mut area = area.clone();
+                let consumed = handle_layout_shortcuts(
+                    &[key],
+                    modifiers,
+                    false,
+                    no_editor.slots.len(),
+                    &mut layout,
+                    &mut area,
+                    layout::AgentRegionSpan::unknown(),
+                    &no_editor,
+                )
+                .is_some();
+                assert_consumed_matches_filter(key, modifiers, consumed);
+            }
+        }
+    }
+
+    /// Drive the handler and the real PTY payload builder for every key, asserting the
+    /// handler's bool is exactly what the filter needs to suppress.
+    fn check_handler_against_filter(
+        area: &mut AgentArea,
+        layout_mode: PaneLayoutMode,
+        modifiers: &Modifiers,
+        keys: &[Key],
+    ) {
+        let panes = PaneTargets {
+            slots: vec![PaneId(1), PaneId(2), PaneId(3)],
+            editor_index: Some(0),
+        };
+        for key in keys {
+            let mut layout = test_layout_state(layout_mode, PaneSplitDirection::Vertical, 1);
+            let consumed = handle_layout_shortcuts(
+                &[*key],
+                *modifiers,
+                false,
+                panes.slots.len(),
+                &mut layout,
+                area,
+                layout::AgentRegionSpan::unknown(),
+                &panes,
+            )
+            .is_some();
+            assert_consumed_matches_filter(*key, *modifiers, consumed);
+        }
+    }
+
+    /// The invariant: for a recognised chord the handler consumes it, so the payload is
+    /// empty; for an unrecognised key it is not consumed and may be typed.
+    fn assert_consumed_matches_filter(key: Key, modifiers: Modifiers, consumed: bool) {
+        let is_chord = layout::layout_chord(key, modifiers).is_some();
+        assert_eq!(
+            consumed, is_chord,
+            "{key:?} with {modifiers:?}: handler consumed = {consumed}, but it is a chord = {is_chord}"
+        );
+        if is_chord {
+            let payload = input::special_keys_payload(&[key], modifiers, consumed);
+            assert!(
+                payload.is_empty(),
+                "{key:?} with {modifiers:?} was consumed yet leaked {payload:?} to the PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_t_with_the_editor_focused_does_not_grab_an_agent() {
+        // Decision: entering tabs must not move keyboard focus onto an agent the user
+        // was not on. It must still leave EditorFull, so the active tab is visible.
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+        assert!(fixture.area.activate(fixture.agents[1]));
+        fixture.layout.active_pane = 0; // the editor
+        fixture.layout.mode = PaneLayoutMode::EditorFull;
+
+        assert!(fixture.press(Key::T, false));
+
+        assert_eq!(fixture.area.mode(), AgentAreaMode::Tabs);
+        assert_eq!(
+            fixture.area.active(),
+            Some(fixture.agents[1]),
+            "the active tab is left alone"
+        );
+        assert_eq!(
+            fixture.layout.active_pane, 0,
+            "keyboard focus stays on the editor"
+        );
+        assert_eq!(
+            fixture.layout.mode,
+            PaneLayoutMode::Split,
+            "but EditorFull is left so the active tab is on screen"
+        );
+    }
+
+    #[test]
+    fn alt_t_from_split_mode_takes_focus_from_the_focused_agent() {
+        // The other side of decision 2: when an agent does have focus, entering tabs
+        // makes its tab active and focus stays on it.
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+        fixture.layout.active_pane = fixture
+            .panes
+            .slots
+            .iter()
+            .position(|id| *id == fixture.agents[2])
+            .expect("agent slot");
+
+        assert!(fixture.press(Key::T, false));
+
+        assert_eq!(fixture.area.active(), Some(fixture.agents[2]));
+        assert_eq!(fixture.layout.active_pane, 3, "focus stays on that agent");
+    }
+
+    #[test]
+    fn a_recognised_chord_is_consumed_even_when_it_changes_nothing() {
+        // Every arm that used to report failure: the return value feeds the input
+        // layer's skip flag, so a matched chord must never be forwarded to the PTY.
+        let alt = shortcut_modifiers(true, false);
+        let alt_shift = shortcut_modifiers(true, true);
+
+        // Alt+J outside split mode.
+        let mut layout =
+            test_layout_state(PaneLayoutMode::EditorFull, PaneSplitDirection::Vertical, 0);
+        assert!(press_layout_shortcut(&[Key::J], alt, 2, &mut layout));
+
+        // Alt+2..9 with no pane at that index.
+        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 0);
+        assert!(press_layout_shortcut(&[Key::Key9], alt, 2, &mut layout));
+
+        // No editor at all: Alt+1, Alt+Shift+1 and split-mode Alt+N.
+        let mut layout = test_layout_state(PaneLayoutMode::Split, PaneSplitDirection::Vertical, 0);
+        let mut area = AgentArea::new();
+        area.sync(&[PaneId(2)], None);
+        let no_editor = PaneTargets {
+            slots: vec![PaneId(2)],
+            editor_index: None,
+        };
+        for (key, modifiers) in [(Key::Key1, alt), (Key::Key1, alt_shift), (Key::Key2, alt)] {
+            let consumed = handle_layout_shortcuts(
+                &[key],
+                modifiers,
+                false,
+                1,
+                &mut layout,
+                &mut area,
+                layout::AgentRegionSpan::unknown(),
+                &no_editor,
+            );
+            assert!(
+                consumed.is_some(),
+                "{key:?} with {modifiers:?} must be consumed with no editor"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_switch_chords_use_the_regional_repaint() {
+        // Decision 1: only a chord that swaps the visible tab while already in tabs
+        // can repaint regionally. Entering tabs changes geometry, so it cannot.
+        use layout::LayoutChord;
+
+        for chord in [LayoutChord::FocusAgent(1), LayoutChord::ActivateTab(2)] {
+            assert!(
+                chord_switches_tab(chord, AgentAreaMode::Tabs),
+                "{chord:?} changes the visible tab in tabs mode"
+            );
+            assert!(
+                !chord_switches_tab(chord, AgentAreaMode::Split),
+                "{chord:?} in split mode changes no tab"
+            );
+        }
+
+        // Everything that changes geometry in tabs mode stays a full redraw.
+        for chord in [
+            LayoutChord::ToggleAgentAreaMode,
+            LayoutChord::EditorFull,
+            LayoutChord::FocusEditor,
+        ] {
+            assert!(
+                !chord_switches_tab(chord, AgentAreaMode::Tabs),
+                "{chord:?} must keep the full redraw"
+            );
+        }
+    }
+
+    #[test]
+    fn a_regional_chord_leaves_force_redraw_clear_and_a_full_one_sets_it() {
+        // Decision 1 end to end at the flag level, which is where it can silently break:
+        // `relayout_for_tab_switch` downgrades `force_redraw`, and a later unconditional
+        // `force_redraw = true` would undo it, making the regional path dead code.
+        use layout::LayoutChord;
+
+        let editor = PaneId(1);
+        let after = test_frame(1600, 600, &[editor, PaneId(3)]);
+        let region = agent_region(&after, |id| id != editor);
+
+        for chord in [LayoutChord::FocusAgent(1), LayoutChord::ActivateTab(2)] {
+            assert!(chord_switches_tab(chord, AgentAreaMode::Tabs));
+            // The downgrade this chord relies on.
+            assert!(
+                !force_redraw_after_tab_switch(
+                    false,
+                    tab_switch_repaint(
+                        &test_frame(1600, 600, &[editor, PaneId(2)]),
+                        &after,
+                        region,
+                        false,
+                    )
+                ),
+                "{chord:?} must leave force_redraw clear so only the region repaints"
+            );
+        }
+
+        // Geometry-changing chords keep the full redraw.
+        for chord in [LayoutChord::ToggleAgentAreaMode, LayoutChord::EditorFull] {
+            assert!(!chord_switches_tab(chord, AgentAreaMode::Tabs));
+        }
+        // And entering tabs from split mode is not regional, even though it activates a tab.
+        assert!(!chord_switches_tab(
+            LayoutChord::ActivateTab(0),
+            AgentAreaMode::Split
+        ));
+    }
+
+    // --- AgentFull (agent fullscreen) --------------------------------------
+
+    /// The full-window rect of the fixture frame, so geometry assertions read clearly.
+    fn full_window() -> PaneRect {
+        PaneRect {
+            x: 0,
+            y: 0,
+            width: 1600,
+            height: 600,
+        }
+    }
+
+    #[test]
+    fn agent_full_places_only_the_active_agent_at_full_window() {
+        // The geometry the review flagged: copying the EditorFull shortcut (index 0
+        // gets the window) would put the EDITOR fullscreen and leave the agent with a
+        // zero rect, and the strip would vanish. The agent must be the placed pane.
+        let editor = PaneId(1);
+        let agents = [PaneId(2), PaneId(3)];
+        let mut area = AgentArea::new();
+        area.sync(&agents, Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agents[1]));
+
+        let ids = area.visible_panes(Some(editor), &agents, PaneLayoutMode::AgentFull);
+        assert_eq!(
+            ids,
+            vec![agents[1]],
+            "only the active agent is placed - not the editor"
+        );
+
+        let frame = test_frame(1600, 600, &ids);
+        assert_eq!(
+            frame.placed().len(),
+            1,
+            "a single entry is the single-pane case"
+        );
+        assert_eq!(
+            frame.placed()[0].rect,
+            full_window(),
+            "and it gets the entire window"
+        );
+        assert!(
+            frame.placed().iter().all(|placed| placed.id != editor),
+            "the editor must not be placed at all"
+        );
+    }
+
+    #[test]
+    fn agent_full_keeps_the_strip_on_the_active_agents_top_row() {
+        // via:tab-render draws the strip from strip_rect_for on the active agent, gated
+        // on tabs mode and more than one agent. It does not care about the layout mode,
+        // so this only has to prove the agent is placed with the strip's row available.
+        let editor = PaneId(1);
+        let agents = [PaneId(2), PaneId(3)];
+        let mut area = AgentArea::new();
+        area.sync(&agents, Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agents[1]));
+
+        // The same gates the strip uses.
+        assert!(
+            tab_strip_visible(area.mode(), area.order().len()),
+            "premise: the strip is enabled for this mode and agent count"
+        );
+
+        let ids = area.visible_panes(Some(editor), &agents, PaneLayoutMode::AgentFull);
+        let frame = test_frame(1600, 600, &ids);
+        let strip_height = 20;
+        let (strip, below) = frame
+            .strip_rect_for(agents[1], strip_height)
+            .expect("the active agent hosts the strip");
+
+        assert_eq!(strip.x, 0, "the strip starts at the window's left edge");
+        assert_eq!(strip.y, 0, "and at its top");
+        assert_eq!(strip.width, 1600, "spanning the full window width");
+        assert_eq!(strip.height, strip_height);
+        assert_eq!(
+            below,
+            PaneRect {
+                x: 0,
+                y: strip_height,
+                width: 1600,
+                height: 600 - strip_height,
+            },
+            "the pane below the strip is what resize_panes sizes the terminal to"
+        );
+        // And the hidden agents have no rect, so they cannot host a strip.
+        for hidden in agents.iter().filter(|id| **id != agents[1]) {
+            assert!(
+                frame.strip_rect_for(*hidden, strip_height).is_none(),
+                "a hidden agent must not host a strip"
+            );
+        }
+    }
+
+    #[test]
+    fn alt_shift_three_enters_agent_full_with_the_second_tab_active() {
+        let mut fixture = TabFixture::new();
+        fixture.area.set_mode(AgentAreaMode::Split);
+
+        // Alt+Shift+3 is the second tab (the editor is 1).
+        assert!(fixture.press(Key::Key3, true));
+
+        assert_eq!(fixture.area.mode(), AgentAreaMode::Tabs);
+        assert_eq!(
+            fixture.area.active(),
+            Some(fixture.agents[1]),
+            "the second tab is active"
+        );
+        assert_eq!(fixture.layout.mode, PaneLayoutMode::AgentFull);
+        let ids = fixture.area.visible_panes(
+            Some(fixture.editor),
+            &fixture.agents,
+            PaneLayoutMode::AgentFull,
+        );
+        assert_eq!(ids, vec![fixture.agents[1]], "and only it is placed");
+    }
+
+    #[test]
+    fn alt_number_in_agent_full_switches_the_maximized_agent() {
+        let mut fixture = TabFixture::new();
+        assert!(fixture.press(Key::Key2, true));
+        assert_eq!(fixture.layout.mode, PaneLayoutMode::AgentFull);
+
+        assert!(fixture.press(Key::Key4, false), "Alt+4 is the third tab");
+
+        assert_eq!(fixture.area.active(), Some(fixture.agents[2]));
+        assert_eq!(
+            fixture.layout.mode,
+            PaneLayoutMode::AgentFull,
+            "Alt+N in agent fullscreen stays fullscreen"
+        );
+        assert_eq!(
+            fixture.layout.active_pane, 3,
+            "and focus moves to the newly maximized agent"
+        );
+    }
+
+    #[test]
+    fn leaving_agent_full_restores_the_editor_rect() {
+        // Alt+1 and Alt+T are the two documented exits.
+        for key in [Key::Key1, Key::T] {
+            let mut fixture = TabFixture::new();
+            assert!(fixture.press(Key::Key2, true));
+            assert_eq!(fixture.layout.mode, PaneLayoutMode::AgentFull);
+
+            assert!(fixture.press(key, false));
+
+            assert_eq!(
+                fixture.layout.mode,
+                PaneLayoutMode::Split,
+                "{key:?} must leave agent fullscreen"
+            );
+            let ids = fixture.area.visible_panes(
+                Some(fixture.editor),
+                &fixture.agents,
+                fixture.layout.mode,
+            );
+            assert!(
+                ids.contains(&fixture.editor),
+                "{key:?} must place the editor again, got {ids:?}"
+            );
+            if key == Key::Key1 {
+                assert_eq!(fixture.layout.active_pane, 0, "Alt+1 focuses the editor");
+            }
+        }
+    }
+
+    #[test]
+    fn closing_the_active_agent_full_tab_falls_back_to_split_with_no_agents() {
+        // Acceptance: closing the active tab in AgentFull moves to the successor, or to
+        // Split with the editor when no agents remain.
+        assert_eq!(
+            layout_mode_after_sync(PaneLayoutMode::AgentFull, true),
+            PaneLayoutMode::AgentFull,
+            "with a successor the agent stays maximized"
+        );
+        assert_eq!(
+            layout_mode_after_sync(PaneLayoutMode::AgentFull, false),
+            PaneLayoutMode::Split,
+            "with no agent left the editor must come back, not a blank frame"
+        );
+        // The other modes are untouched.
+        for mode in [PaneLayoutMode::Split, PaneLayoutMode::EditorFull] {
+            assert_eq!(layout_mode_after_sync(mode, false), mode);
+        }
+    }
+
+    #[test]
+    fn agent_full_with_an_unknown_tab_index_is_a_no_op() {
+        let mut fixture = TabFixture::new();
+        assert!(fixture.press(Key::Key2, true));
+        let before_tab = fixture.area.active();
+        let before_mode = fixture.layout.mode;
+
+        // Only three tabs exist.
+        assert!(fixture.press(Key::Key9, true), "still consumed");
+
+        assert_eq!(fixture.area.active(), before_tab);
+        assert_eq!(fixture.layout.mode, before_mode);
+    }
+
+    #[test]
+    fn agent_full_chords_pick_the_right_repaint() {
+        use layout::LayoutChord;
+
+        // A tab switch that stays in AgentFull keeps the geometry.
+        assert!(
+            chord_keeps_geometry(
+                LayoutChord::FocusAgent(1),
+                AgentAreaMode::Tabs,
+                PaneLayoutMode::AgentFull
+            ),
+            "Alt+N swaps only the maximized pane"
+        );
+        // Entering AgentFull changes geometry, so it keeps the full redraw.
+        assert!(
+            !chord_keeps_geometry(
+                LayoutChord::ActivateTab(1),
+                AgentAreaMode::Split,
+                PaneLayoutMode::Split
+            ),
+            "Alt+Shift+N enters agent fullscreen and must repaint the window"
+        );
+        // Leaving it changes geometry too.
+        for chord in [
+            LayoutChord::FocusEditor,
+            LayoutChord::ToggleAgentAreaMode,
+            LayoutChord::EditorFull,
+        ] {
+            assert!(
+                !chord_keeps_geometry(chord, AgentAreaMode::Tabs, PaneLayoutMode::AgentFull),
+                "{chord:?} leaves agent fullscreen"
+            );
+        }
+    }
+
+    // --- Editor focus chrome vs regional repaint ---------------------------
+
+    /// The three cases the reviewer named, driven through the shared helper.
+    ///
+    /// `editor_chrome_changes` is the rule, `tab_switch_repaint` consumes it, and both
+    /// call sites (a chord and a strip click) go through `relayout_for_tab_switch`,
+    /// which is the only place that knows the previously focused pane.
+    #[test]
+    fn focus_moving_to_or_from_the_editor_forces_a_full_repaint() {
+        let editor = PaneId(1);
+        let agents = [PaneId(2), PaneId(3)];
+        // Tabs + Split with 2+ panes: chrome is on, which is the buggy configuration.
+        let layout_mode = PaneLayoutMode::Split;
+        let chrome_shown = true;
+
+        let mut area = AgentArea::new();
+        area.sync(&agents, Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agents[0]));
+
+        // Frames: editor + active agent, exactly what Tabs places.
+        let before = test_frame(1600, 600, &[editor, agents[0]]);
+        let after_same_agent = test_frame(1600, 600, &[editor, agents[0]]);
+        let region = agent_region(&after_same_agent, |id| id != editor);
+
+        // Premise: the frames are geometrically identical, so only the chrome rule can
+        // force the full repaint here.
+        assert!(frames_share_geometry(&before, &after_same_agent));
+        assert!(tab_strip_visible(area.mode(), area.order().len()));
+
+        // Editor -> agent tab: focus leaves the editor, so its active border and the
+        // agent's dim tint both change. A regional repaint would leave two panes
+        // looking focused.
+        let chrome_changes =
+            editor_chrome_changes(chrome_shown, Some(editor), Some(agents[0]), Some(editor));
+        assert!(chrome_changes, "focus left the editor");
+        assert_eq!(
+            tab_switch_repaint(&before, &after_same_agent, region, chrome_changes),
+            TabSwitchRepaint::Full,
+            "editor -> agent must repaint the window, not just the agent region"
+        );
+
+        // Agent -> agent: the editor was inactive before and after, so its pixels are
+        // untouched and the switch stays regional.
+        let agent_to_agent =
+            editor_chrome_changes(chrome_shown, Some(agents[0]), Some(agents[1]), Some(editor));
+        assert!(!agent_to_agent, "the editor's chrome did not move");
+        assert!(matches!(
+            tab_switch_repaint(&before, &after_same_agent, region, agent_to_agent),
+            TabSwitchRepaint::Region(_)
+        ));
+
+        // Agent -> editor: the same rule in the other direction.
+        let back_to_editor =
+            editor_chrome_changes(chrome_shown, Some(agents[1]), Some(editor), Some(editor));
+        assert!(back_to_editor, "focus returned to the editor");
+        assert_eq!(
+            tab_switch_repaint(&before, &after_same_agent, region, back_to_editor),
+            TabSwitchRepaint::Full
+        );
+
+        // Chrome off (no split chrome outside Split with 2+ panes, e.g. AgentFull):
+        // the editor has no border or tint to update, so the switch stays regional.
+        let in_agent_full =
+            editor_chrome_changes(false, Some(editor), Some(agents[0]), Some(editor));
+        assert!(
+            !in_agent_full,
+            "AgentFull draws no chrome, so the editor's pixels do not change"
+        );
+        assert!(
+            matches!(
+                tab_switch_repaint(&before, &after_same_agent, region, in_agent_full),
+                TabSwitchRepaint::Region(_)
+            ),
+            "AgentFull switches stay regional"
+        );
+        let _ = layout_mode;
+    }
+
+    #[test]
+    fn the_editor_chrome_rule_only_fires_when_chrome_is_shown() {
+        let editor = Some(PaneId(1));
+        let agent = Some(PaneId(2));
+
+        // Chrome shown: crossing the editor in either direction counts.
+        assert!(editor_chrome_changes(true, editor, agent, editor));
+        assert!(editor_chrome_changes(true, agent, editor, editor));
+        // Staying on one side does not.
+        assert!(!editor_chrome_changes(true, agent, Some(PaneId(3)), editor));
+        assert!(!editor_chrome_changes(true, editor, editor, editor));
+
+        // Chrome hidden: nothing about the editor's pixels changes, whatever moves.
+        assert!(!editor_chrome_changes(false, editor, agent, editor));
+        assert!(!editor_chrome_changes(false, agent, editor, editor));
+
+        // No editor placed at all: nothing to go stale.
+        assert!(!editor_chrome_changes(true, agent, Some(PaneId(3)), None));
+    }
+
+    #[test]
+    fn a_focus_move_off_the_editor_does_not_leave_force_redraw_clear() {
+        // The flag half of the bug: a Full fallback must keep `force_redraw` set, or
+        // `render` skips the editor and it keeps its active border.
+        let editor = PaneId(1);
+        let agents = [PaneId(2), PaneId(3)];
+        let mut area = AgentArea::new();
+        area.sync(&agents, Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agents[0]));
+
+        let before = test_frame(1600, 600, &[editor, agents[0]]);
+        let after = test_frame(1600, 600, &[editor, agents[0]]);
+        let region = agent_region(&after, |id| id != editor);
+        let chrome_changes =
+            editor_chrome_changes(true, Some(editor), Some(agents[0]), Some(editor));
+
+        let decision = tab_switch_repaint(&before, &after, region, chrome_changes);
+        assert_eq!(decision, TabSwitchRepaint::Full);
+        assert!(
+            force_redraw_after_tab_switch(false, decision),
+            "a Full fallback must leave force_redraw set"
+        );
+        // And nothing was recorded, so `render` paints the whole window.
+        assert!(
+            tab_switch_region(false, None, &after, region).is_none(),
+            "no recorded frame means no regional confinement"
+        );
+
+        // Agent -> agent by contrast clears it.
+        let regional = tab_switch_repaint(&before, &after, region, false);
+        assert!(matches!(regional, TabSwitchRepaint::Region(_)));
+        assert!(!force_redraw_after_tab_switch(false, regional));
+    }
+
+    #[test]
+    fn a_full_fallback_records_no_frame_so_render_also_repaints_everything() {
+        // The drift risk between the two users of the decision: the helper records a
+        // pre-switch frame only for Region, and `render` re-derives from that frame.
+        // If a Full fallback recorded one anyway, `render` would confine the repaint and
+        // the editor would keep its stale border. Only the helper knows the focused
+        // pane, so this is the contract that keeps them agreeing.
+        let editor = PaneId(1);
+        let agents = [PaneId(2), PaneId(3)];
+        let mut area = AgentArea::new();
+        area.sync(&agents, Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agents[0]));
+
+        let before = test_frame(1600, 600, &[editor, agents[0]]);
+        let after = test_frame(1600, 600, &[editor, agents[0]]);
+        let region = agent_region(&after, |id| id != editor);
+
+        // Modelled the way `relayout_for_tab_switch` does it: Full => no frame recorded.
+        let chrome_changes =
+            editor_chrome_changes(true, Some(editor), Some(agents[0]), Some(editor));
+        let decision = tab_switch_repaint(&before, &after, region, chrome_changes);
+        let recorded = match decision {
+            TabSwitchRepaint::Region(_) => Some(before.clone()),
+            TabSwitchRepaint::Full => None,
+        };
+        assert!(recorded.is_none(), "a Full fallback records nothing");
+        assert!(
+            tab_switch_region(false, recorded.as_ref(), &after, region).is_none(),
+            "so render repaints the whole window too"
+        );
+    }
+    #[test]
+    fn pane_ids_survive_spawn_terminate_and_respawn() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let agent = store.push(test_app_pane("agent"));
+        let coder = store.push(test_app_pane("coder"));
+        let reviewer = store.push(test_app_pane("reviewer"));
+        assert_eq!(store.len(), 4);
+        assert_eq!(store.active(), Some(editor));
+
+        // Spawning appends without touching the identity of existing panes.
+        let spawned = store.push(test_app_pane("spawned"));
+        assert_eq!(store.ids(), vec![editor, agent, coder, reviewer, spawned]);
+
+        // Terminating a pane leaves every survivor's id intact, including the ones
+        // that shift position.
+        let coder_index = store.index_of(coder).expect("coder slot");
+        assert!(store.remove_index(coder_index).is_some());
+        assert_eq!(store.ids(), vec![editor, agent, reviewer, spawned]);
+        assert!(store.get(coder).is_none());
+        assert_eq!(store.active(), Some(editor));
+
+        // Terminating the active pane repoints focus at a surviving pane.
+        let agent_index = store.index_of(agent).expect("agent slot");
+        store.set_active(agent);
+        assert!(store.remove_index(agent_index).is_some());
+        assert_eq!(store.ids(), vec![editor, reviewer, spawned]);
+        assert_eq!(store.active(), Some(reviewer));
+
+        // Respawning in place keeps the slot's id, so identity survives a restart
+        // of the pane itself.
+        let reviewer_before = store.ids();
+        assert!(store.replace(reviewer, test_app_pane("reviewer-acp")));
+        assert_eq!(store.ids(), reviewer_before);
+        assert!(
+            store
+                .get(reviewer)
+                .is_some_and(|pane| pane.agent_id().is_some_and(|id| id == "reviewer-acp"))
+        );
+        assert_eq!(store.active(), Some(reviewer));
+    }
+
+    #[test]
+    fn pane_ids_are_never_reused_after_removal() {
+        let mut store = PaneStore::default();
+        let first = store.push(test_app_pane("first"));
+        store.push(test_app_pane("second"));
+        store.remove_index(0);
+        let third = store.push(test_app_pane("third"));
+
+        assert_ne!(first, third);
+        assert!(store.index_of(first).is_none());
+    }
+
+    /// Minimal terminal pane for store tests; spawns nothing.
+    fn test_app_pane(agent_id: &str) -> AppPane {
+        let metrics = TerminalMetrics {
+            cell_width: 10,
+            cell_height: 20,
+            baseline: 15,
+        };
+        let pane = TerminalPane::new("test", 400, 100, metrics, &config::TerminalTheme::default())
+            .expect("test terminal pane");
+        AppPane::Terminal(TerminalPaneController::new(
+            PaneRole::AgentTerminal {
+                id: agent_id.to_string(),
+                label: agent_id.to_string(),
+                command: None,
+                acp_tui: false,
+            },
+            pane,
+            1.0,
+        ))
+    }
+
+    #[test]
+    fn activity_is_keyed_by_pane_and_survives_reordering() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let agent = store.push(test_app_pane("agent"));
+        let now = Instant::now();
+
+        // The ACP feed addresses an agent by bus id, not by slot position.
+        store.apply_acp_progress("agent", activity::TURN_PROGRESS_ID, true);
+        assert_eq!(
+            store.activity(agent).and_then(|a| a.turn.clone()),
+            Some(activity::TurnState::Thinking)
+        );
+        assert!(store.activity(agent).is_some_and(|a| a.is_busy(now)));
+        assert_eq!(
+            store.activity(editor).and_then(|a| a.turn.clone()),
+            None,
+            "another pane must not pick up the turn"
+        );
+
+        // Dropping an earlier pane shifts indices but not identities, so the
+        // activity stays attached to the right pane.
+        store.remove_index(0);
+        assert!(store.activity(agent).is_some_and(|a| a.is_busy(now)));
+        assert!(store.activity(editor).is_none());
+    }
+
+    #[test]
+    fn acp_progress_for_unknown_agent_is_ignored() {
+        let mut store = PaneStore::default();
+        store.push(test_app_pane("agent"));
+
+        store.apply_acp_progress("nobody", activity::TURN_PROGRESS_ID, true);
+
+        assert!(store.slots.iter().all(|slot| slot.activity.turn.is_none()));
+    }
+
+    #[test]
+    fn respawn_resets_activity_because_the_process_is_new() {
+        let mut store = PaneStore::default();
+        let id = store.push(test_app_pane("agent"));
+        let now = Instant::now();
+        store.apply_acp_progress("agent", activity::TURN_PROGRESS_ID, true);
+        store.mark_seen(id);
+        assert!(store.activity(id).is_some_and(|a| a.is_busy(now)));
+
+        store.replace(id, test_app_pane("agent"));
+
+        let activity = store.activity(id).expect("slot keeps its id");
+        assert_eq!(activity.turn, None);
+        assert_eq!(activity.last_output_at, None);
+        assert!(!activity.unseen_output);
+        assert!(!activity.exited);
+    }
+
+    #[test]
+    fn strip_requires_tabs_mode_and_more_than_one_agent() {
+        use AgentAreaMode::{Split, Tabs};
+
+        // Split mode already shows every agent, so no strip.
+        assert!(!tab_strip_visible(Split, 1));
+        assert!(!tab_strip_visible(Split, 3));
+
+        // Tabs mode with a single agent is pure chrome.
+        assert!(!tab_strip_visible(Tabs, 0));
+        assert!(!tab_strip_visible(Tabs, 1));
+
+        // The case the strip exists for.
+        assert!(tab_strip_visible(Tabs, 2));
+        assert!(tab_strip_visible(Tabs, 5));
+    }
+
+    #[test]
+    fn tab_activation_relayouts_only_in_tabs_mode() {
+        let mut area = AgentArea::new();
+        let agents = [PaneId(2), PaneId(3)];
+        area.sync(&agents, Some(PaneId(1)));
+        area.activate(PaneId(2));
+
+        // Split mode shows every agent, so switching tabs changes no geometry.
+        assert_eq!(area.mode(), AgentAreaMode::Split);
+        assert!(!tab_activation_needs_relayout(&area, PaneId(3)));
+
+        // Tabs mode only places the active agent, so a switch needs a relayout.
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(tab_activation_needs_relayout(&area, PaneId(3)));
+
+        // Re-activating the tab that is already active changes nothing.
+        assert!(!tab_activation_needs_relayout(&area, PaneId(2)));
+    }
+
+    /// A frame for `ids` at the given window size, as `relayout` would build it.
+    fn test_frame(width: usize, height: usize, ids: &[PaneId]) -> FrameLayout {
+        FrameLayout::from_split(
+            ids,
+            SplitLayout::for_window(
+                width,
+                height,
+                ids.len(),
+                PaneLayoutMode::Split,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            ),
+        )
+    }
+
+    #[test]
+    fn mouse_points_are_relative_to_the_drawn_pane_not_the_frame_rect() {
+        // The strip host pane gives up its top row, so its terminal grid starts one
+        // strip-height below the frame rect. Local coordinates must start there too.
+        let editor = PaneId(1);
+        let agent = PaneId(2);
+        let frame = test_frame(1600, 600, &[editor, agent]);
+        let frame_rect = rect_of(&frame, agent);
+        let (strip, below) = frame.strip_rect_for(agent, 20).expect("strip split");
+        assert_eq!(
+            below.y,
+            frame_rect.y + strip.height,
+            "premise: pane is shifted"
+        );
+
+        // The first text row sits at the top of the drawn pane.
+        assert_eq!(
+            pane_local_point(below, below.x + 7, below.y + 3),
+            Some((7, 3)),
+            "a click 3px into the drawn pane is 3px into the grid"
+        );
+        // The old frame-rect math would have reported strip.height + 3.
+        assert_ne!(
+            pane_local_point(frame_rect, below.x + 7, below.y + 3),
+            Some((7, 3))
+        );
+        // A point in the strip row belongs to no pane.
+        assert_eq!(pane_local_point(below, below.x + 7, strip.y + 1), None);
+    }
+
+    fn rect_of(frame: &FrameLayout, id: PaneId) -> PaneRect {
+        frame
+            .placed()
+            .iter()
+            .find(|placed| placed.id == id)
+            .unwrap_or_else(|| panic!("{id:?} is not placed"))
+            .rect
+    }
+
+    #[test]
+    fn tab_switch_repaint_stays_regional_when_only_the_occupant_changes() {
+        // Tabs mode places the editor plus one agent, so a switch swaps *which*
+        // agent holds the agent rect and leaves both rects alone. This is the case
+        // blocker 2 was about: `relayout` raises `force_redraw`, and repainting the
+        // editor for it is pure waste.
+        let editor = PaneId(1);
+        let before = test_frame(1600, 600, &[editor, PaneId(2)]);
+        let after = test_frame(1600, 600, &[editor, PaneId(3)]);
+        let is_agent = |id: PaneId| id != editor;
+        let region = agent_region(&after, is_agent).expect("an agent is placed");
+
+        let decision = tab_switch_repaint(&before, &after, Some(region), false);
+
+        // The switch is confined: `force_full` is false and the region is the agent's.
+        assert_eq!(
+            decision,
+            TabSwitchRepaint::Region(region),
+            "a geometry-preserving switch must stay regional"
+        );
+
+        let editor_rect = rect_of(&after, editor);
+        let agent_rect = rect_of(&after, PaneId(3));
+        assert!(
+            !rects_intersect(editor_rect, region),
+            "the editor must be outside the repaint region: {editor_rect:?} vs {region:?}"
+        );
+        assert!(
+            rects_intersect(agent_rect, region),
+            "the incoming agent must be inside the repaint region"
+        );
+        // Guard the premise: editor and agent really are disjoint in this layout, so
+        // "outside the region" is a meaningful statement about the editor.
+        assert!(!rects_intersect(editor_rect, agent_rect));
+    }
+
+    #[test]
+    fn tab_switch_repaint_falls_back_to_the_whole_window_when_geometry_moves() {
+        let editor = PaneId(1);
+        let before = test_frame(1600, 600, &[editor, PaneId(2)]);
+        let after = test_frame(1000, 600, &[editor, PaneId(3)]);
+        let is_agent = |id: PaneId| id != editor;
+        let region = agent_region(&after, is_agent).expect("an agent is still placed");
+
+        // The rects moved, so the editor's pixels are stale too and it must be drawn.
+        assert!(
+            !frames_share_geometry(&before, &after),
+            "premise: the resize changed the geometry"
+        );
+        assert_eq!(
+            tab_switch_repaint(&before, &after, Some(region), false),
+            TabSwitchRepaint::Full,
+            "a switch that moves panes must repaint the whole window"
+        );
+    }
+
+    #[test]
+    fn tab_switch_repaint_falls_back_when_there_is_no_agent_region() {
+        // No agent is placed, so there is no region to confine the repaint to.
+        let before = test_frame(1600, 600, &[PaneId(1)]);
+        let after = test_frame(1600, 600, &[PaneId(1)]);
+
+        assert_eq!(
+            tab_switch_repaint(&before, &after, None, false),
+            TabSwitchRepaint::Full,
+            "without an agent region the whole window is repainted"
+        );
+    }
+
+    #[test]
+    fn tab_switch_region_forces_the_incoming_pane_and_covers_the_editor_on_full() {
+        // The same geometry-preserving switch as above, now taken all the way through
+        // the function `render` actually calls. This is what blocker A was about: the
+        // incoming tab is clean, so a regional repaint has to force it or nothing is
+        // painted and the old tab's pixels stay under the strip.
+        let editor = PaneId(1);
+        let before = test_frame(1600, 600, &[editor, PaneId(2)]);
+        let after = test_frame(1600, 600, &[editor, PaneId(3)]);
+        let is_agent = |id: PaneId| id != editor;
+        let region = agent_region(&after, is_agent);
+
+        let repaint_region = tab_switch_region(false, Some(&before), &after, region);
+        let region = repaint_region.expect("a regional switch keeps a region");
+
+        // The decision is what forces the drawn pane, so a Region must imply it.
+        assert!(
+            pane_force_redraw(false, repaint_region),
+            "the incoming pane must be forced under a regional switch"
+        );
+        // And the incoming agent is inside that region, so it is the pane drawn.
+        assert!(
+            rects_intersect(rect_of(&after, PaneId(3)), region),
+            "the incoming agent must be the pane the region covers"
+        );
+        // The editor is outside it, hence skipped.
+        assert!(
+            !rects_intersect(rect_of(&after, editor), region),
+            "the editor must stay outside a regional switch"
+        );
+
+        // A full redraw is never confined: the region is None, so nothing is skipped
+        // and every pane - the editor included - is repainted.
+        let full = tab_switch_region(true, Some(&before), &after, Some(region));
+        assert!(full.is_none(), "a full redraw must not keep a region");
+
+        // A frame with no recorded switch is not regional either, whatever the frames
+        // look like, so it cannot accidentally skip the editor.
+        assert!(
+            tab_switch_region(false, None, &after, agent_region(&after, is_agent)).is_none(),
+            "a non-switch frame must not be confined"
+        );
+        // Neither is a switch whose geometry moved.
+        let resized = test_frame(1000, 600, &[editor, PaneId(3)]);
+        assert!(
+            tab_switch_region(
+                false,
+                Some(&before),
+                &resized,
+                agent_region(&resized, is_agent)
+            )
+            .is_none(),
+            "a switch that moves the panes must repaint the window"
+        );
+    }
+
+    #[test]
+    fn a_pending_full_redraw_survives_a_regional_tab_switch() {
+        // Blocker C. A resize or font change sets `force_redraw` and waits for the
+        // next RedrawRequested. If a strip click renders first, its relayout would
+        // clear that flag and render() would then skip the cleared buffer's editor.
+        let editor = PaneId(1);
+        let before = test_frame(1600, 600, &[editor, PaneId(2)]);
+        let after = test_frame(1600, 600, &[editor, PaneId(3)]);
+        let region = agent_region(&after, |id| id != editor);
+
+        let regional = tab_switch_repaint(&before, &after, region, false);
+        assert!(
+            matches!(regional, TabSwitchRepaint::Region(_)),
+            "premise: this switch is regional"
+        );
+
+        // Nothing was pending: the switch clears the relayout's own flag, so the
+        // repaint stays confined.
+        assert!(
+            !force_redraw_after_tab_switch(false, regional),
+            "a switch with nothing pending must not force the window"
+        );
+        // A full redraw was pending: it must not be downgraded, or `render` clears
+        // the buffer and then skips the editor.
+        assert!(
+            force_redraw_after_tab_switch(true, regional),
+            "a pending full redraw must survive a regional switch"
+        );
+
+        // And the flag then wins over the region in render's composition.
+        let pending = true;
+        assert!(
+            tab_switch_region(
+                force_redraw_after_tab_switch(pending, regional),
+                Some(&before),
+                &after,
+                region
+            )
+            .is_none(),
+            "a surviving full redraw must cover the editor again"
+        );
+
+        // A Full switch repaints the window regardless of what was pending.
+        assert!(force_redraw_after_tab_switch(false, TabSwitchRepaint::Full));
+        assert!(force_redraw_after_tab_switch(true, TabSwitchRepaint::Full));
+    }
+
+    #[test]
+    fn a_plain_incremental_frame_does_not_force_the_panes() {
+        // No region and no full redraw: dirty tracking decides per row, which is what
+        // keeps a normal frame cheap. Only a full redraw or a regional switch forces.
+        assert!(!pane_force_redraw(false, None));
+        assert!(pane_force_redraw(true, None), "a full redraw forces");
+        let any = PaneRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        assert!(
+            pane_force_redraw(false, Some(any)),
+            "a regional switch forces the panes it draws"
+        );
+    }
+
+    #[test]
+    fn strip_repaints_when_its_cells_change_but_not_when_they_match() {
+        let entry = |id: u64, busy: bool| TabStripEntry {
+            id: PaneId::from_raw(id),
+            label: "agent".to_string(),
+            active: id == 2,
+            busy,
+            exited: false,
+            unseen: false,
+        };
+
+        let idle = vec![entry(2, false), entry(3, false)];
+        // Never drawn yet: the first paint must happen.
+        assert!(
+            tab_strip_changed(false, false, &idle, None),
+            "the first draw must paint"
+        );
+
+        // Identical cells, no full redraw, no switch: nothing to blit. This is the
+        // early return that stops every frame from presenting.
+        assert!(
+            !tab_strip_changed(false, false, &idle, Some(&idle)),
+            "identical entries must not repaint"
+        );
+
+        // A background pane going busy changes a dot, which arrives as plain output.
+        let busy = vec![entry(2, false), entry(3, true)];
+        assert!(
+            tab_strip_changed(false, false, &busy, Some(&idle)),
+            "a new busy dot must repaint the strip"
+        );
+        // The busy -> idle flip has no event at all, only a changed cell.
+        assert!(
+            tab_strip_changed(false, false, &idle, Some(&busy)),
+            "an expiring dot must repaint the strip"
+        );
+
+        // Both override flags still work on their own.
+        assert!(tab_strip_changed(true, false, &idle, Some(&idle)));
+        assert!(tab_strip_changed(false, true, &idle, Some(&idle)));
+    }
+
+    #[test]
+    fn an_unshown_strip_never_reports_a_change_and_spins_the_idle_poll() {
+        // The idle poll's gate has to be "is a strip on screen", not "does the strip
+        // reserve geometry". Tabs mode with 2 agents reserves a row, but if the active
+        // agent has no rect nothing is drawn and `render` clears the baseline - so a
+        // geometry-based gate would compare None against live entries forever: dirty,
+        // redraw, present nothing, ask again, with no frame cap.
+        //
+        // Drive it from the real layout, in the same shape as
+        // `strip_rect_is_absent_when_the_pane_has_no_area`: editor maximized.
+        let editor = PaneId(1);
+        let agent_one = PaneId(2);
+        let agent_two = PaneId(3);
+
+        let mut area = AgentArea::new();
+        area.sync(&[agent_one, agent_two], Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        assert!(area.activate(agent_one), "agent_one is the active tab");
+        assert_eq!(area.mode(), AgentAreaMode::Tabs);
+
+        // The mode and agent count say "reserve a strip row"...
+        assert!(
+            tab_strip_visible(area.mode(), area.order().len()),
+            "premise: tabs mode with two agents reserves the strip"
+        );
+
+        // ...but the editor is maximized, so the agent has no area and no strip can
+        // be carved from it. This is the exact case that spun.
+        let frame = FrameLayout::from_split(
+            &[editor, agent_one],
+            SplitLayout::for_window(
+                200,
+                100,
+                2,
+                PaneLayoutMode::EditorFull,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            ),
+        );
+        assert!(
+            frame
+                .strip_rect_for(area.active().expect("an active tab"), 10)
+                .is_none(),
+            "premise: the active agent has no rect, so render draws no strip"
+        );
+
+        // Nothing is on screen, so there is nothing to repaint - even though the
+        // baseline is None and the entries would be non-empty.
+        let entries = vec![
+            TabStripEntry {
+                id: agent_one,
+                label: "agent".to_string(),
+                active: true,
+                busy: true,
+                exited: false,
+                unseen: false,
+            },
+            TabStripEntry {
+                id: agent_two,
+                label: "coder".to_string(),
+                active: false,
+                busy: false,
+                exited: false,
+                unseen: false,
+            },
+        ];
+        assert!(!entries.is_empty(), "premise: there are entries to differ");
+
+        // Derive "what would be drawn" the way the idle check does - from the frame,
+        // not by writing None by hand. `strip_rect_for` returning None is what makes
+        // the overlay absent, so the Option below is None *because* the rect is.
+        let shown_on = |frame: &FrameLayout, id: PaneId| -> Option<Vec<TabStripEntry>> {
+            frame.strip_rect_for(id, 10).map(|_| entries.clone())
+        };
+
+        let active = area.active().expect("an active tab");
+        let unshown = shown_on(&frame, active);
+        assert!(
+            unshown.is_none(),
+            "premise: no rect, so nothing is on screen to compare"
+        );
+        // This is the function the idle check calls, so the branch it really runs -
+        // the unshown one - is the one under test.
+        assert!(
+            !tab_strip_screen_changed(unshown.as_deref(), None),
+            "an unshown strip with no baseline must not report a change"
+        );
+        assert!(
+            !tab_strip_screen_changed(unshown.as_deref(), Some(&entries)),
+            "an unshown strip must not report a change even with a stale baseline"
+        );
+
+        // The opposite, so the gate is not a blanket false: the strip IS shown here,
+        // nothing has been drawn yet, so it must report a change and paint once.
+        let with_area = FrameLayout::from_split(
+            &[editor, agent_one],
+            SplitLayout::for_window(
+                200,
+                100,
+                2,
+                PaneLayoutMode::Split,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            ),
+        );
+        let visible = shown_on(&with_area, active);
+        assert!(
+            visible.is_some(),
+            "premise: the agent has a rect, so the strip is on screen"
+        );
+        assert!(
+            tab_strip_screen_changed(visible.as_deref(), None),
+            "a shown strip with no baseline must report a change"
+        );
+        // And once drawn, an identical set settles: no spin in the normal case.
+        assert!(!tab_strip_screen_changed(
+            visible.as_deref(),
+            Some(&entries)
+        ));
+    }
+
+    #[test]
+    fn frames_share_geometry_when_only_the_occupant_changes() {
+        let frame = |ids: &[PaneId]| {
+            FrameLayout::from_split(
+                ids,
+                SplitLayout::for_window(
+                    200,
+                    100,
+                    ids.len(),
+                    PaneLayoutMode::Split,
+                    PaneSplitDirection::Vertical,
+                    SplitLayoutOptions::unbounded(),
+                ),
+            )
+        };
+
+        // A tab switch swaps which agent holds the agent region: same rects.
+        let before = frame(&[PaneId(1), PaneId(2)]);
+        let after = frame(&[PaneId(1), PaneId(3)]);
+        assert!(
+            frames_share_geometry(&before, &after),
+            "a tab switch keeps the geometry, so the repaint can stay regional"
+        );
+
+        // A different pane count really does change the geometry.
+        let narrowed = frame(&[PaneId(1)]);
+        assert!(
+            !frames_share_geometry(&before, &narrowed),
+            "a frame with fewer panes is not the same geometry"
+        );
+    }
+
+    #[test]
+    fn union_rect_spans_both_inputs() {
+        let a = PaneRect {
+            x: 10,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let b = PaneRect {
+            x: 0,
+            y: 20,
+            width: 10,
+            height: 10,
+        };
+
+        assert_eq!(
+            union_rect(a, b),
+            PaneRect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 30
+            }
+        );
+    }
+
+    #[test]
+    fn rects_intersect_ignores_touching_edges() {
+        let left = PaneRect {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let touching = PaneRect {
+            x: 10,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let overlapping = PaneRect {
+            x: 9,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+
+        assert!(!rects_intersect(left, touching));
+        assert!(rects_intersect(left, overlapping));
+    }
+
+    #[test]
+    fn focusing_an_agent_activates_its_tab_and_clears_unseen() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        store.push(test_app_pane("agent"));
+        let coder = store.push(test_app_pane("coder"));
+        let mut area = AgentArea::new();
+        let agents = store
+            .ids()
+            .into_iter()
+            .filter(|id| *id != editor)
+            .collect::<Vec<_>>();
+        area.sync(&agents, Some(editor));
+
+        // Output arrived on coder while it was not the active tab.
+        mark_unseen(&mut store, coder);
+        assert!(store.activity(coder).is_some_and(|a| a.unseen_output));
+
+        // The Alt-key path calls this, mirroring the mouse path.
+        note_focus(&mut store, &mut area, coder);
+
+        assert_eq!(area.active(), Some(coder), "tab model follows focus");
+        assert!(
+            !store.activity(coder).is_some_and(|a| a.unseen_output),
+            "focusing the pane clears its unseen marker"
+        );
+    }
+
+    #[test]
+    fn focusing_the_editor_neither_moves_the_tab_nor_clears_an_agent() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let agent = store.push(test_app_pane("agent"));
+        let mut area = AgentArea::new();
+        area.sync(&[agent], Some(editor));
+
+        mark_unseen(&mut store, agent);
+
+        // Alt+1 focuses the editor. That must not activate a tab, and must not
+        // claim the agent's unseen output was seen.
+        note_focus(&mut store, &mut area, editor);
+
+        assert_eq!(area.active(), Some(agent), "editor never becomes a tab");
+        assert!(
+            store.activity(agent).is_some_and(|a| a.unseen_output),
+            "looking at the editor does not count as looking at the agent"
+        );
+    }
+
+    #[test]
+    fn closing_the_active_tab_after_a_reorder_keeps_tab_and_focus_together() {
+        // The reorder case from the review: slots [E, a, b, c] with tab order [b, a, c]
+        // and `a` active. Closing `a` leaves PaneStore on b (the slot that slid into
+        // the removed one) and the tabs on c (the tab that slid into the removed tab's
+        // position). In tabs mode the visible pane is the active tab, so focus must
+        // follow the tab - both must end on c, not b.
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let a = store.push(test_app_pane("a"));
+        let b = store.push(test_app_pane("b"));
+        let c = store.push(test_app_pane("c"));
+
+        let mut area = AgentArea::new();
+        area.sync(&[a, b, c], Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        // Reorder to [b, a, c].
+        assert!(area.move_tab(b, 0));
+        assert!(area.move_tab(a, 1));
+        assert_eq!(area.order(), &[b, a, c], "premise: tabs are reordered");
+        assert!(area.activate(a));
+        store.set_active(a);
+
+        // Close the active tab exactly as `remove_pane_at` does. The store's own pick
+        // is b here, which is the divergence.
+        let index = store.index_of(a).expect("a slot");
+        store.remove_index(index);
+        assert_eq!(
+            store.active(),
+            Some(b),
+            "premise: the store on its own would focus b"
+        );
+
+        let remaining: Vec<PaneId> = store
+            .iter()
+            .filter(|slot| slot.pane.is_agent_pane())
+            .map(|slot| slot.id)
+            .collect();
+        sync_agent_area(&mut area, &mut store, &remaining, Some(editor));
+
+        assert_eq!(
+            area.active(),
+            Some(c),
+            "the tab that slid into the removed tab's place takes over"
+        );
+        assert_eq!(
+            store.active(),
+            Some(c),
+            "keyboard focus follows the active tab, not the next slot"
+        );
+        assert_ne!(store.active(), Some(b), "and not the slot-neighbor b");
+    }
+
+    #[test]
+    fn closing_a_background_tab_leaves_focus_alone() {
+        // The other half of the contract: closing a tab the user is not on must not
+        // move keyboard focus.
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let first = store.push(test_app_pane("first"));
+        let second = store.push(test_app_pane("second"));
+        let mut area = AgentArea::new();
+        area.sync(&[first, second], Some(editor));
+        area.set_mode(AgentAreaMode::Tabs);
+        area.activate(first);
+        store.set_active(first);
+
+        // Close the background tab.
+        let index = store.index_of(second).expect("second slot");
+        store.remove_index(index);
+        sync_agent_area(&mut area, &mut store, &[first], Some(editor));
+
+        assert_eq!(area.active(), Some(first), "the visible tab is unchanged");
+        assert_eq!(store.active(), Some(first), "so is keyboard focus");
+        assert_eq!(area.order(), &[first]);
+    }
+
+    #[test]
+    fn ensure_contains_appends_without_disturbing_the_active_tab() {
+        // `sync` used to be the only caller; this pins the direct-append contract, and
+        // that the editor is refused.
+        let editor = PaneId(1);
+        let mut area = AgentArea::new();
+
+        assert!(
+            area.ensure_contains(PaneId(2), Some(editor)),
+            "the first agent appends"
+        );
+        assert_eq!(area.active(), Some(PaneId(2)), "and becomes active");
+
+        assert!(
+            area.ensure_contains(PaneId(3), Some(editor)),
+            "a second agent appends"
+        );
+        assert_eq!(area.order(), &[PaneId(2), PaneId(3)]);
+        assert_eq!(
+            area.active(),
+            Some(PaneId(2)),
+            "appending must not steal the active tab"
+        );
+
+        assert!(
+            !area.ensure_contains(PaneId(2), Some(editor)),
+            "re-adding an existing tab is a no-op"
+        );
+        assert!(
+            !area.ensure_contains(editor, Some(editor)),
+            "the editor is never a tab"
+        );
+        assert_eq!(area.order(), &[PaneId(2), PaneId(3)]);
+    }
+
+    #[test]
+    fn editor_full_survives_removal_and_focus_stays_addressable() {
+        // The carry-forward from the pane-ids review, updated for the index-free mode:
+        // removing a slot while the editor is full must shift focus, keep the mode, and
+        // leave the index in range.
+        let mut store = PaneStore::default();
+        let _editor = store.push(test_app_pane("editor"));
+        let first = store.push(test_app_pane("first"));
+        let _second = store.push(test_app_pane("second"));
+        let mut layout =
+            test_layout_state(PaneLayoutMode::EditorFull, PaneSplitDirection::Vertical, 2);
+
+        // Remove the first agent while focus sits on the last slot.
+        let index = store.index_of(first).expect("first slot");
+        store.remove_index(index);
+        adjust_pane_indices_after_removal(&mut layout, index, store.len());
+
+        assert_eq!(layout.mode, PaneLayoutMode::EditorFull, "the mode is kept");
+        assert_eq!(layout.active_pane, 1, "the focus index shifted down");
+        assert!(
+            layout.active_pane < store.len(),
+            "the focus index still addresses a live slot"
+        );
+    }
+
+    #[test]
+    fn sync_clears_the_neighbor_that_takes_over_the_active_tab() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let first = store.push(test_app_pane("first"));
+        let second = store.push(test_app_pane("second"));
+        let mut area = AgentArea::new();
+        area.sync(&[first, second], Some(editor));
+        area.activate(first);
+
+        // Both tabs have unseen output; then the active tab is terminated.
+        mark_unseen(&mut store, first);
+        mark_unseen(&mut store, second);
+        store.remove_index(store.index_of(first).expect("first slot"));
+
+        sync_agent_area(&mut area, &mut store, &[second], Some(editor));
+
+        assert_eq!(area.active(), Some(second), "neighbor is promoted");
+        assert!(
+            !store.activity(second).is_some_and(|a| a.unseen_output),
+            "the promoted neighbor is on screen, so its unseen marker clears"
+        );
+    }
+
+    #[test]
+    fn sync_leaves_unseen_alone_when_the_active_tab_survives() {
+        let mut store = PaneStore::default();
+        let editor = store.push(test_app_pane("editor"));
+        let first = store.push(test_app_pane("first"));
+        let second = store.push(test_app_pane("second"));
+        let mut area = AgentArea::new();
+        area.sync(&[first, second], Some(editor));
+        area.activate(first);
+        mark_unseen(&mut store, second);
+
+        // A spawn does not move the active tab, so nothing should be cleared.
+        sync_agent_area(&mut area, &mut store, &[first, second], Some(editor));
+
+        assert_eq!(area.active(), Some(first));
+        assert!(
+            store.activity(second).is_some_and(|a| a.unseen_output),
+            "a background tab keeps its unseen marker"
+        );
+    }
+
+    /// Give `id` unseen output, as if it printed while not the active tab.
+    fn mark_unseen(store: &mut PaneStore, id: PaneId) {
+        let slot = store
+            .slots
+            .iter_mut()
+            .find(|slot| slot.id == id)
+            .expect("slot");
+        slot.activity.mark_output(Instant::now(), false);
+        // `mark_output` also makes the pane busy; the tests here care about unseen.
+        assert!(slot.activity.unseen_output);
+    }
+
+    #[test]
+    fn mark_seen_clears_unseen_and_reports_the_change() {
+        let mut store = PaneStore::default();
+        let id = store.push(test_app_pane("agent"));
+        let now = Instant::now();
+
+        // Output while this pane is not the active tab is unseen.
+        if let Some(slot) = store.slots.iter_mut().find(|slot| slot.id == id) {
+            slot.activity.mark_output(now, false);
+        }
+        assert!(store.activity(id).is_some_and(|a| a.unseen_output));
+
+        assert!(store.mark_seen(id), "clearing an unseen flag reports true");
+        assert!(!store.activity(id).is_some_and(|a| a.unseen_output));
+        assert!(!store.mark_seen(id), "clearing twice reports false");
+        assert!(!store.mark_seen(PaneId(9999)), "unknown ids report false");
     }
 
     #[test]

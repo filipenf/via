@@ -61,8 +61,11 @@ fn bench_layout(c: &mut Criterion) {
 
     c.bench_function("layout/focus_after_reference", |b| {
         b.iter(|| {
+            // Agent fullscreen (PaneLayoutMode::AgentFull) to editor fullscreen, which
+            // is the transition this measures: it changes the layout mode, so it is the
+            // relayout_needed path rather than a plain focus move.
             let mut layout = PaneLayoutState::with_focus(
-                black_box(PaneLayoutMode::PaneMaximized(1)),
+                black_box(PaneLayoutMode::AgentFull),
                 black_box(1usize),
             );
             let r: FocusNvimAfterReference =

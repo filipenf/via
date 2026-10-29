@@ -1,3 +1,4 @@
+use super::PaneId;
 use super::input::{Key, Modifiers};
 use crate::config::{DEFAULT_AGENT_PANE_MAX_COLS, DEFAULT_AGENT_PANE_MIN_COLS};
 use tracing::info;
@@ -108,8 +109,15 @@ pub struct PaneRect {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneLayoutMode {
     Split,
-    /// One specific pane (by index) is shown full-screen; others have zero size.
-    PaneMaximized(usize),
+    /// Only the editor has geometry; every agent is hidden. This is the old
+    /// `PaneMaximized(0)`.
+    EditorFull,
+    /// Only the active agent has geometry, at the full window size; the editor and the
+    /// other agents get a zero rect. This is the old `PaneMaximized(i)` for `i > 0`,
+    /// but it carries no index: which agent is full-screen comes from
+    /// [`AgentArea::active`], so a reorder or a close cannot leave a stale index
+    /// pointing at another pane's rect.
+    AgentFull,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,7 +139,7 @@ pub struct PaneLayoutState {
 impl PaneLayoutState {
     /// Show the editor fullscreen and focus it.
     pub(super) fn focus_maximized_editor(&mut self) {
-        self.mode = PaneLayoutMode::PaneMaximized(0);
+        self.mode = PaneLayoutMode::EditorFull;
         self.active_pane = 0;
     }
 
@@ -224,26 +232,24 @@ impl SplitLayout {
             };
         }
 
-        // PaneMaximized must be handled before the multi-pane split logic.
-        if let PaneLayoutMode::PaneMaximized(i) = mode {
-            if i < pane_count {
-                let mut panes = vec![
-                    PaneRect {
-                        x: 0,
-                        y: 0,
-                        width: 0,
-                        height: 0
-                    };
-                    pane_count
-                ];
-                panes[i] = PaneRect {
+        // `EditorFull` must be handled before the multi-pane split logic.
+        if mode == PaneLayoutMode::EditorFull && pane_count > 0 {
+            let mut panes = vec![
+                PaneRect {
                     x: 0,
                     y: 0,
-                    width,
-                    height,
+                    width: 0,
+                    height: 0
                 };
-                return Self { panes };
-            }
+                pane_count
+            ];
+            panes[0] = PaneRect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            };
+            return Self { panes };
         }
 
         // For three or more panes we always produce a flat list of visible rects.
@@ -329,127 +335,593 @@ impl SplitLayout {
                 && y < rect.y.saturating_add(rect.height)
         })
     }
+
+    pub(super) fn len(&self) -> usize {
+        self.panes.len()
+    }
 }
+
+/// One pane and the rect it occupies for the current frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacedPane {
+    pub id: PaneId,
+    pub rect: PaneRect,
+}
+
+/// A frame's placement of panes, keyed by stable identity.
+///
+/// [`SplitLayout`] stays purely positional (and unchanged) so the layout math and
+/// its tests do not need to know about pane identity. `FrameLayout` pairs those
+/// rects with the [`PaneId`]s of the slots that produced them, so a hit test or a
+/// resize addresses the pane itself instead of whatever index it happens to have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameLayout {
+    placed: Vec<PlacedPane>,
+    split: SplitLayout,
+}
+
+impl FrameLayout {
+    /// Pair `ids` (slot order) with the rects `split` computed for that order.
+    /// Extra ids beyond the split's rect count are dropped; extra rects beyond
+    /// `ids` are unreachable, which keeps this panic-free on any input.
+    pub(super) fn from_split(ids: &[PaneId], split: SplitLayout) -> Self {
+        let placed = ids
+            .iter()
+            .copied()
+            .enumerate()
+            .take(split.len())
+            .map(|(index, id)| PlacedPane {
+                id,
+                rect: split.pane(index),
+            })
+            .collect();
+        Self { placed, split }
+    }
+
+    /// The positional layout this frame was derived from.
+    pub(super) fn split(&self) -> &SplitLayout {
+        &self.split
+    }
+
+    pub fn placed(&self) -> &[PlacedPane] {
+        &self.placed
+    }
+
+    /// Pane id and rect under `(x, y)`. Hidden (zero-sized) panes never match.
+    pub fn pane_at(&self, x: usize, y: usize) -> Option<(PaneId, PaneRect)> {
+        // Hit-testing stays owned by `SplitLayout`; this only maps the positional
+        // result back to the identity of the slot that produced it.
+        let (index, rect) = self.split.pane_at(x, y)?;
+        let id = self.placed.get(index)?.id;
+        Some((id, rect))
+    }
+
+    /// The strip rect for `id`, plus the pane rect left below it.
+    ///
+    /// The strip takes the top row of the agent region and the pane keeps the rest,
+    /// so panes are drawn below the strip instead of under it. Pure: it reads the
+    /// frame and returns two rects rather than mutating the stored layout, which
+    /// matters because the render path calls it on every frame.
+    ///
+    /// Returns `None` when the pane has no visible area (hidden behind another tab,
+    /// or fullscreened away), in which case nothing is reserved or drawn.
+    pub(super) fn strip_rect_for(
+        &self,
+        id: PaneId,
+        strip_height: usize,
+    ) -> Option<(PaneRect, PaneRect)> {
+        let rect = self
+            .placed
+            .iter()
+            .find(|placed| placed.id == id)
+            .map(|placed| placed.rect)?;
+        if rect.width == 0 || rect.height == 0 {
+            return None;
+        }
+        let height = strip_height.min(rect.height);
+        if height == 0 {
+            return None;
+        }
+        Some((
+            PaneRect {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height,
+            },
+            PaneRect {
+                x: rect.x,
+                y: rect.y + height,
+                width: rect.width,
+                height: rect.height - height,
+            },
+        ))
+    }
+}
+
+/// How the agent region presents its agents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentAreaMode {
+    /// Every agent gets geometry in the agent region (the long-standing behavior).
+    #[default]
+    Split,
+    /// Only the active agent gets geometry; the rest are hidden behind tabs.
+    Tabs,
+}
+
+/// The agent region as a group of tabs: a stable order, one active member, and
+/// the mode that decides whether all of them or only the active one is shown.
+///
+/// This is a pure model. It owns no panes, does no rendering, and knows nothing
+/// about key bindings; callers feed it the live agent ids and ask which panes a
+/// frame should place.
+///
+/// Three invariants are maintained by every mutator:
+///
+/// 1. `order` is a permutation of the live agent ids - no duplicates, and none
+///    missing.
+/// 2. `active` is either a member of `order` or `None`.
+/// 3. The editor pane is never a member of `order`; tabs only ever hold agents.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentArea {
+    order: Vec<PaneId>,
+    active: Option<PaneId>,
+    mode: AgentAreaMode,
+}
+
+impl AgentArea {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn mode(&self) -> AgentAreaMode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: AgentAreaMode) {
+        self.mode = mode;
+    }
+
+    /// Tab order; a permutation of the live agent ids.
+    pub fn order(&self) -> &[PaneId] {
+        &self.order
+    }
+
+    pub fn active(&self) -> Option<PaneId> {
+        self.active
+    }
+
+    /// Reconcile `order` with the live agent ids, keeping the existing tab order.
+    ///
+    /// Surviving tabs keep their relative order, newly spawned agents append, and
+    /// agents that no longer exist are dropped. This is the one entry point that
+    /// re-establishes the permutation invariant after a spawn or a terminate, so
+    /// it also drops duplicates and refuses `editor`.
+    ///
+    /// When `active` is `None` and agents exist, the first tab becomes active, so
+    /// a populated area always has something to show. When `active` was removed,
+    /// the tab that slid into its place takes over, mirroring how pane focus
+    /// behaves when a pane is closed.
+    pub fn sync(&mut self, agents: &[PaneId], editor: Option<PaneId>) {
+        let mut next: Vec<PaneId> = Vec::with_capacity(agents.len());
+        for id in self.order.iter().copied() {
+            if Some(id) == editor || next.contains(&id) || !agents.contains(&id) {
+                continue;
+            }
+            next.push(id);
+        }
+        for id in agents.iter().copied() {
+            if Some(id) == editor || next.contains(&id) {
+                continue;
+            }
+            next.push(id);
+        }
+
+        // Where the active tab sat, so a removal can hand over to its neighbor.
+        let previous = self
+            .active
+            .and_then(|active| self.order.iter().position(|id| *id == active));
+
+        self.order = next;
+
+        let active_is_live = self
+            .active
+            .is_some_and(|active| self.order.contains(&active));
+        if !active_is_live {
+            self.active = match previous {
+                Some(index) if !self.order.is_empty() => {
+                    Some(self.order[index.min(self.order.len() - 1)])
+                }
+                _ => self.order.first().copied(),
+            };
+        }
+    }
+
+    /// Add `id` as the last tab if it is not already present. Returns whether the
+    /// order changed. Refuses `editor`, which never belongs to a tab set.
+    pub fn ensure_contains(&mut self, id: PaneId, editor: Option<PaneId>) -> bool {
+        if Some(id) == editor || self.order.contains(&id) {
+            return false;
+        }
+        self.order.push(id);
+        if self.active.is_none() {
+            self.active = Some(id);
+        }
+        true
+    }
+
+    /// Drop `id` from the tab set. When it was the active tab, the tab that takes
+    /// its place becomes active (or `None` when nothing remains).
+    pub fn remove(&mut self, id: PaneId) -> bool {
+        let Some(index) = self.order.iter().position(|tab| *tab == id) else {
+            return false;
+        };
+        self.order.remove(index);
+        if self.active == Some(id) {
+            self.active = self
+                .order
+                .get(index.min(self.order.len().saturating_sub(1)))
+                .copied();
+        }
+        true
+    }
+
+    /// Make `id` the active tab. Succeeds only for a tab that is in `order`, so
+    /// activating a removed (or unknown) pane is a no-op that returns `false`.
+    pub fn activate(&mut self, id: PaneId) -> bool {
+        if !self.order.contains(&id) {
+            return false;
+        }
+        self.active = Some(id);
+        true
+    }
+
+    /// Move the tab `id` to `new_index`, clamped into range. Returns whether the
+    /// tab exists, so an unknown id cannot disturb the order.
+    pub fn move_tab(&mut self, id: PaneId, new_index: usize) -> bool {
+        let Some(from) = self.order.iter().position(|tab| *tab == id) else {
+            return false;
+        };
+        self.order.remove(from);
+        let to = new_index.min(self.order.len());
+        self.order.insert(to, id);
+        true
+    }
+
+    /// The pane ids a frame should place, editor first.
+    ///
+    /// `Split` returns the editor followed by every agent in slot order, which is
+    /// exactly what the geometry assumed before tabs existed. `Tabs` returns the
+    /// editor plus at most the active agent, so hidden panes get no rect at all.
+    ///
+    /// In [`PaneLayoutMode::AgentFull`] the editor is dropped and only the active
+    /// agent is placed, which [`SplitLayout`] then gives the whole window: a single
+    /// entry is the single-pane case. The agent is chosen by identity, not by index,
+    /// so this mode cannot point at another pane's rect.
+    pub fn visible_panes(
+        &self,
+        editor: Option<PaneId>,
+        agents: &[PaneId],
+        layout_mode: PaneLayoutMode,
+    ) -> Vec<PaneId> {
+        let active_agent = self.active.filter(|id| agents.contains(id));
+        if layout_mode == PaneLayoutMode::AgentFull {
+            return active_agent.into_iter().collect();
+        }
+        let mut visible = Vec::with_capacity(agents.len() + 1);
+        visible.extend(editor);
+        match self.mode {
+            AgentAreaMode::Split => visible.extend(agents.iter().copied()),
+            AgentAreaMode::Tabs => visible.extend(active_agent),
+        }
+        visible
+    }
+}
+/// Apply an Alt chord to the layout and agent-region state.
+///
+/// Returns the chord that was consumed, or `None` when no chord matched. Any
+/// recognised chord is consumed even when it changes nothing: the return value is the
+/// input layer's skip flag, so reporting a chord as unhandled would forward it to the
+/// PTY and type it into the agent (Alt+J in `EditorFull` used to insert a "j").
+///
+/// Focus stays index-based in `Split` mode. In `Tabs` mode the frame is
+/// editor + one agent, so a slot index would address the wrong rect - there the digit
+/// keys address `AgentArea::order` instead, and `active_pane` is derived from the tab
+/// that ends up active rather than used as an index into the frame.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn handle_layout_shortcuts(
     pressed_keys: &[Key],
     modifiers: Modifiers,
     repeat: bool,
     pane_count: usize,
     layout: &mut PaneLayoutState,
+    agent_area: &mut AgentArea,
     agent_span: AgentRegionSpan,
+    panes: &PaneTargets,
+) -> Option<LayoutChord> {
+    for key in pressed_keys {
+        let Some(chord) = layout_chord(*key, modifiers) else {
+            continue;
+        };
+        apply_layout_chord(
+            chord, repeat, pane_count, layout, agent_area, agent_span, panes,
+        );
+        return Some(chord);
+    }
+    None
+}
+
+/// Whether this chord swaps the visible pane without moving any rect.
+///
+/// Such a switch repaints only the agent region instead of the whole window.
+///
+/// `AgentFull` is the exception that has to be excluded by the caller: Alt+Shift+N
+/// *enters* it from a split, which changes the geometry. `chord_switches_tab` therefore
+/// only answers for a layout mode the chord leaves alone - see
+/// [`chord_keeps_geometry`], which takes the mode from before the chord ran.
+pub(super) fn chord_switches_tab(chord: LayoutChord, mode: AgentAreaMode) -> bool {
+    mode == AgentAreaMode::Tabs
+        && matches!(
+            chord,
+            LayoutChord::FocusAgent(_) | LayoutChord::ActivateTab(_)
+        )
+}
+
+/// Whether this chord only swaps the visible pane, so the frame is unchanged.
+///
+/// `area_mode` and `layout_mode` are the modes from *before* the chord ran, because
+/// the interesting cases are exactly the ones that change them:
+///
+/// - `ActivateTab` (Alt+Shift+N) enters `AgentFull` from a split, so it moves every
+///   rect and needs the full redraw.
+/// - `FocusAgent` in `AgentFull` swaps which agent fills the window: same rect, so it
+///   is regional. Entering `AgentFull` that way is only reachable from `Split` mode,
+///   where `area_mode` is not `Tabs`, and is excluded here.
+pub(super) fn chord_keeps_geometry(
+    chord: LayoutChord,
+    area_mode: AgentAreaMode,
+    layout_mode: PaneLayoutMode,
 ) -> bool {
-    if !modifiers.alt {
-        return false;
-    }
-
-    // Alt+J (without Shift) toggles the split direction (replaces the old Alt+Shift+3).
-    for key in pressed_keys {
-        if !modifiers.shift && *key == Key::J {
-            layout.mode = PaneLayoutMode::Split;
-            layout.split_direction = layout.split_direction.toggled();
-            return true;
+    match layout_mode {
+        // Alt+N inside a maximized agent keeps the single full-window rect.
+        PaneLayoutMode::AgentFull => {
+            matches!(chord, LayoutChord::FocusAgent(_))
         }
+        PaneLayoutMode::Split | PaneLayoutMode::EditorFull => chord_switches_tab(chord, area_mode),
+    }
+}
+
+/// The pane identities the layout layer needs to translate between indices and tabs.
+///
+/// The layout layer deliberately does not know about `PaneStore`; this is the small
+/// window onto it that tab addressing requires.
+#[derive(Debug, Clone, Default)]
+pub(super) struct PaneTargets {
+    /// Every pane id in slot order, so an index is a slot index.
+    pub(super) slots: Vec<PaneId>,
+    /// The editor's slot index, when there is one.
+    pub(super) editor_index: Option<usize>,
+}
+
+impl PaneTargets {
+    fn id_at(&self, index: usize) -> Option<PaneId> {
+        self.slots.get(index).copied()
     }
 
-    for key in pressed_keys {
-        if modifiers.shift {
-            let Some(next_mode) = pane_layout_shortcut(*key) else {
-                continue;
-            };
+    fn slot_of(&self, id: PaneId) -> Option<usize> {
+        self.slots.iter().position(|slot| *slot == id)
+    }
+}
 
-            if let PaneLayoutMode::PaneMaximized(i) = next_mode {
-                if i >= pane_count {
-                    if let Some(digit) = key_to_digit(*key) {
-                        info!(
-                            digit,
-                            pane_count,
-                            "layout shortcut ignored: no pane at this index (spawn the agent first?)"
-                        );
+/// Apply one chord. Every arm is a no-op at worst; the caller treats a matched chord
+/// as consumed, so none of them report failure.
+#[allow(clippy::too_many_arguments)]
+fn apply_layout_chord(
+    chord: LayoutChord,
+    repeat: bool,
+    pane_count: usize,
+    layout: &mut PaneLayoutState,
+    agent_area: &mut AgentArea,
+    agent_span: AgentRegionSpan,
+    panes: &PaneTargets,
+) {
+    match chord {
+        // Consumed either way; there is simply no axis to flip outside split mode.
+        LayoutChord::ToggleSplitDirection => {
+            if layout.mode == PaneLayoutMode::Split {
+                layout.split_direction = layout.split_direction.toggled();
+            }
+        }
+        // Always consumed. Entering tabs keeps the focused agent's tab; leaving tabs
+        // returns to split without touching focus or the agent share.
+        LayoutChord::ToggleAgentAreaMode => match agent_area.mode() {
+            AgentAreaMode::Split => {
+                agent_area.set_mode(AgentAreaMode::Tabs);
+                // Only an agent that the tab set actually accepted may take focus.
+                let focused_agent = panes
+                    .id_at(layout.active_pane)
+                    .filter(|id| agent_area.activate(*id));
+                match focused_agent {
+                    Some(id) => {
+                        // Already focused; make sure the layout agrees it is visible.
+                        if let Some(slot) = panes.slot_of(id) {
+                            layout.active_pane = slot;
+                        }
                     }
-                    continue;
+                    None => {
+                        // The editor had focus. Keep `AgentArea.active` and the keyboard
+                        // focus where they are, but leave `EditorFull` so the active tab
+                        // is on screen. Do not hand focus to an agent the user was not on.
+                        if agent_area.active().is_none() {
+                            if let Some(first) = agent_area.order().first().copied() {
+                                agent_area.activate(first);
+                            }
+                        }
+                        if layout.mode == PaneLayoutMode::EditorFull {
+                            layout.mode = PaneLayoutMode::Split;
+                        }
+                    }
                 }
             }
-
-            layout.mode = next_mode;
-            if let Some(next_active_pane) = focused_pane_for_layout(next_mode) {
-                layout.active_pane = next_active_pane;
-            }
-            return true;
-        }
-
-        if let Some(next_active_pane) = pane_navigation_shortcut(*key) {
-            if next_active_pane < pane_count {
+            AgentAreaMode::Tabs => {
+                agent_area.set_mode(AgentAreaMode::Split);
                 layout.mode = PaneLayoutMode::Split;
-                layout.active_pane = next_active_pane;
-                return true;
             }
-        }
-
-        // Alt+1 focuses the editor. Alt+2..9 focuses that agent pane
-        // (Alt+2 = first agent = index 1). Pressing the focused pane's key
-        // again swaps between an even split and the agent at one third.
-        if let Some(digit) = key_to_digit(*key) {
-            let target = match digit {
-                1 => 0,
-                2..=9 => digit - 1,
-                _ => continue,
+        },
+        // Alt+1: focus the editor. In tabs mode this must not move the active tab,
+        // so it only moves keyboard focus. The refocus cycle below is split-mode
+        // only: in tabs there is no split axis to resize.
+        LayoutChord::FocusEditor => {
+            let Some(editor_index) = panes.editor_index.filter(|index| *index < pane_count) else {
+                return;
             };
-            if target >= pane_count {
-                if (2..=9).contains(&digit) {
-                    info!(
-                        digit,
-                        pane_count,
-                        "focus shortcut ignored: no pane at this index (spawn the agent first?)"
-                    );
-                }
-                continue;
-            }
+            let tabs = agent_area.mode() == AgentAreaMode::Tabs;
             if pane_count >= 2
+                && !tabs
                 && layout.mode == PaneLayoutMode::Split
-                && layout.active_pane == target
+                && layout.active_pane == editor_index
             {
                 if !repeat {
-                    let side = if target == 0 {
-                        RefocusSide::Editor
-                    } else {
-                        RefocusSide::Agent
-                    };
-                    layout.agent_share = layout.agent_share.after_refocus(side, agent_span);
+                    layout.agent_share = layout
+                        .agent_share
+                        .after_refocus(RefocusSide::Editor, agent_span);
                 }
-                return true;
+                return;
             }
+            layout.active_pane = editor_index;
             layout.mode = PaneLayoutMode::Split;
-            layout.active_pane = target;
-            return true;
+        }
+        LayoutChord::FocusAgent(agent_index) => focus_agent(
+            agent_index,
+            repeat,
+            pane_count,
+            layout,
+            agent_area,
+            agent_span,
+            panes,
+        ),
+        LayoutChord::EditorFull => {
+            if panes.editor_index.is_some() {
+                layout.focus_maximized_editor();
+            }
+        }
+        LayoutChord::ActivateTab(agent_index) => {
+            let Some(id) = agent_area.order().get(agent_index).copied() else {
+                info!(
+                    agent_index,
+                    tabs = agent_area.order().len(),
+                    "tab shortcut ignored: no tab at this index (spawn the agent first?)"
+                );
+                return;
+            };
+            agent_area.set_mode(AgentAreaMode::Tabs);
+            agent_area.activate(id);
+            sync_active_pane_from_tabs(layout, agent_area, panes);
+            // Agent fullscreen: this tab's pane is the only one on screen. The mode
+            // carries no index, so it always resolves through `AgentArea::active`.
+            layout.mode = PaneLayoutMode::AgentFull;
         }
     }
-
-    false
 }
 
-fn key_to_digit(key: Key) -> Option<usize> {
-    match key {
-        Key::Key1 => Some(1),
-        Key::Key2 => Some(2),
-        Key::Key3 => Some(3),
-        Key::Key4 => Some(4),
-        Key::Key5 => Some(5),
-        Key::Key6 => Some(6),
-        Key::Key7 => Some(7),
-        Key::Key8 => Some(8),
-        Key::Key9 => Some(9),
-        _ => None,
+/// Alt+2..9: focus the Nth agent.
+///
+/// In split mode this is the slot index (unchanged behaviour, including the
+/// toggle-on-refocus agent-share cycle). In tabs mode it is `AgentArea::order[n]`,
+/// because the frame holds only the active agent.
+fn focus_agent(
+    agent_index: usize,
+    repeat: bool,
+    pane_count: usize,
+    layout: &mut PaneLayoutState,
+    agent_area: &mut AgentArea,
+    agent_span: AgentRegionSpan,
+    panes: &PaneTargets,
+) {
+    if agent_area.mode() == AgentAreaMode::Tabs {
+        let Some(id) = agent_area.order().get(agent_index).copied() else {
+            info!(
+                agent_index,
+                tabs = agent_area.order().len(),
+                "focus shortcut ignored: no tab at this index (spawn the agent first?)"
+            );
+            return;
+        };
+        agent_area.activate(id);
+        // Alt+N inside a maximized agent switches which agent is maximized.
+        let stay_fullscreen = layout.mode == PaneLayoutMode::AgentFull;
+        sync_active_pane_from_tabs(layout, agent_area, panes);
+        if stay_fullscreen {
+            layout.mode = PaneLayoutMode::AgentFull;
+        }
+        return;
+    }
+
+    // Split mode keeps the original index-based behaviour. Agent N is slot N (the
+    // editor is slot 0), which only holds while the editor is first; when it does not,
+    // the index would address the wrong pane, so this is a consumed no-op.
+    if panes.editor_index != Some(0) {
+        return;
+    }
+    let target = agent_index + 1;
+    if target >= pane_count {
+        info!(
+            digit = agent_index + 2,
+            pane_count, "focus shortcut ignored: no pane at this index (spawn the agent first?)"
+        );
+        return;
+    }
+    if pane_count >= 2 && layout.mode == PaneLayoutMode::Split && layout.active_pane == target {
+        if !repeat {
+            layout.agent_share = layout
+                .agent_share
+                .after_refocus(RefocusSide::Agent, agent_span);
+        }
+        return;
+    }
+    layout.mode = PaneLayoutMode::Split;
+    layout.active_pane = target;
+}
+
+/// Point `active_pane` at the slot holding the active tab.
+///
+/// `active_pane` is a slot index, so this is the one place the tab identity becomes
+/// the focus index. Callers must never use a tab position as an index into the frame,
+/// which holds only the editor and the active agent.
+fn sync_active_pane_from_tabs(
+    layout: &mut PaneLayoutState,
+    agent_area: &AgentArea,
+    panes: &PaneTargets,
+) {
+    let Some(active) = agent_area.active() else {
+        return;
+    };
+    if let Some(index) = panes.slots.iter().position(|id| *id == active) {
+        layout.active_pane = index;
+        layout.mode = PaneLayoutMode::Split;
     }
 }
 
-fn focused_pane_for_layout(mode: PaneLayoutMode) -> Option<usize> {
+/// The layout mode to keep once the tab model has been reconciled.
+///
+/// `AgentFull` shows only [`AgentArea::active`], so with no agent left there is
+/// nothing to fill the window and every pane would be unplaced. Falling back to
+/// `Split` puts the editor back on screen instead of leaving a blank frame.
+pub(super) fn layout_mode_after_sync(
+    mode: PaneLayoutMode,
+    has_active_agent: bool,
+) -> PaneLayoutMode {
     match mode {
-        PaneLayoutMode::PaneMaximized(i) => Some(i),
-        PaneLayoutMode::Split => None,
+        PaneLayoutMode::AgentFull if !has_active_agent => PaneLayoutMode::Split,
+        other => other,
     }
 }
 
-/// Keep `active_pane` and `PaneMaximized` indices valid after removing a pane.
+/// Keep `active_pane` valid after removing a pane.
+///
+/// `PaneLayoutMode` no longer holds an index, so only the focus index needs shifting.
+/// `EditorFull` always points at the editor, which is slot 0, and that slot only
+/// disappears if the editor itself is removed.
 pub(super) fn adjust_pane_indices_after_removal(
     layout: &mut PaneLayoutState,
     removed_index: usize,
@@ -462,12 +934,8 @@ pub(super) fn adjust_pane_indices_after_removal(
         .active_pane
         .min(remaining_pane_count.saturating_sub(1));
 
-    if let PaneLayoutMode::PaneMaximized(i) = layout.mode {
-        if i == removed_index {
-            layout.mode = PaneLayoutMode::Split;
-        } else if i > removed_index {
-            layout.mode = PaneLayoutMode::PaneMaximized(i - 1);
-        }
+    if remaining_pane_count == 0 {
+        layout.mode = PaneLayoutMode::Split;
     }
 }
 
@@ -481,9 +949,10 @@ pub struct FocusNvimAfterReference {
 /// agent pane. When the agent was fullscreen, switch to fullscreen Neovim; otherwise keep
 /// the split layout and only change the active pane.
 pub fn focus_nvim_after_agent_reference(layout: &mut PaneLayoutState) -> FocusNvimAfterReference {
-    // Any maximized agent pane counts as "agent maximized" for this transition.
-    let was_agent_max = matches!(layout.mode, PaneLayoutMode::PaneMaximized(i) if i != 0);
-    let relayout_needed = was_agent_max;
+    // Agent fullscreen has to give up the window for Neovim, so this is a real relayout
+    // again - the same transition the old `PaneMaximized(1)` performed. In the other
+    // modes only focus moves.
+    let relayout_needed = layout.mode == PaneLayoutMode::AgentFull;
     let focus_changed = layout.active_pane != 0;
     if relayout_needed {
         layout.focus_maximized_editor();
@@ -496,25 +965,65 @@ pub fn focus_nvim_after_agent_reference(layout: &mut PaneLayoutState) -> FocusNv
     }
 }
 
-pub(super) fn pane_navigation_shortcut(key: Key) -> Option<usize> {
-    match key {
-        Key::Left => Some(0),
-        Key::Right => Some(1),
-        _ => None,
-    }
+/// What an Alt chord asks the layout layer to do.
+///
+/// This is the single list of chords the app owns. [`layout_chord`] is the only place
+/// that maps a key plus modifiers onto one of them, and both the shortcut handler and
+/// the PTY input filter consult it - so a chord can never be handled in one place and
+/// forwarded to the terminal in the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LayoutChord {
+    /// Alt+J: flip the split axis. Only meaningful while the layout mode is `Split`.
+    ToggleSplitDirection,
+    /// Alt+T: switch the agent region between `Split` and `Tabs`.
+    ToggleAgentAreaMode,
+    /// Alt+1: focus the editor. Never changes the active tab.
+    FocusEditor,
+    /// Alt+2..9: the Nth agent. Zero-based, so Alt+2 is agent 0.
+    FocusAgent(usize),
+    /// Alt+Shift+1: the editor fullscreen.
+    EditorFull,
+    /// Alt+Shift+2..9: enter tabs mode with the Nth agent's tab active.
+    ActivateTab(usize),
 }
 
-pub(super) fn pane_layout_shortcut(key: Key) -> Option<PaneLayoutMode> {
+/// The chord `key` with `modifiers` maps to, or `None`.
+///
+/// Shift variants are matched before plain ones so `Alt+Shift+N` cannot fall through
+/// to the `Alt+N` focus case. Arrow keys are deliberately not chords: Alt+Left/Right
+/// (and the Shift variants) belong to the editor and the agent TUIs.
+pub(super) fn layout_chord(key: Key, modifiers: Modifiers) -> Option<LayoutChord> {
+    if !modifiers.alt {
+        return None;
+    }
+
+    if modifiers.shift {
+        return match key {
+            Key::Key1 => Some(LayoutChord::EditorFull),
+            Key::Key2 => Some(LayoutChord::ActivateTab(0)),
+            Key::Key3 => Some(LayoutChord::ActivateTab(1)),
+            Key::Key4 => Some(LayoutChord::ActivateTab(2)),
+            Key::Key5 => Some(LayoutChord::ActivateTab(3)),
+            Key::Key6 => Some(LayoutChord::ActivateTab(4)),
+            Key::Key7 => Some(LayoutChord::ActivateTab(5)),
+            Key::Key8 => Some(LayoutChord::ActivateTab(6)),
+            Key::Key9 => Some(LayoutChord::ActivateTab(7)),
+            _ => None,
+        };
+    }
+
     match key {
-        Key::Key1 => Some(PaneLayoutMode::PaneMaximized(0)),
-        Key::Key2 => Some(PaneLayoutMode::PaneMaximized(1)),
-        Key::Key3 => Some(PaneLayoutMode::PaneMaximized(2)),
-        Key::Key4 => Some(PaneLayoutMode::PaneMaximized(3)),
-        Key::Key5 => Some(PaneLayoutMode::PaneMaximized(4)),
-        Key::Key6 => Some(PaneLayoutMode::PaneMaximized(5)),
-        Key::Key7 => Some(PaneLayoutMode::PaneMaximized(6)),
-        Key::Key8 => Some(PaneLayoutMode::PaneMaximized(7)),
-        Key::Key9 => Some(PaneLayoutMode::PaneMaximized(8)),
+        Key::J => Some(LayoutChord::ToggleSplitDirection),
+        Key::T => Some(LayoutChord::ToggleAgentAreaMode),
+        Key::Key1 => Some(LayoutChord::FocusEditor),
+        Key::Key2 => Some(LayoutChord::FocusAgent(0)),
+        Key::Key3 => Some(LayoutChord::FocusAgent(1)),
+        Key::Key4 => Some(LayoutChord::FocusAgent(2)),
+        Key::Key5 => Some(LayoutChord::FocusAgent(3)),
+        Key::Key6 => Some(LayoutChord::FocusAgent(4)),
+        Key::Key7 => Some(LayoutChord::FocusAgent(5)),
+        Key::Key8 => Some(LayoutChord::FocusAgent(6)),
+        Key::Key9 => Some(LayoutChord::FocusAgent(7)),
         _ => None,
     }
 }
@@ -716,14 +1225,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reference_navigation_from_agent_fullscreen_maximizes_nvim() {
-        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
+    fn reference_navigation_from_editor_full_keeps_editor_full_and_focuses_nvim() {
+        let mut layout = test_layout(PaneLayoutMode::EditorFull, 1, AgentPaneShare::Auto);
 
         let focus = focus_nvim_after_agent_reference(&mut layout);
 
-        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(0));
+        assert_eq!(layout.mode, PaneLayoutMode::EditorFull);
         assert_eq!(layout.active_pane, 0);
-        assert!(focus.relayout_needed);
+        assert!(
+            !focus.relayout_needed,
+            "the layout mode did not have to change"
+        );
         assert!(focus.focus_changed);
     }
 
@@ -806,17 +1318,19 @@ mod tests {
     }
 
     #[test]
-    fn adjust_pane_indices_after_removal_decrements_maximized_index() {
-        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(2), 2, AgentPaneShare::Auto);
+    fn adjust_pane_indices_after_removal_keeps_editor_full_and_shifts_focus() {
+        // The mode no longer carries an index, so removing an earlier pane only
+        // shifts the focus index - EditorFull still means "the editor".
+        let mut layout = test_layout(PaneLayoutMode::EditorFull, 2, AgentPaneShare::Auto);
         adjust_pane_indices_after_removal(&mut layout, 0, 2);
-        assert_eq!(layout.mode, PaneLayoutMode::PaneMaximized(1));
+        assert_eq!(layout.mode, PaneLayoutMode::EditorFull);
         assert_eq!(layout.active_pane, 1);
     }
 
     #[test]
-    fn adjust_pane_indices_after_removal_resets_split_when_maximized_pane_removed() {
-        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
-        adjust_pane_indices_after_removal(&mut layout, 1, 1);
+    fn adjust_pane_indices_after_removal_resets_mode_when_every_pane_is_gone() {
+        let mut layout = test_layout(PaneLayoutMode::EditorFull, 0, AgentPaneShare::Auto);
+        adjust_pane_indices_after_removal(&mut layout, 0, 0);
         assert_eq!(layout.mode, PaneLayoutMode::Split);
         assert_eq!(layout.active_pane, 0);
     }
@@ -923,13 +1437,64 @@ mod tests {
         }
     }
 
+    /// Slot order for the three-pane fixtures below: editor, agent, agent.
+    const TEST_SLOTS: [PaneId; 3] = [PaneId(1), PaneId(2), PaneId(3)];
+
+    fn test_targets() -> PaneTargets {
+        PaneTargets {
+            slots: TEST_SLOTS.to_vec(),
+            editor_index: Some(0),
+        }
+    }
+
+    /// A `Split`-mode agent area matching `TEST_SLOTS`, so the split-mode focus tests
+    /// exercise the unchanged index-based path.
+    fn test_split_area() -> AgentArea {
+        let mut area = AgentArea::new();
+        area.sync(&TEST_SLOTS[1..], Some(PaneId(1)));
+        area
+    }
+
     fn press_agent_focus(
         key: Key,
         repeat: bool,
         layout: &mut PaneLayoutState,
         agent_span: AgentRegionSpan,
     ) -> bool {
-        handle_layout_shortcuts(&[key], alt_held(), repeat, 3, layout, agent_span)
+        press_shortcut_with(
+            key,
+            alt_held(),
+            repeat,
+            3,
+            layout,
+            &mut test_split_area(),
+            agent_span,
+            &test_targets(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn press_shortcut_with(
+        key: Key,
+        modifiers: Modifiers,
+        repeat: bool,
+        pane_count: usize,
+        layout: &mut PaneLayoutState,
+        area: &mut AgentArea,
+        agent_span: AgentRegionSpan,
+        panes: &PaneTargets,
+    ) -> bool {
+        handle_layout_shortcuts(
+            &[key],
+            modifiers,
+            repeat,
+            pane_count,
+            layout,
+            area,
+            agent_span,
+            panes,
+        )
+        .is_some()
     }
 
     #[test]
@@ -978,8 +1543,8 @@ mod tests {
     }
 
     #[test]
-    fn refocus_while_maximized_restores_split_without_resizing() {
-        let mut layout = test_layout(PaneLayoutMode::PaneMaximized(1), 1, AgentPaneShare::Auto);
+    fn refocus_while_editor_full_restores_split_without_resizing() {
+        let mut layout = test_layout(PaneLayoutMode::EditorFull, 1, AgentPaneShare::Auto);
 
         assert!(press_agent_focus(
             Key::Key2,
@@ -1009,17 +1574,23 @@ mod tests {
     }
 
     #[test]
-    fn arrow_focus_does_not_change_agent_share() {
+    fn alt_arrows_are_ignored_and_do_not_change_agent_share() {
         let mut layout = test_layout(PaneLayoutMode::Split, 1, AgentPaneShare::Half);
 
-        assert!(handle_layout_shortcuts(
-            &[Key::Right],
-            alt_held(),
-            false,
-            2,
-            &mut layout,
-            AgentRegionSpan::unknown(),
-        ));
+        assert!(
+            handle_layout_shortcuts(
+                &[Key::Right],
+                alt_held(),
+                false,
+                2,
+                &mut layout,
+                &mut test_split_area(),
+                AgentRegionSpan::unknown(),
+                &test_targets(),
+            )
+            .is_none(),
+            "Alt+Right belongs to the focused program, not the layout"
+        );
         assert_eq!(layout.active_pane, 1);
         assert_eq!(layout.agent_share, AgentPaneShare::Half);
     }
@@ -1070,5 +1641,392 @@ mod tests {
             }
         ));
         assert_eq!(layout.agent_share, AgentPaneShare::Third);
+    }
+
+    // --- AgentArea (tabs model) -------------------------------------------
+
+    const EDITOR: PaneId = PaneId(1);
+    const A1: PaneId = PaneId(2);
+    const A2: PaneId = PaneId(3);
+    const A3: PaneId = PaneId(4);
+
+    /// The three invariants every mutator must preserve, checked as one unit.
+    fn assert_invariants(area: &AgentArea, agents: &[PaneId]) {
+        // 1. order is a permutation of the live agent ids.
+        assert_eq!(
+            area.order().len(),
+            agents.len(),
+            "order must have one tab per live agent, got {:?} for {agents:?}",
+            area.order()
+        );
+        for id in area.order() {
+            assert!(
+                agents.contains(id),
+                "{id:?} is in order but is not a live agent"
+            );
+            assert_eq!(
+                area.order().iter().filter(|tab| *tab == id).count(),
+                1,
+                "{id:?} must appear in order exactly once"
+            );
+        }
+        for id in agents {
+            assert!(
+                area.order().contains(id),
+                "live agent {id:?} is missing from order"
+            );
+        }
+
+        // 2. active is in order or None.
+        if let Some(active) = area.active() {
+            assert!(
+                area.order().contains(&active),
+                "active {active:?} must be a member of order"
+            );
+        }
+
+        // 3. the editor is never a tab.
+        assert!(
+            !area.order().contains(&EDITOR),
+            "editor must never appear in the tab order"
+        );
+    }
+
+    #[test]
+    fn agent_area_defaults_to_split_with_every_agent_visible() {
+        let mut area = AgentArea::new();
+        assert_eq!(area.mode(), AgentAreaMode::Split);
+        assert_eq!(area.order(), &[]);
+        assert_eq!(area.active(), None);
+
+        let agents = [A1, A2];
+        area.sync(&agents, Some(EDITOR));
+        assert_invariants(&area, &agents);
+
+        // Split mode keeps the pre-tabs geometry: editor plus every agent.
+        assert_eq!(
+            area.visible_panes(Some(EDITOR), &agents, PaneLayoutMode::Split),
+            vec![EDITOR, A1, A2],
+            "Split must place every agent, as before tabs existed"
+        );
+    }
+
+    #[test]
+    fn agent_area_order_is_a_permutation_after_spawn() {
+        let mut area = AgentArea::new();
+
+        // Spawn one agent at a time; each spawn appends and keeps the rest.
+        area.sync(&[A1], Some(EDITOR));
+        assert_eq!(area.order(), &[A1]);
+        assert_invariants(&area, &[A1]);
+
+        area.sync(&[A1, A2], Some(EDITOR));
+        assert_eq!(area.order(), &[A1, A2]);
+        assert_invariants(&area, &[A1, A2]);
+
+        area.sync(&[A1, A2, A3], Some(EDITOR));
+        assert_eq!(area.order(), &[A1, A2, A3]);
+        assert_invariants(&area, &[A1, A2, A3]);
+    }
+
+    #[test]
+    fn agent_area_order_is_a_permutation_after_terminate() {
+        let mut area = AgentArea::new();
+        area.sync(&[A1, A2, A3], Some(EDITOR));
+        area.activate(A2);
+
+        // Terminating a middle tab drops only that tab, keeping relative order.
+        area.sync(&[A1, A3], Some(EDITOR));
+        assert_eq!(area.order(), &[A1, A3]);
+        assert_invariants(&area, &[A1, A3]);
+        assert_eq!(
+            area.active(),
+            Some(A3),
+            "the tab that slides into the active slot takes over"
+        );
+
+        // Terminating the last remaining agent leaves an empty, active-less area.
+        area.sync(&[], Some(EDITOR));
+        assert_eq!(area.order(), &[]);
+        assert_eq!(area.active(), None);
+        assert_invariants(&area, &[]);
+    }
+
+    #[test]
+    fn agent_area_order_is_a_permutation_after_reorder() {
+        let mut area = AgentArea::new();
+        let agents = [A1, A2, A3];
+        area.sync(&agents, Some(EDITOR));
+
+        assert!(area.move_tab(A3, 0));
+        assert_eq!(area.order(), &[A3, A1, A2]);
+        assert_invariants(&area, &agents);
+
+        assert!(area.move_tab(A1, 2));
+        assert_eq!(area.order(), &[A3, A2, A1]);
+        assert_invariants(&area, &agents);
+
+        // An out-of-range index clamps instead of panicking or losing a tab.
+        assert!(area.move_tab(A3, 99));
+        assert_eq!(area.order(), &[A2, A1, A3]);
+        assert_invariants(&area, &agents);
+
+        // Moving an unknown id is a no-op that reports failure.
+        assert!(!area.move_tab(PaneId(99), 0));
+        assert_eq!(area.order(), &[A2, A1, A3]);
+        assert_invariants(&area, &agents);
+    }
+
+    #[test]
+    fn agent_area_activating_a_removed_pane_is_a_no_op() {
+        let mut area = AgentArea::new();
+        area.sync(&[A1, A2], Some(EDITOR));
+        area.activate(A2);
+
+        // A2 is terminated; activating it again must not resurrect it or clear
+        // the real active tab.
+        area.sync(&[A1], Some(EDITOR));
+        assert_eq!(area.active(), Some(A1));
+
+        assert!(!area.activate(A2), "activating a removed tab must fail");
+        assert_eq!(area.active(), Some(A1));
+        assert_eq!(area.order(), &[A1]);
+        assert_invariants(&area, &[A1]);
+
+        // Activating a tab that never existed behaves the same way.
+        assert!(!area.activate(PaneId(77)));
+        assert_eq!(area.active(), Some(A1));
+    }
+
+    #[test]
+    fn agent_area_never_accepts_the_editor_as_a_tab() {
+        let mut area = AgentArea::new();
+        area.sync(&[A1, EDITOR], Some(EDITOR));
+
+        assert_eq!(
+            area.order(),
+            &[A1],
+            "sync must filter the editor out of the agents list"
+        );
+        assert!(!area.ensure_contains(EDITOR, Some(EDITOR)));
+        assert_eq!(area.order(), &[A1]);
+        assert_invariants(&area, &[A1]);
+    }
+
+    #[test]
+    fn agent_area_remove_clears_active_when_nothing_remains() {
+        let mut area = AgentArea::new();
+        area.sync(&[A1], Some(EDITOR));
+        assert_eq!(area.active(), Some(A1));
+
+        assert!(area.remove(A1));
+        assert_eq!(area.order(), &[]);
+        assert_eq!(area.active(), None);
+        assert!(!area.remove(A1), "removing an absent tab reports failure");
+    }
+
+    #[test]
+    fn agent_area_tabs_mode_hides_inactive_panes_from_geometry() {
+        let frame = |visible: &[PaneId]| -> FrameLayout {
+            let split = SplitLayout::for_window(
+                200,
+                100,
+                visible.len(),
+                PaneLayoutMode::Split,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            );
+            FrameLayout::from_split(visible, split)
+        };
+
+        let mut area = AgentArea::new();
+        let agents = [A1, A2];
+        area.sync(&agents, Some(EDITOR));
+        area.set_mode(AgentAreaMode::Tabs);
+        area.activate(A1);
+
+        // Only the editor and the active tab are placed.
+        let visible = area.visible_panes(Some(EDITOR), &agents, PaneLayoutMode::Split);
+        assert_eq!(visible, vec![EDITOR, A1]);
+
+        // The hidden tab has no placement at all, so resize never reaches it.
+        let tabbed = frame(&visible);
+        assert!(
+            !tabbed.placed().iter().any(|placed| placed.id == A2),
+            "a tabbed-out pane must not appear in the frame"
+        );
+        assert_eq!(tabbed.placed().len(), 2);
+
+        // Revealing the other tab gives it a real rect.
+        area.activate(A2);
+        let revealed = frame(&area.visible_panes(Some(EDITOR), &agents, PaneLayoutMode::Split));
+        let rect = revealed
+            .placed()
+            .iter()
+            .find(|placed| placed.id == A2)
+            .expect("revealed tab must be placed")
+            .rect;
+        assert!(
+            rect.width > 0 && rect.height > 0,
+            "revealed tab must get a non-zero rect, got {rect:?}"
+        );
+
+        // And in Split mode both agents are placed again.
+        area.set_mode(AgentAreaMode::Split);
+        assert_eq!(
+            frame(&area.visible_panes(Some(EDITOR), &agents, PaneLayoutMode::Split))
+                .placed()
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn switching_tabs_rebuilds_the_frame_so_the_strip_survives() {
+        // The full click path: activate a different tab, rebuild the frame from
+        // `visible_panes`, and check the strip is still resolvable afterwards.
+        let frame_for = |area: &AgentArea, agents: &[PaneId]| -> FrameLayout {
+            let visible = area.visible_panes(Some(EDITOR), agents, PaneLayoutMode::Split);
+            FrameLayout::from_split(
+                &visible,
+                SplitLayout::for_window(
+                    200,
+                    100,
+                    visible.len(),
+                    PaneLayoutMode::Split,
+                    PaneSplitDirection::Vertical,
+                    SplitLayoutOptions::unbounded(),
+                ),
+            )
+        };
+
+        let mut area = AgentArea::new();
+        let agents = [A1, A2];
+        area.sync(&agents, Some(EDITOR));
+        area.set_mode(AgentAreaMode::Tabs);
+        area.activate(A1);
+
+        let before = frame_for(&area, &agents);
+        assert!(before.strip_rect_for(A1, 10).is_some(), "strip under A1");
+
+        // Click the other tab.
+        assert!(area.activate(A2));
+        let after = frame_for(&area, &agents);
+
+        // The new tab is placed and hosts the strip...
+        assert!(
+            after.strip_rect_for(A2, 10).is_some(),
+            "the newly active tab must be placed and keep the strip"
+        );
+        // ...the old tab is gone from the frame...
+        assert!(
+            !after.placed().iter().any(|placed| placed.id == A1),
+            "the previous tab must leave the frame"
+        );
+        // ...and the editor is untouched.
+        let editor_before = before
+            .placed()
+            .iter()
+            .find(|placed| placed.id == EDITOR)
+            .expect("editor placed")
+            .rect;
+        let editor_after = after
+            .placed()
+            .iter()
+            .find(|placed| placed.id == EDITOR)
+            .expect("editor placed")
+            .rect;
+        assert_eq!(
+            editor_before, editor_after,
+            "a tab switch must not move or resize the editor"
+        );
+    }
+
+    #[test]
+    fn strip_rect_sits_above_the_pane_in_both_split_directions() {
+        for direction in [PaneSplitDirection::Vertical, PaneSplitDirection::Horizontal] {
+            let frame = FrameLayout::from_split(
+                &[EDITOR, A1],
+                SplitLayout::for_window(
+                    200,
+                    100,
+                    2,
+                    PaneLayoutMode::Split,
+                    direction,
+                    SplitLayoutOptions::unbounded(),
+                ),
+            );
+            let pane_rect = frame
+                .placed()
+                .iter()
+                .find(|placed| placed.id == A1)
+                .expect("agent placed")
+                .rect;
+
+            let (strip, below) = frame
+                .strip_rect_for(A1, 10)
+                .expect("strip fits in the agent region");
+
+            assert_eq!(strip.y, pane_rect.y, "{direction:?}: strip at pane top");
+            assert_eq!(strip.x, pane_rect.x, "{direction:?}: strip aligned");
+            assert_eq!(
+                strip.width, pane_rect.width,
+                "{direction:?}: strip spans pane"
+            );
+            assert_eq!(strip.height, 10, "{direction:?}: one row tall");
+            assert_eq!(
+                below.y,
+                pane_rect.y + 10,
+                "{direction:?}: pane starts below the strip"
+            );
+            assert_eq!(
+                below.height,
+                pane_rect.height - 10,
+                "{direction:?}: pane gives up exactly the strip row"
+            );
+        }
+    }
+
+    #[test]
+    fn strip_rect_is_absent_when_the_pane_has_no_area() {
+        // EditorFull: only the editor has geometry, so an agent has no rect and no
+        // strip can be carved from it.
+        let frame = FrameLayout::from_split(
+            &[EDITOR, A1],
+            SplitLayout::for_window(
+                200,
+                100,
+                2,
+                PaneLayoutMode::EditorFull,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            ),
+        );
+
+        assert!(
+            frame.strip_rect_for(A1, 10).is_none(),
+            "a pane with no area must not host a strip"
+        );
+    }
+
+    #[test]
+    fn strip_never_exceeds_the_pane_it_rides_on() {
+        let frame = FrameLayout::from_split(
+            &[EDITOR, A1],
+            SplitLayout::for_window(
+                200,
+                100,
+                2,
+                PaneLayoutMode::Split,
+                PaneSplitDirection::Vertical,
+                SplitLayoutOptions::unbounded(),
+            ),
+        );
+        let (strip, below) = frame
+            .strip_rect_for(A1, 10_000)
+            .expect("strip clamps rather than overflow");
+
+        assert_eq!(strip.height, below.y - strip.y);
+        assert_eq!(below.height, 0, "an oversized strip consumes the pane");
     }
 }

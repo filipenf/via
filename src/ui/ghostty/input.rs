@@ -3,7 +3,7 @@ use arboard::Clipboard;
 use tracing::warn;
 use winit::keyboard::KeyCode;
 
-use super::layout::{pane_layout_shortcut, pane_navigation_shortcut};
+use super::layout::layout_chord;
 use super::pane::TerminalPane;
 
 const BRACKETED_PASTE_START: &[u8] = b"\x1b[200~";
@@ -194,12 +194,31 @@ pub(super) fn forward_special_keys(
     pane: &mut TerminalPane,
     skip_layout_shortcut: bool,
 ) -> Result<bool> {
+    let payload = special_keys_payload(pressed_keys, modifiers, skip_layout_shortcut);
+    if payload.is_empty() {
+        return Ok(false);
+    }
+
+    pane.write_all(&payload)?;
+    Ok(true)
+}
+
+/// The bytes `forward_special_keys` would send, without touching a pane.
+///
+/// Split out so the layout-chord filter can be asserted on the real path: a chord
+/// that the shortcut handler consumes must produce no payload at all. Without this
+/// the only observable effect was a write into an optional PTY.
+pub(super) fn special_keys_payload(
+    pressed_keys: &[Key],
+    modifiers: Modifiers,
+    skip_layout_shortcut: bool,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(16);
 
     for key in pressed_keys.iter().copied() {
-        if skip_layout_shortcut
-            && (pane_layout_shortcut(key).is_some() || pane_navigation_shortcut(key).is_some())
-        {
+        // The same predicate the shortcut handler acts on, so a chord can never be
+        // consumed there and forwarded to the PTY here.
+        if skip_layout_shortcut && layout_chord(key, modifiers).is_some() {
             continue;
         }
 
@@ -238,12 +257,7 @@ pub(super) fn forward_special_keys(
         }
     }
 
-    if payload.is_empty() {
-        return Ok(false);
-    }
-
-    pane.write_all(&payload)?;
-    Ok(true)
+    payload
 }
 
 fn ctrl_sequence(key: Key) -> Option<[u8; 1]> {
@@ -384,5 +398,91 @@ mod tests {
         };
         assert!(copy_requested(Key::C, modifiers));
         assert!(!paste_requested(Key::V, Modifiers::default()));
+    }
+
+    fn alt() -> Modifiers {
+        Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        }
+    }
+
+    fn alt_shift() -> Modifiers {
+        Modifiers {
+            alt: true,
+            shift: true,
+            ..Modifiers::default()
+        }
+    }
+
+    #[test]
+    fn new_layout_chords_never_reach_the_pty_on_the_real_path() {
+        // Drives the actual filter used by the input path, not just the shared
+        // predicate. Every chord the shortcut handler consumes must produce no bytes,
+        // or it would be acted on and typed into the agent at the same time.
+        //
+        // The digits are looped rather than listed: Alt+5..8 and Alt+Shift+3..8 are
+        // their own match arms, and listing a subset silently skipped them.
+        let mut checked = 0;
+        for key in [
+            Key::Key1,
+            Key::Key2,
+            Key::Key3,
+            Key::Key4,
+            Key::Key5,
+            Key::Key6,
+            Key::Key7,
+            Key::Key8,
+            Key::Key9,
+        ] {
+            for modifiers in [alt(), alt_shift()] {
+                assert!(layout_chord(key, modifiers).is_some(), "premise: a chord");
+                let payload = special_keys_payload(&[key], modifiers, true);
+                assert!(
+                    payload.is_empty(),
+                    "{key:?} with {modifiers:?} leaked {payload:?} to the PTY"
+                );
+                checked += 1;
+            }
+        }
+        for (key, modifiers) in [(Key::J, alt()), (Key::T, alt())] {
+            let payload = special_keys_payload(&[key], modifiers, true);
+            assert!(
+                payload.is_empty(),
+                "{key:?} with {modifiers:?} leaked {payload:?} to the PTY"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            checked, 20,
+            "9 digits x 2 modifier states plus Alt+J and Alt+T"
+        );
+    }
+
+    #[test]
+    fn alt_arrows_always_reach_the_pty() {
+        // Alt+Left/Right and the Shift variants are not layout chords, so even with the
+        // skip flag set they are forwarded to the agent.
+        for modifiers in [alt(), alt_shift()] {
+            assert!(!special_keys_payload(&[Key::Left], modifiers, true).is_empty());
+            assert!(!special_keys_payload(&[Key::Right], modifiers, true).is_empty());
+        }
+    }
+
+    #[test]
+    fn skip_flag_does_not_swallow_ordinary_typing() {
+        // A key that is not a layout chord must survive the filter, so the agent keeps
+        // receiving normal input while shortcuts are live.
+        assert_eq!(
+            special_keys_payload(&[Key::Tab], Modifiers::default(), true),
+            b"\t".to_vec()
+        );
+        // Alt+Down has an escape sequence and is not a chord, so the filter must let it
+        // through.
+        assert_eq!(
+            special_keys_payload(&[Key::Down], alt(), true),
+            b"\x1b[B".to_vec(),
+            "Alt+Down is not a layout chord and must reach the agent"
+        );
     }
 }

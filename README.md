@@ -176,8 +176,10 @@ via agent spawn --id coder --model gpt-5.3-codex-high
 
 - `Alt+1` focuses the editor. Pressing it again while the editor is already focused switches the editor between 50% and 2/3 of the split (the agent is then 50% or 1/3): width in a vertical split, height in a horizontal split.
 - `Alt+2..9` focuses the corresponding agent pane (Alt+2 is the first agent). Pressing that shortcut again while the same agent is already focused switches the agent pane between 50% and 33% of the split, on the same axis.
-- `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2 for the first agent, etc.).
-- `Alt+J` toggles the split direction.
+- `Alt+Shift+1..9` maximizes that pane (Alt+Shift+1 for the editor, Alt+Shift+2 for the first agent, etc.). For agents the number follows tab order and switches the agent region to tabs, which stay on after `Alt+1`.
+- `Alt+T` toggles the agent region between split (all agents side by side) and tabs (one agent at a time, with a tab strip when there is more than one). In tabs, `Alt+2..9` activates the Nth tab in tab order and clicking a tab in the strip activates it. `Alt+1` and `Alt+T` leave an agent maximized with `Alt+Shift+2..9`.
+- `Alt+J` toggles the split direction (split mode only).
+- Alt+Left/Right and Alt+Shift+Left/Right are not layout shortcuts; they go to the focused editor or agent.
 
 **Lua API for plugins**
 

@@ -19,7 +19,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyEventKind};
 
-use crate::agent_bus::{VIA_AGENT_ID_ENV, VIA_AGENT_ROLE_ENV};
+use crate::agent_bus::VIA_AGENT_ID_ENV;
 
 use app::{App, InputEvent};
 pub use host::{
@@ -36,7 +36,7 @@ pub const VIA_ACP_UI_SOCKET_ENV: &str = "VIA_ACP_UI_SOCKET";
 pub struct Args {
     /// Agent id (defaults to `$VIA_AGENT_ID`, then `agent`).
     pub agent_id: Option<String>,
-    /// Role label for the header (defaults to `$VIA_AGENT_ROLE`, then agent id).
+    /// Accepted for compatibility with older launchers; the header no longer shows it.
     pub role: Option<String>,
     /// Seed a short demo transcript and accept keyboard-only use (no host required).
     pub demo: bool,
@@ -55,11 +55,6 @@ pub fn run(args: Args) -> Result<()> {
         .or_else(|| std::env::var(VIA_AGENT_ID_ENV).ok())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "agent".to_string());
-    let role = args
-        .role
-        .or_else(|| std::env::var(VIA_AGENT_ROLE_ENV).ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| agent_id.clone());
     let socket_path = args
         .socket
         .or_else(|| std::env::var_os(VIA_ACP_UI_SOCKET_ENV).map(PathBuf::from));
@@ -87,7 +82,7 @@ pub fn run(args: Args) -> Result<()> {
         ipc_connected = true;
     }
 
-    let mut app = App::new(agent_id.clone(), role, !args.no_input, args.light);
+    let mut app = App::new(agent_id.clone(), !args.no_input, args.light);
     if args.demo {
         app.seed_demo();
     } else if !ipc_connected {
@@ -371,7 +366,7 @@ mod tests {
             clears: 0,
         })
         .unwrap();
-        let mut app = App::new("coder".into(), "coder".into(), true, false);
+        let mut app = App::new("coder".into(), true, false);
         let mut outbound = DiscardOutbound;
 
         // What crossterm delivers for SIGWINCH after a host relayout: without

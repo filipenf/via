@@ -72,6 +72,13 @@ pub enum HostToTui {
     Appearance {
         light: bool,
     },
+    /// Whether the host is drawing a tab strip above this pane.
+    ///
+    /// The strip names the agent, so the pane header only needs to (and only does)
+    /// repeat the agent id while no strip is visible.
+    TabStripVisible {
+        visible: bool,
+    },
     Shutdown,
 }
 
@@ -127,6 +134,16 @@ pub fn encode_tui_line(msg: &TuiToHost) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_tab_strip_visible() {
+        let msg = parse_host_line(r#"{"type":"tab_strip_visible","visible":true}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg, HostToTui::TabStripVisible { visible: true });
+        let line = encode_host_line(&msg).unwrap();
+        assert_eq!(parse_host_line(&line).unwrap().unwrap(), msg);
+    }
 
     #[test]
     fn parse_transcript_and_skip_blank() {

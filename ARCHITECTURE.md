@@ -123,8 +123,9 @@ Major submodules:
   pane.
 - `input.rs`: key and clipboard normalization.
 
-Layout modes (Alt+1/2/Shift variants + Alt+Shift+3 for split direction) live in
-the `WinitGhosttyApp`. The UI also owns an optional review pane (either a `nvim`
+Layout modes (Alt+1..9 focus, Alt+Shift+1..9 maximize, Alt+T split/tabs, Alt+J split
+direction) live in the `WinitGhosttyApp`; the pure geometry and tab model are in
+`src/ui/ghostty/layout.rs`. The UI also owns an optional review pane (either a `nvim`
 review command or the `hunk` tool).
 
 Mouse handling for references ultimately emits `PaneCommand::OpenRequested`,

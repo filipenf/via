@@ -342,35 +342,58 @@ pub(super) fn draw_ratatui_buffer(
     default_fg: u32,
     default_bg: u32,
     force_redraw: bool,
+    changed: bool,
     damage: &mut Vec<DamageRect>,
 ) -> bool {
-    if !force_redraw {
+    // `force_redraw` now means "repaint every cell even if the region is already
+    // correct". A caller that knows its sub-rect changed (the tab strip on a tab
+    // switch) passes `false` and still gets cells drawn: the blit is confined to
+    // its own rect and reports damage only for that rect, so a partial redraw
+    // never turns into a full-window repaint.
+    //
+    // A caller with nothing to repaint must not reach the drawing below at all:
+    // a Ratatui blit always reports that it drew, so returning true unconditionally
+    // would make the caller present a frame every time it asked.
+    if !force_redraw && !changed {
         return false;
     }
 
     let area = ratatui_buffer.area;
+    if area.width == 0 || area.height == 0 {
+        return false;
+    }
+
+    // Damage is decided up front by a pure function, so the "a strip redraw only
+    // damages the strip" property is testable without a font renderer.
+    let mut rects = ratatui_buffer_damage(
+        area.width,
+        area.height,
+        origin_x,
+        origin_y,
+        metrics,
+        width,
+        height,
+    );
+    coalesce_damage(&mut rects);
+    damage.extend(rects);
+
     for row in 0..area.height {
         let y = origin_y + row as usize * metrics.cell_height;
-        let row_width = area.width as usize * metrics.cell_width;
-        draw_rect(
-            buffer,
-            width,
-            height,
-            origin_x,
-            y,
-            row_width,
-            metrics.cell_height,
-            default_bg,
-        );
-        push_damage(
-            damage,
-            origin_x,
-            y,
-            row_width,
-            metrics.cell_height,
-            width,
-            height,
-        );
+        // The row background only needs repainting on a forced redraw. On a partial
+        // redraw the cells below overwrite the row anyway, and skipping the fill
+        // keeps the damage rect tight to what actually changed.
+        if force_redraw {
+            draw_rect(
+                buffer,
+                width,
+                height,
+                origin_x,
+                y,
+                area.width as usize * metrics.cell_width,
+                metrics.cell_height,
+                default_bg,
+            );
+        }
 
         for col in 0..area.width {
             let cell = &ratatui_buffer[(col, row)];
@@ -396,6 +419,35 @@ pub(super) fn draw_ratatui_buffer(
 
     coalesce_damage(damage);
     true
+}
+
+/// The damage a Ratatui blit of `cols`x`rows` cells at `(origin_x, origin_y)` covers.
+///
+/// Pure and font-free so tests can assert that a strip-sized blit stays confined to
+/// its own rect instead of damaging the window.
+fn ratatui_buffer_damage(
+    cols: u16,
+    rows: u16,
+    origin_x: usize,
+    origin_y: usize,
+    metrics: TerminalMetrics,
+    width: usize,
+    height: usize,
+) -> Vec<DamageRect> {
+    let mut damage = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        let y = origin_y + row as usize * metrics.cell_height;
+        push_damage(
+            &mut damage,
+            origin_x,
+            y,
+            cols as usize * metrics.cell_width,
+            metrics.cell_height,
+            width,
+            height,
+        );
+    }
+    damage
 }
 
 fn coalesce_damage(damage: &mut Vec<DamageRect>) {
@@ -1272,6 +1324,78 @@ mod tests {
         assert_eq!(cursor_underline_thickness(32), 4);
         assert_eq!(cursor_bar_thickness(8), 1);
         assert_eq!(cursor_bar_thickness(16), 2);
+    }
+
+    #[test]
+    fn strip_sized_blit_damages_only_the_strip() {
+        let metrics = TerminalMetrics {
+            cell_width: 10,
+            cell_height: 20,
+            baseline: 15,
+        };
+        let window_width = 800;
+        let window_height = 600;
+
+        // A 40-column, one-row strip blitted at an arbitrary origin, as the tab
+        // strip does on a tab switch.
+        let mut damage =
+            ratatui_buffer_damage(40, 1, 300, 200, metrics, window_width, window_height);
+        coalesce_damage(&mut damage);
+
+        assert_eq!(damage.len(), 1, "one strip row coalesces to one rect");
+        let rect = damage[0];
+        assert_eq!(rect.x, 300);
+        assert_eq!(rect.y, 200);
+        assert_eq!(rect.width, 40 * metrics.cell_width);
+        assert_eq!(rect.height, metrics.cell_height);
+
+        // The whole window must stay untouched: no rect may reach outside the strip.
+        let strip_right = rect.x + rect.width;
+        let strip_bottom = rect.y + rect.height;
+        for rect in &damage {
+            assert!(rect.x >= 300, "damage escapes left of the strip");
+            assert!(rect.y >= 200, "damage escapes above the strip");
+            assert!(
+                rect.x + rect.width <= strip_right,
+                "damage escapes right of the strip"
+            );
+            assert!(
+                rect.y + rect.height <= strip_bottom,
+                "damage escapes below the strip"
+            );
+        }
+        assert!(
+            strip_right < window_width && strip_bottom < window_height,
+            "strip must be smaller than the window for this test to mean anything"
+        );
+    }
+
+    #[test]
+    fn multi_row_blit_coalesces_into_one_rect() {
+        let metrics = TerminalMetrics {
+            cell_width: 10,
+            cell_height: 20,
+            baseline: 15,
+        };
+
+        // Rows stack vertically, so coalescing should fold them into one rect.
+        let mut damage = ratatui_buffer_damage(5, 3, 0, 0, metrics, 800, 600);
+        coalesce_damage(&mut damage);
+
+        assert_eq!(damage.len(), 1);
+        assert_eq!(damage[0].width, 5 * metrics.cell_width);
+        assert_eq!(damage[0].height, 3 * metrics.cell_height);
+    }
+
+    #[test]
+    fn empty_ratatui_area_damages_nothing() {
+        let metrics = TerminalMetrics {
+            cell_width: 10,
+            cell_height: 20,
+            baseline: 15,
+        };
+        assert!(ratatui_buffer_damage(0, 1, 0, 0, metrics, 800, 600).is_empty());
+        assert!(ratatui_buffer_damage(10, 0, 0, 0, metrics, 800, 600).is_empty());
     }
 
     #[test]
